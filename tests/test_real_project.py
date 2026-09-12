@@ -1361,6 +1361,132 @@ def main():
         # 这里用纯函数无法直接构造“已销毁窗口”，靠 18.6/18.7 的 focused 组合
         # + reconcile 内 IsWindow 判定共同保证；此处确认 suppress=False 时照常挂载。
 
+    # ---- 19. v35：走【真实的】VbeBackend + Completer（假 COM 对象驱动）----
+    #
+    # 这一段专门补 11.x 覆盖不到的盲区：11.x 用的是手写的 collect() 复刻版，
+    # 它会把 caret 传进解析器；而生产的 get_identifiers() 从不传 caret。
+    # 两者行为不一致 -> 真实 bug（"arr 打全名后列表消失"）在 11.x 里根本测不出来。
+    print("\n=== 19. 真实后端全链路（v35：打全名必须保留列表）===")
+    try:
+        import vbe_bridge as VB
+
+        class _CM(object):
+            def __init__(self, name, text):
+                self.Name = name
+                self.text = text
+
+            @property
+            def CountOfLines(self):
+                return self.text.count("\n") + 1
+
+            def Lines(self, start, count):
+                return "\r\n".join(self.text.split("\n")
+                                   [start - 1:start - 1 + count])
+
+        class _Comp(object):
+            def __init__(self, name, text, ctype=1):
+                self.Name = name
+                self.Type = ctype
+                self.CodeModule = _CM(name, text)
+
+        class _Pane(object):
+            def __init__(self, comp):
+                self._c = comp
+                self.sel = (1, 1, 1, 1)
+
+            @property
+            def CodeModule(self):
+                return self._c.CodeModule
+
+            def GetSelection(self):
+                return self.sel
+
+        class _VBE(object):
+            def __init__(self, comps, act):
+                self._p = type("_Proj", (object,), {})()
+                self._p.Name = "VBAProject"
+                self._p.VBComponents = list(comps)
+                self.ActiveVBProject = self._p
+                self.ActiveCodePane = _Pane(act)
+
+        class _UI(object):
+            def __init__(self):
+                self.shown = False
+
+            def show(self, matches, selected, completer=None):
+                self.shown = True
+
+            def update_selection(self, i):
+                pass
+
+            def hide(self):
+                self.shown = False
+
+            def contains_point(self, x, y):
+                return False
+
+        def drive(mods, active_mod, edit_line, indent, name):
+            """逐字符输入 name，返回 [(输入到的词, 是否显示, 候选), ...]。"""
+            out = []
+            for n in range(1, len(name) + 1):
+                typed = name[:n]
+                comps, act = [], None
+                for mn, text, ct in mods:
+                    if mn == active_mod:
+                        ls = text.split("\n")
+                        ls[edit_line - 1] = indent + typed
+                        text = "\n".join(ls)
+                    c = _Comp(mn, text, ct)
+                    comps.append(c)
+                    if mn == active_mod:
+                        act = c
+                vbe = _VBE(comps, act)
+                VB._get_vbe_cached = lambda: vbe
+                bk = VB.VbeBackend()
+                ui = _UI()
+                cp = E.Completer(bk, ui)
+                col = len(indent + typed) + 1
+                vbe.ActiveCodePane.sel = (edit_line, col, edit_line, col)
+                cp.trigger(True)
+                out.append((typed, ui.shown, list(cp.current_matches())))
+            return out
+
+        # 19.1 核心回归：**从未 Dim、只是到处在用** 的隐式变量 arr。
+        #      修复前：a / ar 提示 arr，一把 arr 打全列表就消失（用户报的现象）。
+        m_imp = [("Module1", "Sub Foo()\n    arr = 1\n    <in>\nEnd Sub", 1)]
+        check("19.1 隐式变量 arr：打前缀提示", drive(m_imp, "Module1", 3, "    ", "ar"),
+              expect_contain=[("ar", True, ["arr"])])
+        check("19.1 隐式变量 arr：打全名仍保留",
+              drive(m_imp, "Module1", 3, "    ", "arr"),
+              expect_contain=[("arr", True, ["arr"])])
+        # 19.2 单字符隐式变量（同一个机制，只是长度不同）
+        m_single = [("Module1", "Sub Foo()\n    a = 1\n    <in>\nEnd Sub", 1)]
+        check("19.2 单字符隐式变量 a：打全名保留",
+              drive(m_single, "Module1", 3, "    ", "a"),
+              expect_contain=[("a", True, ["a"])])
+        # 19.3 显式 Dim 的多字符变量（v33 的老场景不能被新逻辑破坏）
+        m_dim = [("Module1", "Option Explicit\nSub Foo()\n    Dim arr As Long\n    <in>\nEnd Sub", 1)]
+        check("19.3 Dim arr：打全名保留",
+              drive(m_dim, "Module1", 4, "    ", "arr"),
+              expect_contain=[("arr", True, ["arr"])])
+        # 19.4 对照：从没出现过的词（numA）打全仍不能提示自己
+        m_to = [("Module1", "Option Explicit\nPublic num As Long\nPublic numArr As Long\nSub Foo()\n    <in>\nEnd Sub", 1)]
+        check("19.4 未定义的 numA：绝不提示自己",
+              drive(m_to, "Module1", 5, "    ", "numA"),
+              expect_contain=[("numA", True, ["numArr"])],
+              expect_absent=[("numA", True, ["numA", "numArr"])])
+        check("19.4 num/numArr：打 num 两个同屏",
+              drive(m_to, "Module1", 5, "    ", "num"),
+              expect_contain=[("num", True, ["num", "numArr"])])
+        # 19.5 纯幻影词：工程里任何地方都没有 -> 应当收起，不提示自己
+        m_ghost = [("Module1", "Option Explicit\nSub Foo()\n    <in>\nEnd Sub", 1)]
+        check("19.5 纯幻影 zzq：不提示",
+              drive(m_ghost, "Module1", 3, "    ", "zzq"),
+              expect_contain=[("zzq", False, [])])
+    except Exception as _e:
+        check("第 19 节不可用（vbe_bridge 导入失败）: %s" % _e, [True],
+              expect_contain=[True])
+
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))
     if FAILURES:

@@ -134,6 +134,24 @@ def filter_identifiers_by_scope(scoped_ids, current_proc, current_module=None):
     return [ranked[k][1] for k in ranked]
 
 
+def _name_exists_outside_caret(backend, word, line_no, caret_col):
+    """把光标处的词抹掉之后，这个 name 在工程里还存不存在。
+
+    这是区分「真实存在的标识符」与「正在输入的回声」的唯一可靠问法，
+    由后端实现（可选接口 `backend.name_exists_outside_caret(name, caret)`）。
+
+    后端没实现时退化为 False —— 保守起见按"不存在"处理，等价于旧的
+    "不是声明过的名字就剔除本身"语义，行为不会比修复前更糟。
+    """
+    hook = getattr(backend, "name_exists_outside_caret", None)
+    if not callable(hook) or not word or not line_no or not caret_col:
+        return False
+    try:
+        return bool(hook(word, (int(line_no), int(caret_col))))
+    except Exception:
+        return False
+
+
 class Completer:
     def __init__(self, backend, ui):
         self.backend = backend
@@ -243,13 +261,27 @@ class Completer:
                 matches = [m for m in matches
                            if not (m.lower() == exact and m.lower() in decl_names)]
             # 通用自我提示防护（声明行 / 用法行一律生效）：
-            # 正在输入的词若【不是工程里真实声明、且不在光标所在声明行】的名字
-            # （例如回退出来的 numA），它出现在候选里只能来自"用到即存在"的隐式
-            # 残留、或就是自己正在敲的那个词本身——两者都是"提示自己"，必须剔除。
-            # 真实声明的名字（如 num）保留：输入 num 仍可同时提醒 num 与 numArr；
-            # 输入 numA（从未定义）则只提示 numArr、绝不提示 numA。
-            if word.lower() not in self._declared_names():
-                matches = [m for m in matches if m.lower() != word.lower()]
+            # 正在输入的词有可能只是"自己的回声"——光标处那几个字符被当成
+            # 隐式变量收录了。此时把它提示出来等于"打什么提示什么"（回退出来
+            # 的 numA 就是典型），必须剔除。
+            #
+            # 判定依据不能用"候选剩几个"（那是 v30 的老毛病：会把"打全名"误杀），
+            # 也不能只用"是否真实声明过"——后者在真实工程里会漏判：名字明明在
+            # 代码里到处在用（或声明在解析层没能归类的位置），却因为不在
+            # 声明集合里被打全时一脚踢掉，正是"输入 arr 列表反而消失"的成因。
+            #
+            # 正确问法是：**把光标处的词抹掉后，这个名字在别处还存在吗？**
+            #   存在 -> 它是合法候选，打全照常提示（arr / num 都保留）；
+            #   不存在 -> 它只是回声，剔除（numA 不提示）。
+            # 已确认"真实声明过"的名字直接放行，省掉一次文本扫描。
+            exact = word.lower()
+            if any(m.lower() == exact for m in matches) \
+                    and exact not in self._declared_names():
+                exists = _name_exists_outside_caret(
+                    self.backend, word, ctx.get("line_no"),
+                    ctx.get("caret_col"))
+                if not exists:
+                    matches = [m for m in matches if m.lower() != exact]
         # 注意：这里【不要】再加"唯一候选恰好等于所输词就收起"的收尾规则。
         #
         # 那条规则（v30 为修"回退键提示自己"引入）误伤了正常场景：变量 arr 已定义，

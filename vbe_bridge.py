@@ -748,6 +748,57 @@ class VbeBackend:
             self.get_identifiers()
         return getattr(self, "_declared_names", set())
 
+    def name_exists_outside_caret(self, name, caret):
+        """把光标处的词抹掉后，【当前模块】里 name 是否还在别处出现。
+
+        这是判断"正在输入的词是不是自己的回声"的最可靠依据：
+
+        * 打 Name到一半/打全时，光标处那几个字符本身会被当成"用到过的隐式
+          变量"收录进候选池。若这个名字在工程里再没别处出现，把它提示出来
+          就是纯粹的自我提示（回退出来的 numA 就是典型）。
+        * 反过来，只要它在别处真实存在（哪怕解析层没能识别出它的声明），
+          那它就是个合法候选 —— 用户把它打全时**必须继续提示**，否则会出现
+          "输入 a / ar 都提示 arr，一把 arr 打全列表就消失"。
+
+        刻意只在【当前模块】里查：回声只可能产生于正在编辑的这个模块；
+        全工程扫描既没必要，又会在多模块大工程上明显变慢。
+
+        刻意只读文本做一次线性扫描（不触发标识符重解析），因此很廉价，
+        可以每次按键都调用。
+        """
+        if not name:
+            return False
+        try:
+            line_no, col = int(caret[0]), int(caret[1])
+        except Exception:
+            return False
+        try:
+            vbe = _get_vbe_cached()
+            if vbe is None:
+                return False
+            cp = vbe.ActiveCodePane
+            if cp is None:
+                return False
+            cm = cp.CodeModule
+            if cm.CountOfLines <= 0:
+                return False
+            code = cm.Lines(1, cm.CountOfLines)
+        except Exception:
+            return False
+        try:
+            src = vba_parser._blank_ident_at(code, line_no, col)
+            src = vba_parser._mask_strings_and_comments(src)
+        except Exception:
+            src = code
+        target = str(name).lower()
+        try:
+            for m in re.finditer(r"[^\W\d]\w*", src):
+                if m.group(0).lower() == target:
+                    return True
+        except Exception:
+            return False
+        return False
+
     def _collect_identifiers(self):
         # 用缓存的 VBE（会顺带做失败退避），避免每次收集都新建
         # Excel.Application 代理 —— 那会让 Excel 退出时要清理的引用越堆越多。
