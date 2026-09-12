@@ -612,15 +612,24 @@ def main():
         return (ui.shown, c.current_matches())
 
     # 声明行：能匹配到已定义的就提示，只剩"正在输入的那个词本身"才安静
-    check("公共变量：打全名 -> 不提示自己",
+    #
+    # 【v37 语义变更】"打全名 -> 不提示自己" 这三条的期望已按用户要求反转：
+    #   旧规则（v31~v36）：正在声明的名字，打全名时一律剔除 -> 列表整个消失。
+    #   问题（用户报的 bug）：工程里已经有 `Function test()`，你在 `Sub test`
+    #     这一行把 test 打全，那不是"自己的回声"，是货真价实的同名函数，
+    #     却被打全名那一刻清空了列表 —— 输入 tes 提示、输入 test 反而没了。
+    #   新规则：只看"这个名字在工程里真实存在吗"。存在就提示（含打全名），
+    #     不存在（纯幻影 zzq、回退出来的 numA）才剔除。
+    # 下面的 gUserName / gCalc / numArr 在 ids 里都是【已定义】的，故打全名照常提示。
+    check("公共变量：打全名 -> 照常提示（v37）",
           [trig("Public gUserName", 17, True, decl_names=["gUserName"])],
-          expect_contain=[(False, [])])
+          expect_contain=[(True, ["gUserName"])])
     check("公共变量：打前缀 -> 提示已有的 gUserName",
           [trig("Public gUser", 13, True, decl_names=["gUserName"])],
           expect_contain=[(True, ["gUserName"])])
-    check("函数名：打全名 -> 不提示自己",
+    check("函数名：打全名 -> 照常提示（v37）",
           [trig("Public Function gCalc", 22, True, decl_names=["gCalc"])],
-          expect_contain=[(False, [])])
+          expect_contain=[(True, ["gCalc"])])
     check("函数名：打前缀 -> 提示已有的 gCalc",
           [trig("Public Function gCal", 21, True, decl_names=["gCalc"])],
           expect_contain=[(True, ["gCalc"])])
@@ -647,7 +656,9 @@ def main():
     check("Bug1: 声明行输入 num 同时提醒 num 与 numArr",
           [(ui_b1.shown, sorted(c_b1.current_matches()))],
           expect_contain=[(True, ["num", "numArr"])])
-    # 打全 numArr（声明行完整名字）-> 不提示 numArr 自己（无其它兄弟，整行安静）
+    # 打全 numArr（声明行完整名字）-> v37 起【照常提示】：numArr 是本模块真实
+    # 声明过的 Public 名字，打全它不属于"自我提示"，用户正需要看到它
+    # （与用户报的"输入 test 打全了要提示 test"是同一条规则）。
     ui_b1b = _UI2()
     c_b1b = E.Completer(_B2(
         {"line_no": 2, "caret_col": len("Public numArr") + 1,
@@ -656,9 +667,9 @@ def main():
          "decl_names": ["numArr"], "proc_name": None, "module_name": "M1"},
         b1_recs), ui_b1b)
     c_b1b.trigger()
-    check("Bug1: 声明行打全 numArr 不提示自己",
+    check("Bug1: 声明行打全 numArr -> 照常提示（v37）",
           [(ui_b1b.shown, sorted(c_b1b.current_matches()))],
-          expect_contain=[(False, [])])
+          expect_contain=[(True, ["numArr"])])
 
     # ---- 11.7 Bug2：回退删除后若唯一匹配等于所输入词，不提示自己 ----
     ui_b2 = _UI2()
@@ -1483,6 +1494,274 @@ def main():
         check("19.5 纯幻影 zzq：不提示",
               drive(m_ghost, "Module1", 3, "    ", "zzq"),
               expect_contain=[("zzq", False, [])])
+
+        # ---- 20. v36：模糊匹配（不必从首字母开始）+ 命中字符高亮 ----
+        #
+        # 用户原话：定义了 dataArr / dataSheet，输入 ts 要提示 dataSheet
+        # （t 和 s 都在里面），输入 ta 两个都要提示，且命中的字符标红。
+        print("\n=== 20. 模糊匹配与命中高亮（v36）===")
+
+        def probe(mods, active_mod, edit_line, indent, typed):
+            """把 typed 整串放到编辑行，返回 (是否显示, 候选, 命中位置字典)。"""
+            comps, act = [], None
+            for mn, text, ct in mods:
+                if mn == active_mod:
+                    ls = text.split("\n")
+                    ls[edit_line - 1] = indent + typed
+                    text = "\n".join(ls)
+                c = _Comp(mn, text, ct)
+                comps.append(c)
+                if mn == active_mod:
+                    act = c
+            vbe = _VBE(comps, act)
+            VB._get_vbe_cached = lambda: vbe
+            bk = VB.VbeBackend()
+            ui = _UI()
+            cp = E.Completer(bk, ui)
+            col = len(indent + typed) + 1
+            vbe.ActiveCodePane.sel = (edit_line, col, edit_line, col)
+            cp.trigger(True)
+            return (ui.shown, list(cp.current_matches()),
+                    dict(getattr(cp, "match_hits", None) or {}))
+
+        m_two = [("Module1",
+                  "Option Explicit\n"
+                  "Sub Foo()\n"
+                  "    Dim dataArr As Long\n"
+                  "    Dim dataSheet As Worksheet\n"
+                  "    <in>\n"
+                  "End Sub", 1)]
+
+        # 20.1 核心场景一：ts -> 只提示 dataSheet（dataArr 里没有 s）
+        s1, m1, h1 = probe(m_two, "Module1", 5, "    ", "ts")
+        check("20.1 输入 ts：弹窗显示", [s1], expect_contain=[True])
+        check("20.1 输入 ts：提示 dataSheet", m1, expect_contain=["dataSheet"])
+        check("20.1 输入 ts：不提示 dataArr（里面没有 s）", m1,
+              expect_absent=["dataArr"])
+        check("20.1 输入 ts：命中位置为 t(2) 与 S(4)", [h1.get("dataSheet")],
+              expect_contain=[[2, 4]])
+
+        # 20.2 核心场景二：ta -> 两个都提示，且各自命中位置正确
+        s2, m2, h2 = probe(m_two, "Module1", 5, "    ", "ta")
+        check("20.2 输入 ta：弹窗显示", [s2], expect_contain=[True])
+        check("20.2 输入 ta：dataArr 与 dataSheet 同屏", [sorted(m2)],
+              expect_contain=[["dataArr", "dataSheet"]])
+        check("20.2 输入 ta：dataArr 命中 t(2) a(3)", [h2.get("dataArr")],
+              expect_contain=[[2, 3]])
+        check("20.2 输入 ta：dataSheet 命中 t(2) a(3)", [h2.get("dataSheet")],
+              expect_contain=[[2, 3]])
+
+        # 20.3 高亮位置必须合法：数量等于输入长度、升序、不越界
+        bad = []
+        for name, pos in (h2 or {}).items():
+            if len(pos) != 2 or pos != sorted(pos) or pos[-1] >= len(name):
+                bad.append((name, pos))
+        check("20.3 命中位置数量/顺序/越界检查", [bad], expect_contain=[[]])
+
+        # 20.4 词首缩略：ds -> 命中 dataSheet 的 D 与 S（不是随便找两个字母）
+        s4, m4, h4 = probe(m_two, "Module1", 5, "    ", "ds")
+        check("20.4 输入 ds：提示 dataSheet", m4, expect_contain=["dataSheet"])
+        check("20.4 输入 ds：命中词首 D(0) 与 S(4)", [h4.get("dataSheet")],
+              expect_contain=[[0, 4]])
+
+        # 20.5 连续块优先：arr -> 命中 dataArr 尾部的 Arr，而不是散着凑
+        s5, m5, h5 = probe(m_two, "Module1", 5, "    ", "arr")
+        check("20.5 输入 arr：命中连续的 Arr(4,5,6)", [h5.get("dataArr")],
+              expect_contain=[[4, 5, 6]])
+
+        # 20.6 排序：精确匹配必须排第一（不能被模糊候选挤下去）
+        m_rank = [("Module1",
+                   "Option Explicit\n"
+                   "Public num As Long\n"
+                   "Public myNumber As Long\n"
+                   "Sub Foo()\n"
+                   "    <in>\n"
+                   "End Sub", 1)]
+        s6, m6, _h6 = probe(m_rank, "Module1", 5, "    ", "num")
+        check("20.6 输入 num：精确匹配 num 排第一", [m6[0] if m6 else None],
+              expect_contain=["num"])
+        check("20.6 输入 num：模糊候选 myNumber 也在列", m6,
+              expect_contain=["myNumber"])
+
+        # 20.7 排序：前缀匹配排在"中间命中"之前
+        m_pref = [("Module1",
+                   "Option Explicit\n"
+                   "Public wsName As String\n"
+                   "Public myWorksheetName As String\n"
+                   "Sub Foo()\n"
+                   "    <in>\n"
+                   "End Sub", 1)]
+        s7, m7, _h7 = probe(m_pref, "Module1", 5, "    ", "wsn")
+        check("20.7 输入 wsn：前缀命中的 wsName 排第一",
+              [m7[0] if m7 else None], expect_contain=["wsName"])
+
+        # 20.8 不回归：工程里压根没有的字符组合 -> 不显示
+        s8, m8, _h8 = probe(m_two, "Module1", 5, "    ", "zzq")
+        check("20.8 纯幻影 zzq：不显示、无候选", [(s8, m8)],
+              expect_contain=[(False, [])])
+
+        # 20.9 不回归：打全名仍保留列表（v35 的修复不能被模糊匹配破坏）
+        s9, m9, h9 = probe(m_two, "Module1", 5, "    ", "dataSheet")
+        check("20.9 打全名 dataSheet：列表保留且它排第一",
+              [(s9, m9[0] if m9 else None)], expect_contain=[(True, "dataSheet")])
+        check("20.9 打全名：命中位置覆盖全部字符",
+              [h9.get("dataSheet")], expect_contain=[[0, 1, 2, 3, 4, 5, 6, 7, 8]])
+
+        # ---- 21. v37：函数名打全名要提示 + 回退删除后不漏（真实后端全链路）----
+        #
+        # 用户报的两个 bug，根因是同一条老规则：in_decl_position 时【无条件】
+        # 剔除"当前声明行正在声明的那个名字"。它把"打全名"整个清空了：
+        #   bug1 `Sub test` 行输入 test（工程里已有 Function test）-> 列表消失
+        #   bug2 在声明行回退 02 剩 test -> 同样消失
+        # v37 改为统一判据："这个名字在工程里真实存在吗"。
+        print("\n=== 21. 函数名打全名 / 回退删除（v37）===")
+
+        def probe2(mods, active_mod, edit_line, indent, typed):
+            comps, act = [], None
+            for mn, text, ct in mods:
+                if mn == active_mod:
+                    ls = text.split("\n")
+                    ls[edit_line - 1] = indent + typed
+                    text = "\n".join(ls)
+                c = _Comp(mn, text, ct)
+                comps.append(c)
+                if mn == active_mod:
+                    act = c
+            vbe = _VBE(comps, act)
+            VB._get_vbe_cached = lambda: vbe
+            bk = VB.VbeBackend()
+            ui = _UI()
+            cp = E.Completer(bk, ui)
+            col = len(indent + typed) + 1
+            vbe.ActiveCodePane.sel = (edit_line, col, edit_line, col)
+            cp.trigger(True)
+            return (ui.shown, sorted(cp.current_matches()))
+
+        # 21.1 已有 Function test()，在新的 Sub 声明行上输入（bug1）
+        m_fn = [("Module1",
+                 "Option Explicit\n"
+                 "Function test() As Long\n"
+                 "    test = 1\n"
+                 "End Function\n"
+                 "\n"
+                 "<in>\n"
+                 "End Sub", 1)]
+        check("21.1 声明行输入 tes：提示 test",
+              [probe2(m_fn, "Module1", 6, "Sub ", "tes")],
+              expect_contain=[(True, ["test"])])
+        check("21.1 声明行输入 test（打全名）：仍提示 test  ← bug1",
+              [probe2(m_fn, "Module1", 6, "Sub ", "test")],
+              expect_contain=[(True, ["test"])])
+
+        # 21.2 test / test02 都在，声明行回退到 test 要两个都提示（bug2）
+        m_two = [("Module1",
+                  "Option Explicit\n"
+                  "Function test() As Long\n"
+                  "    test = 1\n"
+                  "End Function\n"
+                  "Function test02() As Long\n"
+                  "    test02 = 2\n"
+                  "End Function\n"
+                  "\n"
+                  "<in>\n"
+                  "End Sub", 1)]
+        check("21.2 声明行回退到 test：test 与 test02 同屏  ← bug2",
+              [probe2(m_two, "Module1", 10, "Sub ", "test")],
+              expect_contain=[(True, ["test", "test02"])])
+        check("21.2 声明行输入 test02：提示 test02",
+              [probe2(m_two, "Module1", 10, "Sub ", "test02")],
+              expect_contain=[(True, ["test02"])])
+
+        # 21.3 过程体内调用处回退（非声明行，属回归保护）
+        m_call = [("Module1",
+                   "Option Explicit\n"
+                   "Function test() As Long\n"
+                   "    test = 1\n"
+                   "End Function\n"
+                   "Function test02() As Long\n"
+                   "    test02 = 2\n"
+                   "End Function\n"
+                   "Sub Main()\n"
+                   "    <in>\n"
+                   "End Sub", 1)]
+        check("21.3 调用处回退到 test：两个都提示",
+              [probe2(m_call, "Module1", 10, "    ", "test")],
+              expect_contain=[(True, ["test", "test02"])])
+
+        # 21.4 关键反向保护：幻影词（哪都不存在）依然【绝不】提示自己
+        m_ghost = [("Module1",
+                    "Option Explicit\n"
+                    "Sub Main()\n"
+                    "    <in>\n"
+                    "End Sub", 1)]
+        check("21.4 幻影 zzq：不提示",
+              [probe2(m_ghost, "Module1", 3, "    ", "zzq")],
+              expect_contain=[(False, [])])
+        check("21.4 声明行幻影 zzq：不提示",
+              [probe2([("Module1", "Option Explicit\n<in>\nEnd Sub", 1)],
+                      "Module1", 2, "Sub ", "zzq")],
+              expect_contain=[(False, [])])
+        # 21.5 回退出来的未定义词 numA（v35 的核心用例，不能被 v37 放宽掉）
+        m_numA = [("Module1",
+                   "Option Explicit\n"
+                   "Public num As Long\n"
+                   "Public numArr As Long\n"
+                   "Sub Foo()\n"
+                   "    <in>\n"
+                   "End Sub", 1)]
+        check("21.5 回退出的 numA：只提示 numArr，绝不提示 numA 自己",
+              [probe2(m_numA, "Module1", 5, "    ", "numA")],
+              expect_contain=[(True, ["numArr"])])
+
+        # 20.10 高亮分段：把名字切成"命中/未命中"交替的段（纯函数，无需 GUI）
+        import ui as _uimod
+
+        check("20.10 分段：dataSheet 命中 [2,4]",
+              [_uimod.split_by_hits("dataSheet", [2, 4])],
+              expect_contain=[[("da", False), ("t", True), ("a", False),
+                               ("S", True), ("heet", False)]])
+        check("20.10 分段：连续命中会合并成一段",
+              [_uimod.split_by_hits("dataArr", [4, 5, 6])],
+              expect_contain=[[("data", False), ("Arr", True)]])
+        check("20.10 分段：无命中时整段一段",
+              [_uimod.split_by_hits("num", [])],
+              expect_contain=[[("num", False)]])
+        check("20.10 分段：全命中时整段一段",
+              [_uimod.split_by_hits("num", [0, 1, 2])],
+              expect_contain=[[("num", True)]])
+        check("20.10 分段：拼接回去必须等于原名（不丢字）",
+              ["".join(s for s, _ in _uimod.split_by_hits("dataSheet", [2, 4]))],
+              expect_contain=["dataSheet"])
+
+        # 20.11 真实 Popup 渲染冒烟：Canvas 自绘不抛异常（无 GUI 环境则跳过）
+        try:
+            import tkinter as _tk
+
+            class _FakeC(object):
+                match_hits = {"dataSheet": [2, 4], "dataArr": [2, 3]}
+                selected = 0
+
+                def pick(self, i):
+                    return True
+
+                def accept(self):
+                    pass
+
+            _root = _tk.Tk()
+            _root.withdraw()
+            _p = _uimod.Popup(_root)
+            _p.show(["dataSheet", "dataArr"], 0, _FakeC())
+            _root.update()
+            check("20.11 Canvas 渲染：两行都画出来了", [len(_p._rows)],
+                  expect_contain=[2])
+            check("20.11 Canvas 渲染：命中位置已传给 UI", [_p._rows[0]],
+                  expect_contain=[("dataSheet", [2, 4])])
+            check("20.11 点空白行不触发确认（返回 None）", [_p._row_at(10 ** 6)],
+                  expect_contain=[None])
+            _root.destroy()
+        except Exception as _e2:
+            check("20.11 跳过（无 GUI 环境）: %s" % _e2, [True],
+                  expect_contain=[True])
     except Exception as _e:
         check("第 19 节不可用（vbe_bridge 导入失败）: %s" % _e, [True],
               expect_contain=[True])

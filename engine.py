@@ -134,6 +134,120 @@ def filter_identifiers_by_scope(scoped_ids, current_proc, current_module=None):
     return [ranked[k][1] for k in ranked]
 
 
+def _word_boundaries(name):
+    """名字里的"词边界"下标集合。
+
+    边界 = 首字符 / 下划线之后 / 小写→大写的切换处（camelCase 驼峰）。
+    例如 dataSheet -> {0, 4}，DataArr -> {0, 4}。
+
+    【必须用原始 name，不能先 lower】——大小写切换信息一丢，
+    就再也认不出 camelCase 的词首了，`ds` 想命中 `dataSheet` 的 D 和 S 就无从谈起。
+    """
+    b = set()
+    if not name:
+        return b
+    b.add(0)
+    prev = name[0]
+    for i in range(1, len(name)):
+        ch = name[i]
+        if prev == "_" or (prev.islower() and ch.isupper()):
+            b.add(i)
+        prev = ch
+    return b
+
+
+def _greedy_positions(low, query, bounds):
+    """无法整块连续命中时，逐字符挑位置：优先词边界，其次紧接上一个命中。
+
+    档位越小越优先（同档取更靠前的）：
+      0 既接在上一个命中之后、又落在词边界
+      1 落在词边界（首字母缩略型：ds -> dataSheet）
+      2 紧接上一个命中（尽量连成块）
+      3 其它
+    """
+    pos = []
+    i = 0
+    for ch in query:
+        best = None
+        best_key = None
+        for j in range(i, len(low)):
+            if low[j] != ch:
+                continue
+            if j == i and j in bounds:
+                key = (0, j)
+            elif j in bounds:
+                key = (1, j)
+            elif j == i:
+                key = (2, j)
+            else:
+                key = (3, j)
+            if best_key is None or key < best_key:
+                best_key, best = key, j
+        if best is None:
+            return None
+        pos.append(best)
+        i = best + 1
+    return pos
+
+
+def fuzzy_match(name, query):
+    """模糊匹配：query 的字符按顺序出现在 name 里即算命中（不要求开头）。
+
+    返回 (score, positions)；不匹配返回 None。
+
+      score     排序键（元组，越大越靠前）：
+                  (kind, -首个命中位置, -命中跨度, -名字长度)
+                kind: 4 完全相等 > 3 前缀 > 2 词首缩略 > 1 连续块 > 0 分散
+      positions 命中的字符下标（升序），供 UI 高亮
+
+    匹配策略（命中位置怎么挑，直接决定高亮好不好看）：
+      1) 优先【整块连续】——query 作为子串出现时直接用它，
+         视觉上就是"我打的这几个字母连在一起"。这是最常见的直觉。
+         例：arr -> dataArr 命中 Arr（而不是散着的 a..r..r）。
+      2) 否则逐字符贪心，优先落在词边界上（首字母缩略型）。
+         例：ts -> dataSheet 命中 t 和 S（datasheet 里没有连续的 ts）。
+    """
+    if not name or not query:
+        return None
+    low = name.lower()
+    q = query.lower()
+    if len(q) > len(low):
+        return None
+    bounds = _word_boundaries(name)
+
+    contiguous = False
+    # 1) 整块连续：取"最靠前、且尽量落在词边界"的那一次出现
+    starts = []
+    i = low.find(q)
+    while i >= 0:
+        starts.append(i)
+        i = low.find(q, i + 1)
+    if starts:
+        best = min(starts, key=lambda s: (0 if s == 0 else
+                                          (1 if s in bounds else 2), s))
+        positions = list(range(best, best + len(q)))
+        contiguous = True
+    else:
+        # 2) 分散：逐字符按档位挑
+        positions = _greedy_positions(low, q, bounds)
+        if positions is None:
+            return None
+
+    if low == q:
+        kind = 4                                  # 完全相等
+    elif low.startswith(q):
+        kind = 3                                  # 前缀
+    elif all(p in bounds for p in positions):
+        kind = 2                                  # 词首缩略（ds -> dataSheet）
+    elif contiguous:
+        kind = 1                                  # 连续块
+    else:
+        kind = 0                                  # 分散
+    span = positions[-1] - positions[0] + 1
+    score = (kind, -positions[0], -span, -len(low))
+    return score, positions
+
+
 def _name_exists_outside_caret(backend, word, line_no, caret_col):
     """把光标处的词抹掉之后，这个 name 在工程里还存不存在。
 
@@ -163,6 +277,9 @@ class Completer:
         self.word_is_complete = False
         self._suppress_until = 0.0
         self.shown_at = 0.0       # 最近一次真正弹出的时刻（供"刚弹出保护期"使用）
+        # 当前候选各自的命中下标：{名字: [下标, ...]}，供 UI 把命中的字符标红。
+        # 由 trigger() 填写、hide() 清空。UI 通过 completer 读取，不占用 show() 签名。
+        self.match_hits = {}
 
     def _type_name_set(self):
         """后端给出的"类型名"集合（小写），供 `As` 之后的位置使用。
@@ -177,6 +294,35 @@ class Completer:
             return set(str(n).lower() for n in (hook() or ()))
         except Exception:
             return set()
+
+    def _name_really_exists(self, name, ctx=None):
+        """这个名字在工程里是【真实存在】的，还是只是光标处的回声？
+
+        两条互为补充的证据，命中任一即认为真实存在：
+
+        1. `get_declared_names()` 里有它 —— 全工程范围内被 Dim/Const/Sub/
+           Function/Type/Enum 真正声明过。跨模块的 Public 名字靠这一条。
+        2. `name_exists_outside_caret()` 为真 —— 把光标处的词抹掉后，它在
+           当前模块别处还出现。隐式变量（用到即存在）、以及解析层没能归类
+           的声明，靠这一条兜住。
+
+        只用 1 会漏判隐式变量（正是 v35"打全 arr 列表消失"的成因）；
+        只用 2 会漏判跨模块的 Public 名字（`name_exists_outside_caret`
+        刻意只扫当前模块以省开销）。所以两条都要。
+        """
+        low = str(name).lower()
+        if not low:
+            return False
+        try:
+            if low in self._declared_names():
+                return True
+        except Exception:
+            pass
+        if ctx is None:
+            ctx = self.ctx or {}
+        return _name_exists_outside_caret(self.backend, name,
+                                          ctx.get("line_no"),
+                                          ctx.get("caret_col"))
 
     def _declared_names(self):
         """工程里【真实声明】过的名字（小写集合），供 trigger 区分"真名字"与"幻影"。
@@ -240,27 +386,30 @@ class Completer:
             ctx.get("proc_name"),
             ctx.get("module_name"),
         )
-        # 候选 = 所有以当前单词为前缀的标识符（不区分大小写）。
+        # 候选 = 输入串按顺序出现在名字里即命中（模糊匹配，不要求从头开始）。
+        # 例：dataArr / dataSheet 两个变量——
+        #   输入 ts -> dataSheet（datasheet 里没有连续的 "ts"，按词边界命中 t 和 S）
+        #   输入 ta -> 两者都中（"ta" 在两边都是连续块）
         # 关键：就算单词已完整等于某个候选（如已把 cell 打全），也保留在列表里，
         # 弹窗继续显示，直到用户按 Tab 确认 / 鼠标点列表外 / 改成不再匹配的词。
-        # 这样"打全名"和"打首字母"行为完全一致；单字母标识符也因此始终可提示。
-        matches = [i for i in visible_ids
-                   if i.lower().startswith(word.lower())]
+        #
+        # 打分排序：精确 > 前缀 > 词首缩略 > 连续块 > 分散，同级再比
+        # "命中越靠前 / 跨度越小 / 名字越短"越好——保证最像的那个永远排第一，
+        # 不会因为放开模糊匹配就让列表变成一锅粥。
+        scored = []
+        for i in visible_ids:
+            r = fuzzy_match(i, word)
+            if r is not None:
+                scored.append((r[0], i, r[1]))
+        # sorted 稳定：同分时保持后端原来的顺序
+        scored.sort(key=lambda t: t[0], reverse=True)
+        matches = [name for _, name, _ in scored]
+        # 每个候选的命中下标，交给 UI 高亮（键是名字，值是下标列表）
+        self.match_hits = {name: pos for _, name, pos in scored}
         if in_type:
             matches = [i for i in matches if i.lower() in type_names]
         else:
-            if ctx.get("in_decl_position"):
-                # 正在"起新名字"的声明行（Dim / Const / Sub / Function / Public 变量...）。
-                # 只隐藏"当前声明行正在声明的那个名字"的【完整】拼法——避免"打全名还
-                # 提示自己"（输入 gUserName 不提示 gUserName 自己）。其余任何候选（包括同
-                # 前缀兄弟 num，以及工程里已存在的近名 numArr）照常提示：输入 num 也能同时
-                # 提醒 num 与 numArr（修复前缀补全被误杀的 bug）。
-                decl_names = set(str(n).lower()
-                                 for n in (ctx.get("decl_names") or []))
-                exact = word.lower()
-                matches = [m for m in matches
-                           if not (m.lower() == exact and m.lower() in decl_names)]
-            # 通用自我提示防护（声明行 / 用法行一律生效）：
+            # 自我提示防护（声明行 / 用法行一律生效）：
             # 正在输入的词有可能只是"自己的回声"——光标处那几个字符被当成
             # 隐式变量收录了。此时把它提示出来等于"打什么提示什么"（回退出来
             # 的 numA 就是典型），必须剔除。
@@ -270,18 +419,20 @@ class Completer:
             # 代码里到处在用（或声明在解析层没能归类的位置），却因为不在
             # 声明集合里被打全时一脚踢掉，正是"输入 arr 列表反而消失"的成因。
             #
-            # 正确问法是：**把光标处的词抹掉后，这个名字在别处还存在吗？**
-            #   存在 -> 它是合法候选，打全照常提示（arr / num 都保留）；
+            # 【v37】也不能反过来用"它是不是当前声明行正在起的新名字"来剔除
+            # （那是 v31~v36 的老规则）：它同样会误杀——工程里已经有
+            # `Function test()`，你在 `Sub test` 这一行把 test 打全，那不是回声，
+            # 是货真价实的同名函数，必须继续提示。老规则的唯一作用是在
+            # "正在声明的名字恰好又被本过程用到"时多剔除一次，而那种情况
+            # 提示出来也无害（Tab 确认后写的就是同样的字符）。
+            #
+            # 正确问法只有一个：**这个名字在工程里真实存在吗？**
+            #   存在 -> 合法候选，打全照常提示（arr / num / test 都保留）；
             #   不存在 -> 它只是回声，剔除（numA 不提示）。
-            # 已确认"真实声明过"的名字直接放行，省掉一次文本扫描。
             exact = word.lower()
             if any(m.lower() == exact for m in matches) \
-                    and exact not in self._declared_names():
-                exists = _name_exists_outside_caret(
-                    self.backend, word, ctx.get("line_no"),
-                    ctx.get("caret_col"))
-                if not exists:
-                    matches = [m for m in matches if m.lower() != exact]
+                    and not self._name_really_exists(word, ctx):
+                matches = [m for m in matches if m.lower() != exact]
         # 注意：这里【不要】再加"唯一候选恰好等于所输词就收起"的收尾规则。
         #
         # 那条规则（v30 为修"回退键提示自己"引入）误伤了正常场景：变量 arr 已定义，
@@ -300,8 +451,10 @@ class Completer:
                 len(visible_ids), matches))
         try:
             hits = [r for r in self.backend.get_identifiers()
-                    if str(r[0]).lower().startswith(word.lower())]
+                    if fuzzy_match(str(r[0]), word) is not None]
             _log("  raw hits for %r: %s" % (word, hits[:40]))
+            _log("  hit positions: %s" % ({k: v for k, v in
+                                           list(self.match_hits.items())[:10]},))
         except Exception:
             pass
         if not matches:
@@ -388,6 +541,7 @@ class Completer:
         self.selected = 0
         self.ctx = None
         self.word_is_complete = False
+        self.match_hits = {}
         self.ui.hide()
 
     def maybe_hide_on_outside_click(self, px, py):
