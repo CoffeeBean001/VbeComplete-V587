@@ -84,6 +84,58 @@ VK_MENU = 0x12         # Alt
 
 NAV_VKS = (VK_UP, VK_DOWN)
 
+# KBDLLHOOKSTRUCT.flags 的 bit4：这一下是【注入】的（SendInput / keybd_event
+# 发出），不是人真按的。v57 起我们自己兜底重发按键时会带这个标志 —— 必须放行，
+# 否则会自己截自己、无限递归。别人家的自动化按键同理，一律不拦。
+LLKHF_INJECTED = 0x10
+
+# 兜底重发字符用的 SendInput 结构（KEYEVENTF_UNICODE：直接给字符，不碰键盘
+# 布局 / Shift，中英文布局下都准）。
+INPUT_KEYBOARD = 1
+KEYEVENTF_UNICODE = 0x0004
+KEYEVENTF_KEYUP = 0x0002
+
+
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = [("wVk", ctypes.c_ushort),
+                ("wScan", ctypes.c_ushort),
+                ("dwFlags", ctypes.c_ulong),
+                ("time", ctypes.c_ulong),
+                ("dwExtraInfo", ctypes.c_size_t)]
+
+
+class _INPUT_UNION(ctypes.Union):
+    _fields_ = [("ki", _KEYBDINPUT), ("pad", ctypes.c_ubyte * 32)]
+
+
+class _INPUT(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_ulong), ("u", _INPUT_UNION)]
+
+
+def send_char(ch):
+    """把一个字符原样"还给"系统（keydown+keyup），等价于人敲了一下。
+
+    只用于兜底：自动配对没做成时，按键已经被我们吞了，必须让用户这一下
+    【真的输入进去】—— 绝不能"吞掉按键却什么都没发生"。
+    用 KEYEVENTF_UNICODE 直接发字符，绕开键盘布局与 Shift 状态。
+    """
+    try:
+        evts = (_INPUT * 2)()
+        for i, flags in enumerate((KEYEVENTF_UNICODE,
+                                   KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)):
+            e = evts[i]
+            e.type = INPUT_KEYBOARD
+            e.u.ki.wVk = 0
+            e.u.ki.wScan = ord(ch)
+            e.u.ki.dwFlags = flags
+            e.u.ki.time = 0
+            e.u.ki.dwExtraInfo = 0
+        n = ctypes.windll.user32.SendInput(
+            2, ctypes.byref(evts), ctypes.sizeof(_INPUT))
+        return int(n) == 2
+    except Exception:
+        return False
+
 
 def _is_newline_shortcut(vk, shift_down):
     """Shift+Enter 是否应触发"在当前行下方新起一行"（纯判断，便于单测）。
@@ -449,6 +501,22 @@ def main():
         except Exception:
             pass
 
+    def _auto_pair_here(ch):
+        """自动配对（`(` -> `()`、`"` -> `""`、右半边已存在则跨过去）。
+
+        【只在主线程执行】—— COM 只能在主线程碰（见 vbe_bridge._get_vbe_cached
+        的线程守卫）。按键此时已经被钩子吞掉了，所以这里必须收尾：
+        写成功了最好；写不成（注释里 / 有选区 / COM 恰好抽风）就把这一下
+        原样还给系统，让 VBE 按原生行为插入 —— 绝不丢用户的按键。
+        """
+        try:
+            if backend.insert_pair(ch):
+                return
+            _log("autopair: 未接管 %r -> 原样还给系统" % ch)
+        except Exception:
+            _log("autopair: insert_pair 异常 -> 原样还给系统")
+        send_char(ch)
+
     def drain_actions():
         """主线程循环消费动作队列。"""
         try:
@@ -475,6 +543,14 @@ def main():
         action = None
         suppress = False
         try:
+            # v57：注入的按键一律放行（含我们自己兜底重发的那一下），
+            # 否则会自己截自己 -> 无限递归。
+            if msg in (WM_KEYDOWN, WM_SYSKEYDOWN, WM_KEYUP, WM_SYSKEYUP):
+                try:
+                    if int(data.flags) & LLKHF_INJECTED:
+                        return True
+                except Exception:
+                    pass
             vk = data.vkCode
 
             if msg in (WM_KEYDOWN, WM_SYSKEYDOWN):
@@ -493,14 +569,21 @@ def main():
                 elif (_pair_ch
                         and not _mod_down()
                         and com_backoff_remaining() <= 0
-                        and in_vbe_code_pane()
-                        and backend.insert_pair(_pair_ch)):
-                    # 自动配对：写成功了才吞键。
+                        and in_vbe_code_pane()):
+                    # 自动配对 —— v57 改【主线程执行】（见 _auto_pair_here）。
                     #
-                    # 刻意【同步】做（而不是 post 给主线程）：吞键是不可撤销的，
-                    # 必须先确知文本真的写进去了。写不进去（在注释里、有选区、
-                    # COM 出问题）就【放行】，让 VBE 按原生行为插一个字符 ——
-                    # 绝不能"吞掉按键却什么都没发生"。
+                    # v56 这里曾是同步调用 backend.insert_pair() 才吞键，理由是
+                    # "先确知写进去了再吞"。但它犯了个致命错误：**钩子线程不
+                    # 能碰 COM**。那个线程没有 COM 单元，调用必然失败；失败又
+                    # 走 _com_fail() 把全局退避打满（1s/2s/5s），连主线程的提示
+                    # 轮询一起挡住 -> 敲一下 `(` 之后提示要等 2~3 秒才出来，
+                    # 而配对本身还一次都没生效过。
+                    #
+                    # 现在的做法：先吞键（判断条件全是纯 Win32 / 本地状态，
+                    # 钩子线程里做是安全的），真正的写入丢给主线程。万一主
+                    # 线程也写不进去，_auto_pair_here 会把这一下原样还给系统
+                    # —— 依然不会"吞掉按键却什么都没发生"。
+                    action = (_auto_pair_here, (_pair_ch,))
                     suppress = True
                 elif completer.is_visible():
                     if not in_vbe_code_pane():

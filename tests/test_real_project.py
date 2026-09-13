@@ -3410,10 +3410,21 @@ def main():
                 self.lines = [text]
 
             def Lines(self, n, _c):
-                return self.lines[n - 1]
+                # 真 VBE 对"虚拟空行"（末行+1）也返回空串，不报错
+                if 1 <= n <= len(self.lines):
+                    return self.lines[n - 1]
+                return ""
+
+            @property
+            def CountOfLines(self):
+                return len(self.lines)
 
             def ReplaceLine(self, n, t):
                 self.lines[n - 1] = t
+
+            def InsertLines(self, n, t):
+                # 真 VBE：第 n 行处插入，原第 n 行及之后下移
+                self.lines.insert(n - 1, t)
 
         class _Pane35(object):
             def __init__(self, mod, sl, sc, el, ec):
@@ -3430,17 +3441,21 @@ def main():
             def __init__(self, pane):
                 self.ActiveCodePane = pane
 
-        def _pair_run(text, col, ch, ec=None):
-            """返回 (新行, 光标列, 是否代为输入)。ec 不同即视为有选区。"""
+        def _pair_run(text, col, ch, ec=None, line=1):
+            """返回 (该行新文本, 光标列, 是否代为输入)。ec 不同即视为有选区。
+
+            line 可指定光标所在行：>CountOfLines 时即 VBE 的"虚拟空行"。
+            """
             mod = _Mod35(text)
-            pane = _Pane35(mod, 1, col, 1, col if ec is None else ec)
+            pane = _Pane35(mod, line, col, line, col if ec is None else ec)
             _orig = VB35._get_vbe_cached
             VB35._get_vbe_cached = lambda: _Vbe35(pane)
             try:
                 ok = VB35.VbeBackend().insert_pair(ch)
             finally:
                 VB35._get_vbe_cached = _orig
-            return mod.lines[0], pane.sel[1], ok
+            _txt = mod.lines[line - 1] if line - 1 < len(mod.lines) else ""
+            return _txt, pane.sel[1], ok
 
         check("35.11 光标在行尾敲 ( -> 写入 () 且光标停在中间",
               list(_pair_run("x = ", 5, "(")),
@@ -3476,6 +3491,66 @@ def main():
               [_pair_run("x = ab", 5, ")")[2],
                _pair_run("x = ab", 5, ")")[0]],
               expect_contain=[False, "x = ab"])
+        # --- v57：模块末尾的「虚拟空行」上 ReplaceLine 会报参数无效 ---
+        check("35.19 光标在虚拟空行（末行+1）-> 先建行再配对，光标在中间",
+              list(_pair_run("x = ", 1, "(", line=2)),
+              expect_contain=["()", 2, True])
+        check("35.20 行号离谱（差 2 行以上）-> 不管，交兜底",
+              [_pair_run("x = ", 1, "(", line=4)[2]],
+              expect_contain=[False])
+        # --- v57：非主线程绝不能碰 COM（否则会污染全局退避，拖慢提示）---
+        # 只验证守卫判据本身：vbe_bridge._get_vbe_cached 这个模块属性被前面
+        # 小节（14/15/16 节等）换成过 lambda 且没还原，这里拿不到真函数；
+        # 完整路径（子线程调用返回 None 且不计失败）由真机验证覆盖。
+        import threading as _th_mod
+        _box = {}
+
+        def _ask():
+            try:
+                _box["main"] = VB35._on_main_thread()
+            except Exception as _exc:
+                _box["main"] = "EXC:%s" % _exc
+
+        _t = _th_mod.Thread(target=_ask)
+        _t.daemon = True
+        _t.start()
+        _t.join(5)
+        check("35.21 守卫判据：子线程 _on_main_thread() 为 False、主线程为 True",
+              [_box.get("main", "MISSING"), VB35._on_main_thread()],
+              expect_contain=[False, True])
+        # --- v57：配对没做成时的兜底（绝不吞掉用户的按键）---
+        if M is not None:
+            _u32 = M.ctypes.windll
+            _had = "user32" in _u32.__dict__
+            _old = _u32.__dict__.get("user32")
+            try:
+                class _FakeU32(object):
+                    def __init__(self):
+                        self.events = []
+
+                    def SendInput(self, n, ptr, size):
+                        arr = M.ctypes.cast(
+                            ptr, M.ctypes.POINTER(M._INPUT * 2)).contents
+                        for _e in arr:
+                            self.events.append((_e.type, _e.u.ki.wScan,
+                                                _e.u.ki.dwFlags))
+                        return 2
+
+                _fake = _FakeU32()
+                _u32.__dict__["user32"] = _fake
+                _ok = M.send_char("(")
+                check("35.22 兜底重发：keydown+keyup 两个 unicode 事件",
+                      [_ok, len(_fake.events),
+                       chr(_fake.events[0][1]) if _fake.events else "",
+                       _fake.events[0][2] if _fake.events else -1,
+                       _fake.events[1][2] if len(_fake.events) > 1 else -1],
+                      expect_contain=[True, 2, "(", M.KEYEVENTF_UNICODE,
+                                      M.KEYEVENTF_UNICODE | M.KEYEVENTF_KEYUP])
+            finally:
+                if _had:
+                    _u32.__dict__["user32"] = _old
+                else:
+                    _u32.__dict__.pop("user32", None)
     except Exception as _e35:
         check("第 35 节异常: %s" % _e35, [True], expect_contain=[False])
 

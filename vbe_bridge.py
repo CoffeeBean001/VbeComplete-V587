@@ -7,6 +7,7 @@ VBE 后端：通过 pywin32 与正在运行的 Excel VBE 交互。
 
 import os
 import re
+import threading
 import time
 import unicodedata
 
@@ -584,8 +585,26 @@ def _com_fail():
          % (_com_state["fails"], _COM_BACKOFF[i]))
 
 
+def _on_main_thread():
+    """当前是否在【主线程】上 —— 只有主线程允许碰 COM（见 _get_vbe_cached）。"""
+    try:
+        return threading.current_thread() is threading.main_thread()
+    except Exception:
+        return True
+
+
+_warned_thread = {"n": 0}
+
+
 def _get_vbe_cached():
     """取 VBE 对象（**短命**代理，TTL 到期主动放手）。
+
+    v57 重大约束：**只允许主线程调用**。
+    键盘低层钩子运行在系统创建的【钩子线程】上，那个线程没有 COM 单元、
+    也不该被阻塞（钩子回调超时会被 Windows 直接摘掉）。在那里调 COM 必然
+    失败，更糟的是失败会走 _com_fail() 把全局退避打成 1s/2s/5s —— 连主线程
+    的正常轮询一起挡住，表现为"敲一下 `(` 之后提示要等 2~3 秒才出来"。
+    所以这里直接拒绝，并【不记失败】，避免污染退避状态。
 
     注意与"长缓存"的取舍：复用代理确实省一次 GetActiveObject，但代价是我们
     的进程会一直持有 Excel.Application —— 而只要持有它，Excel 就退不干净
@@ -597,6 +616,13 @@ def _get_vbe_cached():
     取到后先访问一次 ActiveCodePane 验证仍可用；Excel/VBE 已关闭会抛异常，
     此时丢弃缓存并返回 None。
     """
+    if not _on_main_thread():
+        # 钩子线程（或其它后台线程）来要 COM：直接拒绝，且【不】计失败 ——
+        # 责任在调用方（它本就不该在这里调），不该让主线程的正常访问连坐。
+        if _warned_thread["n"] < 3:
+            _warned_thread["n"] += 1
+            _log("com: 非主线程请求 COM -> 拒绝（不记失败，请改在主线程调用）")
+        return None
     if com_backoff_remaining() > 0:
         return None
     # 宿主窗口门【每次都查】：FindWindow 是纯 Win32 调用，开销可忽略。
@@ -1135,6 +1161,30 @@ class VbeBackend:
     # 会在【行尾按回车时】补齐缺失的右引号，那与逐字符输入无关，不受影响。
     _PAIR_CLOSE = {"(": ")", '"': '"', ")": ")"}
 
+    @staticmethod
+    def _write_line(cm, line_no, text):
+        """把 text 写回第 line_no 行。返回是否成功。
+
+        VBE 允许光标停在【模块最后一行的下一行】（一个尚不存在的"虚拟空行"），
+        此时 `Lines()` 读出来是空串、看起来一切正常，但 `ReplaceLine()` 会抛
+        "无效的过程调用或参数"。真机实测（模块 9 行、光标在第 10 行）确实如此。
+        这一行得先用 `InsertLines()` 真的建出来，再写内容。
+        """
+        try:
+            n = cm.CountOfLines
+        except Exception:
+            n = None                  # 拿不到行数（桩对象等）-> 按普通行处理
+        try:
+            if n is not None and line_no > n:
+                if line_no != n + 1:
+                    return False      # 差得离谱，不猜，交给调用方兜底
+                cm.InsertLines(line_no, text)
+            else:
+                cm.ReplaceLine(line_no, text)
+            return True
+        except Exception:
+            return False
+
     def insert_pair(self, open_ch):
         """在光标处插入一对符号（`(` -> `()`、`"` -> `""`），光标落在中间。
 
@@ -1173,7 +1223,8 @@ class VbeBackend:
                 new_line, caret_off = _pair_insertion(
                     line_text, col0, open_ch, close_ch)
             if new_line is not None:
-                cm.ReplaceLine(sl, new_line)
+                if not self._write_line(cm, sl, new_line):
+                    return False
                 try:
                     actual = cm.Lines(sl, 1)
                 except Exception:
