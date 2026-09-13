@@ -47,8 +47,9 @@ except ImportError:
     raise
 
 import engine
+import vbe_bridge
 from vbe_bridge import VbeBackend, com_backoff_remaining
-from ui import Popup, MAX_VISIBLE_ROWS
+from ui import Popup, MAX_VISIBLE_ROWS, caret_screen_rect
 from log import log as _log, log_boot as _log_boot
 
 
@@ -278,6 +279,32 @@ def _reconcile_resources(focused, released, backoff, last_focus_time, now, grace
     return mount_hooks, release_com
 
 
+def _vbe_list_up():
+    """VBE 自己是不是正在显示「自动列出成员」列表（是则我们让位）。
+
+    拿不准 / 出任何异常一律返回 False —— 宁可两个列表同时出现，也不能让
+    工具整个哑掉。判据见 vbe_bridge.vbe_list_visible。
+    """
+    try:
+        return vbe_bridge.vbe_list_visible(caret_screen_rect())
+    except Exception:
+        return False
+
+
+def _poll_action(typed_sep, vbe_list_up):
+    """纯函数：本轮轮询该做什么 —— 'hide' 还是 'trigger'。
+
+    - typed_sep  ：这一下敲的是空格 / 标点（v52，别拿右边的词来补全）；
+    - vbe_list_up：VBE 自己的提示列表已经弹出来了（v54）。
+
+    后者与前者同等对待：直接收起、不去 trigger。两个列表同时出现会互相
+    遮挡、还抢键盘，VBE 已经给了就让它给。
+    """
+    if typed_sep or vbe_list_up:
+        return "hide"
+    return "trigger"
+
+
 def main():
 
     _log_boot()
@@ -473,7 +500,8 @@ def main():
             elif key in _MOD_KEYS:
                 pass
             elif key == Key.space and state["ctrl"] and not state["alt"]:
-                if in_vbe_code_pane():
+                # v54：Ctrl+Space 也是 VBE 唤列表的键，它已经弹了就别再弹
+                if in_vbe_code_pane() and not _vbe_list_up():
                     post(completer.trigger)
             elif completer.is_visible() and not _is_ident_char(key) \
                     and key not in _VK_HANDLED_WHEN_VISIBLE:
@@ -700,6 +728,13 @@ def main():
         try:
             snap = backend.snapshot() if _com_allowed() else None
             if snap is not None:
+                # v54：VBE 自己也在弹列表 -> 让位（两个列表同时出现会
+                # 互相遮挡、抢键盘）。文本变没变都要查：按 Ctrl+J 手动
+                # 唤出 VBE 列表时文本是不变的，只有这里能拦住。
+                vbe_up = _vbe_list_up()
+                if vbe_up and completer.is_visible():
+                    _log("poll: VBE 自带列表已出现 -> 收起")
+                    post(completer.hide)
                 last = state.get("last_snap")
                 if last is None:
                     state["last_snap"] = snap      # 首次只记录，不触发
@@ -721,8 +756,12 @@ def main():
                         # 当成"正在输入的词"拿来补全 —— 形参首字符前打空格把
                         # 形参自己提示出来，正是这么来的（详见 engine 里
                         # typed_separator 的说明）。删字的路径是"变短"，不受影响。
-                        if engine.typed_separator(last[1], snap[1]):
-                            _log("poll: 敲了空格/标点 -> 收起")
+                        if _poll_action(
+                                engine.typed_separator(last[1], snap[1]),
+                                vbe_up) == "hide":
+                            _log("poll: %s -> 收起"
+                                 % ("VBE 自带列表已出现" if vbe_up
+                                    else "敲了空格/标点"))
                             post(completer.hide)
                         else:
                             # True: 校验光标前是否标识符字符（不在拼标识符则收起）
