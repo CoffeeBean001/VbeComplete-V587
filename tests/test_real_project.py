@@ -3340,9 +3340,132 @@ def main():
                   [_ui55d.shown], expect_contain=[True])
         finally:
             E.YIELD_TO_VBE_LIST = _orig_yield
+
+        # --- 声明里 `As ` / `New ` 之后：VBE 会弹类型列表，同样让位 ---
+        check("34.18 Dim x As （类型名还没开始打）-> 让位",
+              [_yl("    Dim x As ", 14)], expect_contain=[True])
+        check("34.19 Dim x As In（类型名输入中）-> 让位",
+              [_yl("    Dim x As In", 16)], expect_contain=[True])
+        check("34.20 Set c = New （大写的 New）-> 让位",
+              [_yl("    Set c = New ", 17)], expect_contain=[True])
+        check("34.21 类型名打完并跟了空格 -> 恢复，不让位",
+              [_yl("    Dim x As Long ", 19)], expect_contain=[False])
+        check("34.22 注释里的 As -> 不让位",
+              [_yl("    ' Dim x As ", 16)], expect_contain=[False])
+        check("34.23 变量名 asName（不是 As 关键字）-> 不让位",
+              [_yl("    x = asName", 15)], expect_contain=[False])
     except Exception as _e34:
         check("第 34 节异常: %s" % _e34, [True], expect_contain=[False])
 
+
+    # ==================================================================
+    # 35. 自动配对：`(` -> `()`、`"` -> `""`，光标落在中间
+    # ==================================================================
+    # VBE 原生不自动闭合括号 / 引号（VBE_Extras、Rubberduck 都把它当增强功能加），
+    # 所以由我们补。两条铁律：写成功了才吞键；不该插时【放行】让 VBE 原生处理。
+    print("\n=== 35. 自动配对（括号 / 引号）===")
+    try:
+        # --- 按键 -> 符号（纯函数）---
+        if M is not None:
+            check("35.1 Shift+9 -> (",
+                  [M._pair_char_for_key(0x39, True)],
+                  expect_contain=["("])
+            check("35.2 不按 Shift 的 9 -> 不管",
+                  [M._pair_char_for_key(0x39, False)],
+                  expect_contain=[None])
+            check("35.3 Shift+' -> \"",
+                  [M._pair_char_for_key(0xDE, True)],
+                  expect_contain=['"'])
+            check("35.4 字母键 -> 不管",
+                  [M._pair_char_for_key(0x41, True)],
+                  expect_contain=[None])
+            check("35.5 小键盘 9 -> 不管（NumLock 下是数字）",
+                  [M._pair_char_for_key(0x69, True)],
+                  expect_contain=[None])
+        else:
+            check("35.1 main 不可用", [True], expect_contain=[False])
+
+        # --- 插什么、光标落哪（纯函数）---
+        import vbe_bridge as VB35
+        _pi = VB35._pair_insertion
+        check("35.6 行尾敲 ( -> 补成 ()，光标在中间",
+              list(_pi("x = ", 4, "(", ")")),
+              expect_contain=["x = ()", 5])
+        check("35.7 行尾敲 \" -> 补成 \"\"，光标在中间",
+              list(_pi("s = ", 4, '"', '"')),
+              expect_contain=['s = ""', 5])
+        check("35.8 右边已经有 \" -> 只跨过去，一个字符都不写",
+              list(_pi('s = "abc"', 8, '"', '"')),
+              expect_contain=[None, 9])
+        check("35.9 在未闭合字符串里敲 \" -> 只补收尾那一半",
+              list(_pi('s = "abc', 8, '"', '"')),
+              expect_contain=['s = "abc"', 9])
+        check("35.10 行中间敲 ( -> 就地补一对（不会去补别人的右括号）",
+              list(_pi("foo(a, b)", 5, "(", ")")),
+              expect_contain=["foo(a(), b)", 6])
+
+        # --- 后端集成：真写进"编辑器"（假 VBE）并把光标摆到中间 ---
+        class _Mod35(object):
+            def __init__(self, text):
+                self.lines = [text]
+
+            def Lines(self, n, _c):
+                return self.lines[n - 1]
+
+            def ReplaceLine(self, n, t):
+                self.lines[n - 1] = t
+
+        class _Pane35(object):
+            def __init__(self, mod, sl, sc, el, ec):
+                self.CodeModule = mod
+                self.sel = [sl, sc, el, ec]
+
+            def GetSelection(self):
+                return tuple(self.sel)
+
+            def SetSelection(self, sl, sc, el, ec):
+                self.sel = [sl, sc, el, ec]
+
+        class _Vbe35(object):
+            def __init__(self, pane):
+                self.ActiveCodePane = pane
+
+        def _pair_run(text, col, ch, ec=None):
+            """返回 (新行, 光标列, 是否代为输入)。ec 不同即视为有选区。"""
+            mod = _Mod35(text)
+            pane = _Pane35(mod, 1, col, 1, col if ec is None else ec)
+            _orig = VB35._get_vbe_cached
+            VB35._get_vbe_cached = lambda: _Vbe35(pane)
+            try:
+                ok = VB35.VbeBackend().insert_pair(ch)
+            finally:
+                VB35._get_vbe_cached = _orig
+            return mod.lines[0], pane.sel[1], ok
+
+        check("35.11 光标在行尾敲 ( -> 写入 () 且光标停在中间",
+              list(_pair_run("x = ", 5, "(")),
+              expect_contain=["x = ()", 6, True])
+        check("35.12 光标在行尾敲 \" -> 写入 \"\" 且光标停在中间",
+              list(_pair_run("s = ", 5, '"')),
+              expect_contain=['s = ""', 6, True])
+        check("35.13 注释里敲 ( -> 不管（返回 False，调用方会放行按键）",
+              [_pair_run("' x = ", 7, "(")[2],
+               _pair_run("' x = ", 7, "(")[0]],
+              expect_contain=[False, "' x = "])
+        check("35.14 有选区 -> 不管（替换语义交给 VBE）",
+              [_pair_run("x = ab", 3, "(", ec=6)[2],
+               _pair_run("x = ab", 3, "(", ec=6)[0]],
+              expect_contain=[False, "x = ab"])
+        _orig_g = VB35._get_vbe_cached
+        try:
+            VB35._get_vbe_cached = lambda: None
+            _bk = VB35.VbeBackend()
+            check("35.15 COM 拿不到 VBE -> 不管，且不炸",
+                  [_bk.insert_pair("(")], expect_contain=[False])
+        finally:
+            VB35._get_vbe_cached = _orig_g
+    except Exception as _e35:
+        check("第 35 节异常: %s" % _e35, [True], expect_contain=[False])
 
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))

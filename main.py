@@ -24,15 +24,20 @@ VbeComplete 主入口（修复版）
   - Esc     取消；鼠标单击/双击候选也可确认；
   - ← / →   移动光标即收起列表（与"鼠标点到别处"同义），按键照常放行；
   - Ctrl+Space  手动触发。
+  - 自动配对：敲 `(` 自动补 `)`、敲 `"` 自动补另一个 `"`，光标停在**中间**；
+    光标右边已经有那个右半边时（打完 `"abc` 再按 `"`）就只是【跨过去】，
+    不会补出 `""` 双份。注释里不做，有选区时不做。
   注（v49）：数字键 1~9 不再用于选词，候选也不再显示序号 —— 弹窗开着时
   照常输入数字，定义 `s1` / `arr17` 这类名字不会被列表抢走。
 
   v55：VBE 自己弹「自动列出成员」时我们让位（写 `UserForm1.` 后输入成员名、
-  或按 Ctrl+J），只让位那一会儿，成员名一打完就恢复。VBE 那个列表是画在代码
-  窗格上的、没有独立窗口，所以判据走光标的语法位置（见 engine.vbe_list_expected）。
-  想彻底关掉让位：设环境变量 VBECOMPLETE_NO_YIELD=1。
+  `Dim x As ` 后填类型名、或按 Ctrl+J），只让位那一会儿，名字一打完就恢复。
+  VBE 那个列表是画在代码窗格上的、没有独立窗口，所以判据走光标的语法位置
+  （见 engine.vbe_list_expected）。想彻底关掉让位：设 VBECOMPLETE_NO_YIELD=1。
+  想关掉自动配对：设 VBECOMPLETE_NO_AUTOPAIR=1。
 """
 
+import os
 import sys
 import time
 import ctypes
@@ -74,6 +79,8 @@ VK_UP = 0x26
 VK_RIGHT = 0x27
 VK_DOWN = 0x28
 VK_PROCESSKEY = 0xE5   # IME 组字过程中的按键（vkCode=229），不携带真实字符
+VK_CONTROL = 0x11
+VK_MENU = 0x12         # Alt
 
 NAV_VKS = (VK_UP, VK_DOWN)
 
@@ -85,6 +92,42 @@ def _is_newline_shortcut(vk, shift_down):
     VK_RETURN，因此与主键盘一视同仁。
     """
     return vk == VK_RETURN and bool(shift_down)
+
+
+def _pair_char_for_key(vk, shift_down):
+    """这个键敲出来的是不是需要自动配对的符号 —— 返回 '(' / '"' / None。
+
+    刻意去问系统「这个 vk 在当前键盘布局下的基础字符是什么」
+    （MapVirtualKeyW），而不是写死 vk 常量：布局不同也不会配错。
+    小键盘（NumLock 下按 9 就是数字 9）一律不管。
+    """
+    if not shift_down:
+        return None
+    try:
+        if 0x60 <= vk <= 0x69:                       # 小键盘
+            return None
+        base = ctypes.windll.user32.MapVirtualKeyW(vk, 2) & 0xFFFF
+        if not base:
+            return None
+        ch = chr(base)
+    except Exception:
+        return None
+    if ch == "9":
+        return "("
+    if ch in ("'", '"'):
+        return '"'
+    return None
+
+
+def _mod_down():
+    """Ctrl 或 Alt 是否被按住（组合键不该触发自动配对）。"""
+    try:
+        u32 = ctypes.windll.user32
+        ctrl = bool(u32.GetAsyncKeyState(VK_CONTROL) & 0x8000)
+        alt = bool(u32.GetAsyncKeyState(VK_MENU) & 0x8000)
+        return ctrl or alt
+    except Exception:
+        return False
 
 
 def _shift_down():
@@ -166,6 +209,17 @@ POLL_INTERVAL_IDLE_MS = 2000
 #
 # 刻意取得比 VSCode 收尾略长（2.5 秒），宁可多等半秒也不要再拖慢一次关闭。
 HOOK_SUPPRESS_SEC = 2.5
+
+# 自动配对：敲 `(` 补 `)`、敲 `"` 补另一个 `"`，光标落在中间。
+#
+# VBE 原生【不会】自动闭合括号 / 引号（VBE_Extras、Rubberduck 都把它当增强功能
+# 往外加），所以由我们补上不会出现"两边都补"的双份；VBE 只在【行尾按回车时】
+# 才补缺失的右引号，与逐字符输入不冲突。
+# 想关掉：set VBECOMPLETE_NO_AUTOPAIR=1
+try:
+    AUTO_PAIR = os.environ.get("VBECOMPLETE_NO_AUTOPAIR", "0").strip() != "1"
+except Exception:
+    AUTO_PAIR = True
 
 # 文本变化后，标识符缓存最快多久允许重解析一次（秒）。
 # 太小会每敲一个键都全量解析所有模块（大工程会卡），太大则新声明的变量
@@ -427,10 +481,24 @@ def main():
                 # 只在【焦点在 VBE 代码窗】且【COM 没在失败退避】时才吞键；
                 # 否则放行，让 VBE 按原生行为处理（原生 Shift+Enter == 回车），
                 # 绝不"吞了按键却什么都没发生"。
+                _pair_ch = (_pair_char_for_key(vk, _shift_down())
+                            if AUTO_PAIR else None)
                 if (_is_newline_shortcut(vk, _shift_down())
                         and com_backoff_remaining() <= 0
                         and in_vbe_code_pane()):
                     action = (_new_line_here, ())
+                    suppress = True
+                elif (_pair_ch
+                        and not _mod_down()
+                        and com_backoff_remaining() <= 0
+                        and in_vbe_code_pane()
+                        and backend.insert_pair(_pair_ch)):
+                    # 自动配对：写成功了才吞键。
+                    #
+                    # 刻意【同步】做（而不是 post 给主线程）：吞键是不可撤销的，
+                    # 必须先确知文本真的写进去了。写不进去（在注释里、有选区、
+                    # COM 出问题）就【放行】，让 VBE 按原生行为插一个字符 ——
+                    # 绝不能"吞掉按键却什么都没发生"。
                     suppress = True
                 elif completer.is_visible():
                     if not in_vbe_code_pane():

@@ -707,6 +707,58 @@ def _is_std_module(comp_type):
         return True   # 取不到类型时按标准模块处理（最宽松，不误伤）
 
 
+def _caret_char_col(cm, cp, line_no, line_text, ec):
+    """VBE 给的光标列 ec（显示列）-> (字符列 1-based, sem, tabw, wide2)。
+
+    VBE 的 ec 是显示列（中文等全角占 2 格），而 line_text 是字符序列；行内含
+    Tab / 全角时必须换算，否则索引会越过行尾或落在中文中间。换算结果连同本次
+    的列语义一起返回，供"写回后摆光标"复用同一套算法。
+
+    判定顺序（越靠前越安全，与 get_context 一致）：
+      1) 被动判定：完全不移动光标（打字时光标多在行尾，这条最常用）；
+      2) 会话缓存：同一编辑器探测一次后长期复用；
+      3) 才移动光标探测（_probe_semantics 会自动还原+校验，还原不可靠的编辑器
+         会永久禁用探测，避免光标乱跳）。
+    """
+    if ec <= 0:
+        return 1, "char", 4, False
+    if not ("\t" in line_text or any(_is_wide(c) for c in line_text)):
+        return min(ec, len(line_text) + 1), "char", 4, False
+    info = _detect_semantics_passive(line_text, ec)
+    if info is None:
+        info = _sem_cache.get("info")
+    if info is None:
+        info = _probe_semantics(cm, cp, line_no, line_text)
+    if info is None:
+        info = ("char", 4, False)
+    sem, tabw, wide2 = info
+    if sem == "disp":
+        return (_col_to_char_index(line_text, ec, tabw, wide2) + 1,
+                sem, tabw, wide2)
+    return min(ec, len(line_text) + 1), sem, tabw, wide2
+
+
+def _pair_insertion(line_text, col0, open_ch, close_ch):
+    """算出自动配对后的 (新行文本, 光标字符下标 0-based)。
+
+    新行文本为 None 表示"一个字符都不用写，只把光标挪到 caret_off"—— 右半边
+    已经在光标右边时（打完 `s = "abc` 再按 `"`），再插一对就会变成 `""`，
+    此时应当像现代编辑器那样"跨过去"。
+
+    引号是特殊的一个键（既开又闭），所以额外看【光标左边引号数的奇偶】：
+    奇数说明正处在未闭合的字符串里，这一下是收尾的那一半，只补一个。
+    """
+    if open_ch == '"':
+        if col0 < len(line_text) and line_text[col0] == '"':
+            return None, col0 + 1                       # 跨过去
+        inside = line_text[:col0].count('"') % 2 == 1
+        if inside:
+            return line_text[:col0] + '"' + line_text[col0:], col0 + 1
+        return line_text[:col0] + '""' + line_text[col0:], col0 + 1
+    return (line_text[:col0] + open_ch + close_ch + line_text[col0:],
+            col0 + 1)
+
+
 class VbeBackend:
     def __init__(self):
         self._cache = None
@@ -1076,6 +1128,71 @@ class VbeBackend:
         """
         return getattr(self, "_type_names", set())
 
+    # ---- 自动配对：输入 ( / " 自动补右半边 ----
+    #
+    # VBE 原生【不会】自动闭合括号和引号（VBE_Extras / Rubberduck 都把它当增强
+    # 功能往外加），所以这里补上不会出现"两边都补"的双份。唯一要注意的是 VBE
+    # 会在【行尾按回车时】补齐缺失的右引号，那与逐字符输入无关，不受影响。
+    _PAIR_CLOSE = {"(": ")", '"': '"'}
+
+    def insert_pair(self, open_ch):
+        """在光标处插入一对符号（`(` -> `()`、`"` -> `""`），光标落在中间。
+
+        返回 True = "这一下我代为输入了"（调用方据此吞掉原按键）；
+        返回 False = "我没管"（在注释里 / 有选区 / COM 出问题），调用方必须
+        **放行按键**让 VBE 按原生行为处理 —— 绝不吞掉用户的按键却什么都没发生。
+        """
+        close_ch = self._PAIR_CLOSE.get(open_ch)
+        if not close_ch:
+            return False
+        new_line = None
+        try:
+            vbe = _get_vbe_cached()
+            if vbe is None:
+                return False
+            cp = vbe.ActiveCodePane
+            if cp is None:
+                return False
+            cm = cp.CodeModule
+            sl, sc, el, ec = cp.GetSelection()
+            if sl != el or sc != ec:
+                return False          # 有选区：替换语义交给 VBE，别插
+            line_text = cm.Lines(sl, 1)
+            col, sem, tabw, wide2 = _caret_char_col(
+                cm, cp, sl, line_text, ec)
+            col0 = max(0, min(col - 1, len(line_text)))
+            if _classify(line_text, col0 + 1)[1]:
+                return False          # 注释里不自动配对（VBE 也不）
+            new_line, caret_off = _pair_insertion(
+                line_text, col0, open_ch, close_ch)
+            if new_line is not None:
+                cm.ReplaceLine(sl, new_line)
+                try:
+                    actual = cm.Lines(sl, 1)
+                except Exception:
+                    actual = new_line
+                if actual != new_line:
+                    # VBE 做了规范化：只要插入点仍是我们要的那个符号，光标位置
+                    # 依旧成立；认不出来就退到行尾附近，绝不越界。
+                    if actual[col0:col0 + 1] != open_ch:
+                        caret_off = min(caret_off, len(actual))
+            else:
+                # 右半边已经在光标右边：只把光标挪过去，一个字符都不写
+                actual = line_text
+                caret_off = min(caret_off, len(actual))
+            if sem == "disp":
+                col = _disp_width(actual, tabw, wide2, upto=caret_off) + 1
+            else:
+                col = caret_off + 1
+            cp.SetSelection(sl, col, sl, col)
+            return True
+        except Exception:
+            return False
+        finally:
+            # 与 apply_completion 同理：写过代码（VBAProject 变脏），立刻放手。
+            if new_line is not None:
+                _release_vbe_proxy()
+
     # ---- 当前光标上下文 ----
     def get_context(self):
         try:
@@ -1096,30 +1213,8 @@ class VbeBackend:
             # 若直接拿 ec 去 _classify 索引 line_text，行内含全角时 ec-1 会
             # 超过 len(line_text)-1 -> IndexError -> get_context 返回 None
             # -> 中文输入永远不弹列表（纯英文行显示列==字符列，所以一直正常）。
-            ec_char = ec
-            sem, tabw, wide2 = "char", 4, False
-            has_wide = any(_is_wide(c) for c in line_text)
-            if ec > 0 and ("\t" in line_text or has_wide):
-                # 判定顺序（越靠前越安全）：
-                #   1) 被动判定：完全不移动光标（打字时光标多在行尾，这条最常用）；
-                #   2) 会话缓存：同一编辑器探测一次后长期复用；
-                #   3) 才移动光标探测（_probe_semantics 会自动还原+校验，
-                #      还原不可靠的编辑器会永久禁用探测，避免光标乱跳）。
-                info = _detect_semantics_passive(line_text, ec)
-                if info is None:
-                    info = _sem_cache.get("info")
-                if info is None:
-                    info = _probe_semantics(cm, cp, sl, line_text)
-                if info is None:
-                    info = ("char", 4, False)
-                sem, tabw, wide2 = info
-                if sem == "disp":
-                    idx = _col_to_char_index(line_text, ec, tabw, wide2)
-                    ec_char = idx + 1
-                else:
-                    ec_char = min(ec, len(line_text) + 1)
-            elif ec > 0:
-                ec_char = min(ec, len(line_text) + 1)
+            ec_char, sem, tabw, wide2 = _caret_char_col(
+                cm, cp, sl, line_text, ec)
             in_str, in_comment = _classify(line_text, ec_char)
             # 声明里 `As` 之后的数据类型名位置：正在填类型名，不该提示变量名。
             # 即便后面的变量名前缀匹配上已有标识符，也应保持静默。

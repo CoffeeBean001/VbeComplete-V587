@@ -212,8 +212,8 @@ def typed_separator(old_line, new_line):
 # 跟我们撞车的就是成员访问：光标停在 `标识符.` 之后、正在输入成员名 ——
 # `UserForm1.` / `Me.` / `Sheet1.Range(...).` 全是这种。
 #
-# 只认这一种，宁可少拦也别再弄成"一直不弹"：让位只在那个位置成立，成员名
-# 一打完（空格、等号、换行）立刻恢复。
+# 只认这两种，宁可少拦也别再弄成"一直不弹"：让位只在那些位置成立，成员名 /
+# 类型名一打完（空格、等号、换行）立刻恢复。
 
 # 点号左边允许出现的"能取成员的东西"末尾字符
 _MEMBER_OWNER_TAIL = "_)]}"
@@ -240,8 +240,8 @@ def _in_comment_or_string(line_text, col):
     return in_str
 
 
-def vbe_list_expected(line_text, caret_col):
-    """光标是否正停在 VBE 会自己弹「自动列出成员」列表的位置（是则我们让位）。
+def vbe_member_list_expected(line_text, caret_col):
+    """光标是否正停在 VBE 会自己弹【成员列表】的位置（`标识符.` 之后）。
 
     判据：光标左边形如 `xxx.` + 正在输入的成员名（成员名可以还没开始打）。
     纯文本判定，不碰窗口、不碰 COM，可单测。
@@ -274,7 +274,41 @@ def vbe_list_expected(line_text, caret_col):
     if line_text[s + 1:m + 1].isdigit():
         return False
     # 5) 注释 / 字符串里 VBE 不弹，我们照旧弹
-    return not _in_comment_or_string(line_text, k + 1)
+    if _in_comment_or_string(line_text, k + 1):
+        return False
+    return True
+
+
+def _in_type_list_position(line_text, caret_col):
+    """光标是否停在 `As ` / `New ` 之后 —— VBE 在这里会弹【类型列表】。
+
+    `Dim x As ` / `Set c = New ` 之后敲的第一个字母就会把 VBE 的类型列表唤出来，
+    跟我们的弹窗撞在同一处，同样要让位。判据刻意简单：光标左边（去掉正在输入
+    的那个词之后）以 `As` 或 `New` 收尾即可，不去看整句是不是合法声明 ——
+    `As` / `New` 是关键字，正常代码里不会有别的以它收尾的位置。
+    """
+    if not line_text or not caret_col or caret_col < 1:
+        return False
+    i = min(caret_col - 1, len(line_text))
+    j = i - 1
+    while j >= 0 and (line_text[j].isalnum() or line_text[j] == "_"):
+        j -= 1
+    head = line_text[:j + 1].rstrip().lower()
+    if not (head.endswith(" as") or head.endswith(" new")):
+        return False
+    # 注释 / 字符串里 VBE 不弹，我们照旧弹
+    return not _in_comment_or_string(line_text, j + 2)
+
+
+def vbe_list_expected(line_text, caret_col):
+    """光标是否正停在 VBE 会自己弹列表的位置（是则我们让位）。
+
+    两种位置：
+      1. 成员访问 —— 光标停在 `标识符.` 之后（含成员名输入中）；
+      2. 类型位置 —— 光标停在 `As ` / `New ` 之后填类型名。
+    """
+    return (vbe_member_list_expected(line_text, caret_col)
+            or _in_type_list_position(line_text, caret_col))
 
 
 def replace_word(line_text, word_start_col, caret_col, completion):
