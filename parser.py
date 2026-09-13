@@ -398,10 +398,23 @@ def _usage_candidates(masked_code, excluded):
     """
     found = []
     seen = set()
-    # 编译指令 / API 声明 / 模块属性行不参与用法扫描（否则函数名、库名会被当变量）
-    kept = "\n".join("" if _RE_USAGE_SKIP_LINE.match(l) else l
-                     for l in masked_code.split("\n"))
-    masked_code = kept
+    # 编译指令 / API 声明 / 模块属性行不参与用法扫描（否则函数名、库名会被当变量）。
+    #
+    # 【关键】必须抹成【等长空格】而不是空串 —— 本函数返回的偏移是与
+    # _line_proc_map 算出的 offsets 配对使用的（调用方靠它定位"这个名字属于
+    # 哪个过程"）。早期实现把整行替换成 ""，使后续所有字符偏移整体前移；
+    # 真实模块头部动辄有 5 行以上 `Attribute VB_xxx` + `Option Explicit`
+    # （累计可前移 150+ 字符），于是偏移与 offsets 彻底错位 ——
+    # 只读用法扫出来的隐式变量会被算到【别的过程】甚至【模块级】，
+    # 表现为"一个过程里的变量泄漏到另一个过程（含其形参位置）"。
+    # 抹成空格后长度不变，偏移始终与 offsets 对齐。
+    kept_parts = []
+    for l in masked_code.split("\n"):
+        if _RE_USAGE_SKIP_LINE.match(l):
+            kept_parts.append(" " * len(l))     # 等长空格：屏蔽内容、保留偏移
+        else:
+            kept_parts.append(l)
+    masked_code = "\n".join(kept_parts)
     n = len(masked_code)
     for m in re.finditer(_IDENT, masked_code):
         name = m.group(0)

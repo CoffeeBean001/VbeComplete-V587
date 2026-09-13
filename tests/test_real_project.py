@@ -2539,6 +2539,110 @@ def main():
         check("第 19 节不可用（vbe_bridge 导入失败）: %s" % _e, [True],
               expect_contain=[True])
 
+    # ---- 30. v50：跨过程泄漏（只读隐式变量被算到别的过程 / 模块级）----
+    #
+    # 病根：_usage_candidates 把 `Attribute VB_xxx` / `Option Explicit` 这类
+    # 行【替换成空串】以屏蔽内容，但这会缩短文本、让后续所有字符偏移整体前移；
+    # 而调用方 _line_proc_map 算 offsets 用的是【未压缩】的文本。
+    # 真实模块头部动辄 5 行以上 Attribute + Option（累计前移 150+ 字符），
+    # 于是"只被读取、从未被赋值"的隐式变量被算成 proc=None（模块级）——
+    # 全模块每个过程都能看到它，包括别的过程的**形参位置**。
+    #
+    # 修复：跳过行改为抹成【等长空格】，偏移恒定对齐。
+    print("\n=== 30. 跨过程泄漏：跳过行必须等长屏蔽（v50）===")
+    try:
+        _HDR30 = [
+            'Attribute VB_Name = "Module1"',
+            "Attribute VB_GlobalNameSpace = False",
+            "Attribute VB_Creatable = False",
+            "Attribute VB_PredeclaredId = False",
+            "Attribute VB_Exposed = False",
+            "Option Explicit",
+        ]
+        _code30 = "\n".join(_HDR30 + [
+            "",
+            "Public Sub ProcedureA()",
+            "    Debug.Print targetName",
+            "End Sub",
+            "",
+            "Public Sub ProcedureB(ByVal sheetName As String)",
+            "    Debug.Print resultValue",
+            "End Sub",
+        ])
+
+        # 30.1 偏移对齐：_usage_candidates 返回的偏移必须与 offsets 同基准
+        _masked30 = P._mask_strings_and_comments(_code30)
+        _masked30 = P._RE_CONTINUATION.sub(" ", _masked30)
+        _offs30, _lp30 = P._line_proc_map(_masked30)
+        _owner30 = {n: P._proc_at_offset(_offs30, _lp30, p)
+                    for n, p in P._usage_candidates(_masked30, set())}
+        check("30.1 只读隐式变量归属正确（不再落到模块级）",
+              [_owner30.get("targetName"), _owner30.get("resultValue")],
+              expect_contain=["ProcedureA", "ProcedureB"])
+
+        # 30.2 跳过行长度不变（等长屏蔽）
+        _kept30 = "\n".join(" " * len(l) if P._RE_USAGE_SKIP_LINE.match(l) else l
+                            for l in _masked30.split("\n"))
+        check("30.2 跳过行抹成等长空格（偏移不漂移）",
+              [len(_kept30), len(_masked30)],
+              expect_contain=[len(_masked30), len(_masked30)])
+
+        # 30.3 端到端：A 的变量不得出现在 B 的可见集（B 的形参位置）
+        _r30 = list(P.extract_records(_code30, module="M1", is_std_module=True))
+        _r30 += P.extract_implicit_records(_code30, module="M1",
+                                           is_std_module=True, declared=_r30,
+                                           scope="proc")
+        _visB30 = E.filter_identifiers_by_scope(_r30, "ProcedureB", "M1")
+        _visA30 = E.filter_identifiers_by_scope(_r30, "ProcedureA", "M1")
+        check("30.3 A 的只读变量不泄漏到 ProcedureB",
+              [n for n in _visB30 if str(n).lower() == "targetname"],
+              expect_contain=[])
+        check("30.3 B 的只读变量不泄漏到 ProcedureA",
+              [n for n in _visA30 if str(n).lower() == "resultvalue"],
+              expect_contain=[])
+        check("30.3 各自的只读变量在自己过程里仍提示",
+              [sorted(str(n) for n in _visA30 if str(n).lower() == "targetname"),
+               sorted(str(n) for n in _visB30 if str(n).lower() == "resultvalue")],
+              expect_contain=[["targetName"], ["resultValue"]])
+
+        # 30.4 头部越"胖"，旧实现漂移越大 —— 多 Attribute 行下依然正确
+        _fat30 = "\n".join([
+            'Attribute VB_Name = "M"',
+            "Attribute VB_GlobalNameSpace = False",
+            "Attribute VB_Creatable = False",
+            "Attribute VB_PredeclaredId = False",
+            "Attribute VB_Exposed = False",
+            "#If VBA7 Then",
+            "#End If",
+            "Option Explicit",
+            "Option Base 0",
+            "",
+            "Public Sub AA()",
+            "    Debug.Print onlyInAA",
+            "End Sub",
+            "",
+            "Public Sub BB()",
+            "    Debug.Print onlyInBB",
+            "End Sub",
+        ])
+        _m30b = P._RE_CONTINUATION.sub(
+            " ", P._mask_strings_and_comments(_fat30))
+        _o30b, _p30b = P._line_proc_map(_m30b)
+        _own30b = {n: P._proc_at_offset(_o30b, _p30b, p)
+                   for n, p in P._usage_candidates(_m30b, set())}
+        check("30.4 更胖的模块头部下归属仍正确",
+              [_own30b.get("onlyInAA"), _own30b.get("onlyInBB")],
+              expect_contain=["AA", "BB"])
+
+        # 30.5 回归：跳过行里的名字不该被当成隐式变量收录
+        check("30.5 Attribute 行里的名字不当变量",
+              [n for n, _p in P._usage_candidates(_masked30, set())
+               if str(n).lower() in ("vb_name", "vb_globalnamespace",
+                                     "explicit")],
+              expect_contain=[])
+    except Exception as _e30:
+        check("第 30 节异常: %s" % _e30, [True], expect_contain=[False])
+
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))
     if FAILURES:
