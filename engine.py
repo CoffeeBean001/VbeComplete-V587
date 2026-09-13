@@ -440,12 +440,17 @@ class Completer:
         except Exception:
             return set()
 
-    def _live_names_outside_caret(self, ctx=None):
+    def _live_names_outside_caret(self, ctx=None, scope_only=False):
         """现场扫描当前模块：抹掉光标处的词之后，里面还出现过的名字（小写）。
 
-        可选接口 backend.names_outside_caret(caret)。
+        可选接口 backend.names_outside_caret(caret, scope_only=False)。
         返回 None 表示【现场证据不可用】（后端没实现 / 读不到），
         此时调用方退回"声明集合"这一路证据（行为等同旧版，不会更糟）。
+
+        scope_only=True（v51）：只要【光标处可见的那个作用域】里的出现 ——
+        模块级行 + 光标所属过程的行，别的过程体内的一律不算。用于"正在过程内
+        声明一个名字"的场景（形参 / 局部 Dim），详见 trigger 里的说明。
+        后端没实现这个参数时退回全模块扫描（旧行为，不会更糟）。
         """
         if ctx is None:
             ctx = self.ctx or {}
@@ -456,7 +461,10 @@ class Completer:
         if not line_no or not col:
             return None
         try:
-            got = hook((int(line_no), int(col)))
+            try:
+                got = hook((int(line_no), int(col)), scope_only)
+            except TypeError:
+                got = hook((int(line_no), int(col)))   # 旧式单参实现
             if got is None:
                 return None       # 后端读不到（COM 失败）
             return set(str(n).lower() for n in got)
@@ -491,6 +499,9 @@ class Completer:
            Function/Type/Enum 真正声明过。跨模块的 Public 名字靠这一条。
         2. 现场扫描当前模块（把光标处的词抹掉后）还能找到它 —— 隐式变量
            （用到即存在）、以及解析层没能归类的声明，靠这一条兜住。
+           v51：调用方可能传入【按作用域收窄过】的 live（只含模块级 + 光标
+           所属过程里的出现）。此时"别的过程里的同名局部变量"不算证据 ——
+           它不是光标处的合法引用，只是文字巧合（详见 trigger 里的 scope_only）。
 
         只用 1 会漏判隐式变量（正是 v35"打全 arr 列表消失"的成因）；
         只用 2 会漏判跨模块的 Public 名字（`names_outside_caret` 刻意只扫
@@ -679,6 +690,24 @@ class Completer:
             # 性能：只有"缓存里没有它"或"它就是那个光标旧词"时才需要现场扫描。
             # 正常打字路径候选都在声明集合里，一次 COM 都不会多打。
             low_word = word.lower()
+            # 光标处【正在声明的名字】（形参 / 局部 Dim / 过程名 / Type 成员…），
+            # 由后端解析当前声明行得到（ctx["decl_names"]）。
+            decl_at_caret = set(str(n).lower()
+                                for n in (ctx.get("decl_names") or ()))
+            # 若"正在输入的词"本身就是这里正在声明的名字，且声明发生在【过程内】，
+            # 那它此刻的作用域是过程局部的 —— 现场证据也必须限定在同一个窗口里
+            # 取（模块级 + 本过程），别的过程里的出现不算数。
+            #
+            # 不这么做会怎样（用户报的 bug）：ProcedureA 里有局部变量 username，
+            # 你在 ProcedureB 的形参位置打 / 回退 / 粘一个同名的 username ——
+            # 逐字符看，"别的过程里出现过 username"会被当成"这个名字真实存在"
+            # 的铁证，于是弹窗把用户刚敲进去的字原样提示出来（提示自己）。
+            # 只有【一模一样】才会触发：换成任何别处都没有的新名字，现场扫不到，
+            # 回声防护照常把它剔掉 —— 正好对应用户描述的"不相同就不提示"。
+            #
+            # 模块级声明不受此限（proc_name 为空）：模块级名字本来就全模块可见，
+            # 任何出现都是它的合法引用（v37 语义：`Sub test` 打全仍要提示）。
+            scope_only = bool(ctx.get("proc_name") and low_word in decl_at_caret)
 
             def _is_echo_candidate(name):
                 # 连续子串：前缀（结尾删）/ 后缀（开头删）/ 中段（头尾都删）
@@ -696,7 +725,9 @@ class Completer:
                 # 现场证据【每次都要取】：判断"声明在本模块的名字是不是已被
                 # 删掉"只能靠现场文本（声明集合最长滞后 0.4s）。代价是每次触发
                 # 多读一次当前模块文本，远比全量重解析便宜。
-                live = self._live_names_outside_caret(ctx)
+                # scope_only：过程内声明（形参 / 局部 Dim）只看本过程与模块级
+                # 的出现，别把别的过程的同名局部变量当证据（见上面 scope_only）。
+                live = self._live_names_outside_caret(ctx, scope_only=scope_only)
                 matches = [
                     m for m in matches
                     if not _is_echo_candidate(m)

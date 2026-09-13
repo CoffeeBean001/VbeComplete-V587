@@ -790,7 +790,7 @@ class VbeBackend:
             self.get_identifiers()
         return getattr(self, "_declared_names", set())
 
-    def names_outside_caret(self, caret):
+    def names_outside_caret(self, caret, scope_only=False):
         """把光标处的词抹掉后，【当前模块】里还出现过的名字（小写集合）。
 
         `name_exists_outside_caret` 的批量版：一次读取模块文本，供引擎在剔除
@@ -798,6 +798,19 @@ class VbeBackend:
 
         刻意只读【当前模块】：回声只可能产生于正在编辑的这个模块；全工程扫描
         既没必要，又会在多模块大工程上明显变慢。
+
+        scope_only=True（v51）：只收集【从光标处看得见】的出现 —— 模块级行
+        （含过程/Type 声明头行、模块声明区）与光标所属过程的行；*别的过程体内
+        的出现一律不算*。
+
+        为什么需要这个窄窗口：用户正在【过程内声明一个名字】（形参 / 局部 Dim）
+        时，这个名字是过程局部的。若现场证据仍是"全模块出现过"，那么"别的过程
+        里的同名局部变量"就会被当成"这个名字真实存在"的铁证，回声防护随即放行，
+        于是用户把别的过程的变量名原样敲/回退/粘贴到形参位置时，弹窗提示出自己
+        ——正是用户报的"只有一模一样才会提示自己"。收窄到可见窗口后，那种出现
+        不再是证据，候选照常按回声剔除。
+        默认 False = 全模块扫描（模块级声明的场景仍走这一路：模块级名字本就
+        全模块可见，任何出现都是它的合法引用，见 v37 语义）。
         """
         # 读不到就返回 None（= 现场证据不可用），与"真的没有名字"（空集）
         # 区分开 —— 调用方据此决定是保守放过还是照常判定。
@@ -824,8 +837,42 @@ class VbeBackend:
         except Exception:
             src = code
         try:
-            return set(m.group(0).lower()
-                       for m in re.finditer(r"[^\W\d]\w*", src))
+            if not scope_only:
+                return set(m.group(0).lower()
+                           for m in re.finditer(r"[^\W\d]\w*", src))
+            rows = src.split("\n")
+            if not (1 <= line_no <= len(rows)):
+                # 行号对不上（理论上不该发生）：保守退回全模块扫描，
+                # 宁可少剔除候选，也不要凭错的窗口把真名字误杀。
+                return set(m.group(0).lower()
+                           for m in re.finditer(r"[^\W\d]\w*", src))
+            # 逐行标注归属：声明头行归属【它自己声明的那个过程】（与
+            # parser._line_proc_map 一致），但它在下面按模块级收集 —— 过程的
+            # 声明本身就是模块级语句，`Public Sub update()` 这种模块级过程名
+            # 必须在这里找得到，否则在别的过程里就再也搜不到它了。
+            owners = []
+            cur = None
+            for raw in rows:
+                s = raw.strip()
+                if vba_parser._RE_ANY_PROC_END.match(s):
+                    cur = None
+                m_head = (vba_parser._RE_SUB.match(s)
+                          or vba_parser._RE_PROP.match(s))
+                if m_head:
+                    cur = m_head.group(1)
+                owners.append((cur, bool(m_head)))
+            keep = owners[line_no - 1][0] or ""
+            if not keep:
+                # 光标不在任何过程里（模块声明区）：没有可收窄的窗口。
+                return set(m.group(0).lower()
+                           for m in re.finditer(r"[^\W\d]\w*", src))
+            kl = str(keep).lower()
+            names = set()
+            for (owner, is_header), raw in zip(owners, rows):
+                if owner is None or is_header or str(owner).lower() == kl:
+                    names.update(m.group(0).lower()
+                                 for m in re.finditer(r"[^\W\d]\w*", raw))
+            return names
         except Exception:
             return None
 

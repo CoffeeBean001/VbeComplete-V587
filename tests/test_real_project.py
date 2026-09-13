@@ -2643,6 +2643,232 @@ def main():
     except Exception as _e30:
         check("第 30 节异常: %s" % _e30, [True], expect_contain=[False])
 
+    # ---- 31. v51：形参名与别的过程的变量重名时不得"提示自己" ----
+    #
+    # 用户报的现象：在 ProcedureB 的形参位置，打 / 回退 / 粘贴一个与
+    # ProcedureA 的局部变量一模一样的名字，弹窗会把刚敲进去的字原样提示出来；
+    # 换成任何别处都没有的新名字反而安静（"不相同就不提示"）。
+    #
+    # 根因：形参位置的输入会被解析成 ProcedureB 自己的形参记录 —— 于是
+    # "别的过程里出现过这个名字"（现场全模块扫描）被当成了"这个名字真实存在"
+    # 的铁证，回声防护放行。本节的 31.1 先复现旧行为，31.2 起验证修复。
+    print("\n=== 31. 形参位置不提示自己（v51：现场证据按作用域收窄）===")
+    try:
+        import vbe_bridge as VB31
+
+        _HDR31 = [
+            'Attribute VB_Name = "Module1"',
+            "Attribute VB_GlobalNameSpace = False",
+            "Attribute VB_Creatable = False",
+            "Attribute VB_PredeclaredId = False",
+            "Attribute VB_Exposed = False",
+            "Option Explicit",
+        ]
+
+        class _CM31(object):
+            """只实现后端用到的 CodeModule.CountOfLines / Lines。"""
+
+            def __init__(self, code):
+                self._code = code
+
+            @property
+            def CountOfLines(self):
+                return len(self._code.split("\n"))
+
+            def Lines(self, start, count):
+                _ls = self._code.split("\n")
+                return "\n".join(_ls[start - 1:start - 1 + count])
+
+        class _VBE31(object):
+            def __init__(self, code):
+                _cm = _CM31(code)
+                self.ActiveCodePane = type("_CP31", (), {"CodeModule": _cm})()
+
+        _cur31 = {"code": ""}
+        _orig_get31 = VB31._get_vbe_cached
+        VB31._get_vbe_cached = lambda *a, **k: _VBE31(_cur31["code"])
+        _names31 = VB31.VbeBackend().names_outside_caret
+
+        class _UI31(object):
+            def __init__(self):
+                self.shown = False
+
+            def show(self, *a, **k):
+                self.shown = True
+
+            def update_selection(self, *a, **k):
+                pass
+
+            def hide(self, *a, **k):
+                self.shown = False
+
+            def contains_point(self, *a, **k):
+                return False
+
+        def _parse31(lines):
+            """带 | 标记的代码行 -> (代码, 光标位置)。"""
+            _out, _caret = [], None
+            for _i, _l in enumerate(lines, 1):
+                if "|" in _l:
+                    _col = _l.index("|")
+                    _caret = (_i, _col + 1)
+                    _l = _l[:_col] + _l[_col + 1:]
+                _out.append(_l)
+            return "\n".join(_out), _caret
+
+        class _B31(object):
+            """最小后端：候选/声明名来自真实解析，现场证据走真实
+            VbeBackend.names_outside_caret（只把最底层读文本换成假的）。"""
+
+            def __init__(self, code, caret, force_broad=False):
+                self.code = code
+                self.caret = caret
+                self.force_broad = force_broad
+                _r = list(P.extract_records(code, module="Module1",
+                                            is_std_module=True, caret=caret))
+                _r += list(P.extract_implicit_records(
+                    code, module="Module1", is_std_module=True, declared=_r,
+                    scope="proc", caret=caret))
+                self._recs = _r
+                self._decl_names = set(
+                    str(n).lower() for n in
+                    (P.decl_names_at_caret(code, caret) or ()))
+                self._declared = set(
+                    str(x[0]).lower() for x in _r
+                    if str(x[0]).lower() not in self._decl_names)
+                try:
+                    self._caret_word = P.ident_at_caret(
+                        code, caret[0], caret[1]).lower()
+                except Exception:
+                    self._caret_word = ""
+
+            def get_context(self):
+                _ls = self.code.split("\n")
+                return {"line_no": self.caret[0], "caret_col": self.caret[1],
+                        "line_text": _ls[self.caret[0] - 1],
+                        "in_string": False, "in_comment": False,
+                        "in_type_position": False,
+                        "in_decl_position": bool(self._decl_names),
+                        "decl_names": sorted(self._decl_names),
+                        "proc_name": P.proc_at_line(self.code, self.caret[0]),
+                        "module_name": "Module1"}
+
+            def get_identifiers(self):
+                return self._recs
+
+            def get_declared_names(self):
+                return list(self._declared)
+
+            def caret_word_at_collect(self):
+                return self._caret_word
+
+            def declared_elsewhere(self, name, module_name):
+                return False           # 全部声明都在 Module1
+
+            def names_outside_caret(self, caret, scope_only=False):
+                _cur31["code"] = self.code
+                if self.force_broad:   # 对照：v50 行为（永远全模块扫描）
+                    scope_only = False
+                return _names31(caret, scope_only)
+
+            def apply_completion(self, *a, **k):
+                return None
+
+        def _trig31(body, force_broad=False):
+            _code, _caret = _parse31(_HDR31 + body)
+            _be = _B31(_code, _caret, force_broad)
+            _ui = _UI31()
+            _c = E.Completer(_be, _ui)
+            _c.trigger()
+            return (_ui.shown, sorted(_c.matches or []))
+
+        _leak31 = [
+            "Public Sub ProcedureA()",
+            "    Dim username As String",
+            '    username = "abc"',
+            "    Debug.Print username",
+            "End Sub",
+            "",
+            "Public Sub ProcedureB(ByVal username| As String)",
+            "End Sub",
+        ]
+        # 31.1 旧行为确实会"提示自己"——证明这条回归确实有意义
+        check("31.1 对照：旧行为下形参重名会提示自己",
+              [_trig31(_leak31, force_broad=True)],
+              expect_contain=[(True, ["username"])])
+        # 31.2 修复后：不再提示自己
+        check("31.2 形参名与其他过程的变量重名 -> 不提示自己",
+              [_trig31(_leak31)],
+              expect_contain=[(False, [])])
+        # 31.3 对照：任何地方都没有的新名字同样安静（用户说的"不相同不提示"）
+        check("31.3 全新形参名保持安静",
+              [_trig31([
+                  "Public Sub ProcedureA()",
+                  "    Dim username As String",
+                  "End Sub",
+                  "",
+                  "Public Sub ProcedureB(ByVal zzqnewxx| As String)",
+                  "End Sub"])],
+              expect_contain=[(False, [])])
+        # 31.4 回退到"别的过程的变量名"时同样不提示
+        check("31.4 形参回退到别的过程的变量名 -> 不提示",
+              [_trig31([
+                  "Public Sub ProcedureA()",
+                  "    Dim username As String",
+                  "End Sub",
+                  "",
+                  "Public Sub ProcedureB(ByVal usernam| As String)",
+                  "End Sub"])],
+              expect_contain=[(False, [])])
+        # 31.5 模块级名字仍是合法引用（v37 语义）——收窄不等于砍掉
+        check("31.5 形参同名于模块级过程名 -> 照常提示",
+              [_trig31([
+                  "Public Sub updateValue()",
+                  "End Sub",
+                  "",
+                  "Public Sub ProcedureB(ByVal updateValue| As String)",
+                  "End Sub"])],
+              expect_contain=[(True, ["updateValue"])])
+        # 31.6 回归：用法位置（不是在声明新名字）照常提示同过程的名字
+        check("31.6 同过程内用法位置打前缀 -> 照常提示",
+              [_trig31([
+                  "Public Sub ProcedureA()",
+                  "    Dim username As String",
+                  "    Debug.Print userna|",
+                  "End Sub"])],
+              expect_contain=[(True, ["username"])])
+        # 31.7 回归：模块级声明行打全名照常提示（gate 不生效的路径）
+        check("31.7 模块级声明行打全名 -> 照常提示",
+              [_trig31([
+                  "Public gUserName As String",
+                  "Sub Foo()",
+                  "    MsgBox gUserName",
+                  "End Sub",
+                  "",
+                  "Public gUserName| As String"])],
+              expect_contain=[(True, ["gUserName"])])
+        # 31.8 机制本身：现场证据的宽/窄两个窗口
+        _c31, _k31 = _parse31(_HDR31 + _leak31)
+        _cur31["code"] = _c31
+        _broad31 = _names31(_k31, False)
+        _narrow31 = _names31(_k31, True)
+        check("31.8 现场证据：宽窗口含 username，窄窗口不含",
+              ["username" in _broad31, "username" in _narrow31],
+              expect_contain=[True, False])
+        _c31b, _k31b = _parse31(_HDR31 + [
+            "Public Sub updateValue()",
+            "End Sub",
+            "",
+            "Public Sub ProcedureB(ByVal updateValue| As String)",
+            "End Sub"])
+        _cur31["code"] = _c31b
+        check("31.8 窄窗口仍认模块级过程名（不能收窄过头）",
+              ["updatevalue" in _names31(_k31b, True)],
+              expect_contain=[True])
+        VB31._get_vbe_cached = _orig_get31
+    except Exception as _e31:
+        check("第 31 节异常: %s" % _e31, [True], expect_contain=[False])
+
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))
     if FAILURES:
