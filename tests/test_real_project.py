@@ -860,14 +860,19 @@ def main():
           [ok9, ui_k2.shown, c_k2.selected],
           expect_contain=[False, True, 0])
 
-    # ---- 11.12 v32：候选项显示序号 ----
+    # ---- 11.12 v40：候选不再带序号（数字键选词已移除）----
     try:
         import ui as _ui
-        check("v32: 候选显示带序号",
+        check("v40: 候选显示即名字本身（无 1. 序号前缀）",
               [_ui.format_row(0, "num"), _ui.format_row(2, "numCount")],
-              expect_contain=["1. num", "3. numCount"])
-        check("v32: 列表至少 8 行（不足用空行补位）",
-              [_ui.MAX_ROWS], expect_contain=[8])
+              expect_contain=["num", "numCount"])
+        check("v42: 一屏最多显示 15 行（候选不足时列表高度随之缩短，不补空行）",
+              [_ui.MAX_VISIBLE_ROWS], expect_contain=[15])
+        check("v42: 列表宽度固定 30 字符（不再有横向滚动条）",
+              [_ui.NAME_CHARS, hasattr(_ui.Popup, "has_hscroll")],
+              expect_contain=[30, False])
+        check("v42: 超长名字用 ... 省略",
+              [_ui.ELLIPSIS], expect_contain=["..."])
     except Exception as e:                                # pragma: no cover
         check("v32: 候选显示带序号（跳过：ui 不可用 %s）" % e, [True],
               expect_contain=[True])
@@ -1762,6 +1767,641 @@ def main():
         except Exception as _e2:
             check("20.11 跳过（无 GUI 环境）: %s" % _e2, [True],
                   expect_contain=[True])
+
+        # ---------------------------------------------------------------
+        # 22. 候选超过一屏：滚动窗口，不多丢、序号不再显示（v40）
+        #
+        # 用户报的问题：旧版本把 MAX_ROWS(=8) 当成了候选上限，
+        # 第 9 个往后直接看不见（"多的都给我删没了"）。v38 把它还原成
+        # 【一屏显示几行】：候选全留着，靠上下键 / 滚轮滚动查看；
+        # v39 再把上限从 8 提到 10，并去掉"数字键选词"（会与输入变量名里的
+        # 数字冲突，例如 s1 会被误选成 sheet1）。选择只走 ↑/↓ + Tab 或鼠标点击。
+        # ---------------------------------------------------------------
+        print("\n=== 22. 超过一屏不丢候选，滚动查看（v39）===")
+        try:
+            _N = 30
+            _names = ["x%02d" % i for i in range(_N)]
+
+            class _WinUI(object):
+                """记录 UI 真正收到了哪些行（不依赖 tkinter，纯记账）。"""
+                def __init__(self):
+                    self.shown = False
+                    self.rows = []
+                    self.sel = 0
+                    self.hidden = False
+
+                def show(self, rows, sel, completer=None):
+                    self.shown = True
+                    self.hidden = False
+                    self.rows = list(rows)
+                    self.sel = sel
+
+                def update_selection(self, sel):
+                    self.sel = sel
+
+                def hide(self):
+                    self.shown = False
+                    self.hidden = True
+                    self.rows = []
+
+                def contains_point(self, x, y):
+                    return False
+
+            class _ManyBk(object):
+                """一次性给出 N 个候选的最小假后端。"""
+                def __init__(self, names, word):
+                    self._names = list(names)
+                    line = "    " + word
+                    self._ctx = {
+                        "line_no": 3, "caret_col": len(line) + 1,
+                        "line_text": line, "in_string": False,
+                        "in_comment": False, "in_type_position": False,
+                        "in_decl_position": False, "decl_names": [],
+                        "proc_name": None, "module_name": "M1",
+                    }
+                    self.applied = None
+
+                def get_context(self):
+                    return dict(self._ctx)
+
+                def get_identifiers(self):
+                    return [(n, "M1", None, False) for n in self._names]
+
+                def get_declared_names(self):
+                    return list(self._names)
+
+                def get_type_names(self):
+                    return []
+
+                def name_exists_outside_caret(self, name, caret):
+                    return True
+
+                def apply_completion(self, line_no, start, end, name):
+                    self.applied = name
+                    return True
+
+            def mk22(names=None, word="x"):
+                bk = _ManyBk(names or _names, word)
+                ui = _WinUI()
+                c = E.Completer(bk, ui, view_rows=10)
+                c.trigger()
+                return bk, ui, c
+
+            bk1, ui1, c1 = mk22()
+            all_m = c1.current_matches()
+            check("22.1 30 个候选一个都不丢（不再只留 8 个）",
+                  [len(all_m)], expect_contain=[_N])
+            check("22.1 弹窗确实显示了", [ui1.shown], expect_contain=[True])
+
+            check("22.2 UI 只画当前这一屏（最多 10 行）",
+                  [ui1.rows], expect_contain=[all_m[:10]])
+            check("22.2 这一屏 == visible_rows()（同一份数据，不会错位）",
+                  [c1.visible_rows()], expect_contain=[all_m[:10]])
+            check("22.3 初始窗口停在列表开头", [c1.view_info()],
+                  expect_contain=[(_N, 0)])
+            check("22.3 初始选中本屏第 1 行", [c1.view_selection()],
+                  expect_contain=[0])
+
+            # 22.4 在本屏内移动：窗口不该动
+            for _ in range(9):
+                c1.move(1)
+            check("22.4 本屏内下移 9 次：selected=9 且窗口不动",
+                  [c1.selected, c1.view_info(), c1.view_selection()],
+                  expect_contain=[9, (_N, 0), 9])
+
+            # 22.5 越过下沿：窗口跟着下移一行（而不是整屏跳）
+            c1.move(1)
+            check("22.5 走出本屏：窗口只下移一行",
+                  [c1.selected, c1.view_info(), c1.view_selection()],
+                  expect_contain=[10, (_N, 1), 9])
+            check("22.5 窗口内容与选中行一致",
+                  [c1.visible_rows()], expect_contain=[all_m[1:11]])
+            check("22.5 选中行始终在窗口内",
+                  [c1.view_top <= c1.selected < c1.view_top + c1.view_rows],
+                  expect_contain=[True])
+
+            # 22.6 一屏最多 10 行：屏幕上只会显示 10 条，再多靠滚动
+            check("22.6 屏幕内一屏最多 10 行",
+                  [len(c1.visible_rows())], expect_contain=[10])
+            check("22.6 超过一屏才出现纵向滚动（total > 10）",
+                  [c1.view_info()[0] > 10], expect_contain=[True])
+
+            # 22.7 鼠标点击对应"本屏第几行"：滚过之后点第 1 行，选的是新的第 1 项
+            #      （数字键选词已在 v39 移除，避免与"输入变量名里的数字"冲突）
+            bk7, ui7, c7 = mk22()
+            m7 = c7.current_matches()
+            for _ in range(10):
+                c7.move(1)
+            check("22.7 滚一行后本屏第一行是原列表第 2 项",
+                  [c7.visible_rows()[0]], expect_contain=[m7[1]])
+            # 鼠标点本屏第 1 行 -> _row_at 换算成绝对下标 1 -> completer.pick(1)
+            check("22.7 点击本屏第 1 行（pick 绝对下标 1）写入的就是它",
+                  [c7.pick(1), bk7.applied],
+                  expect_contain=[True, m7[1]])
+            check("22.7 选完就收起（accept 会 hide）", [ui7.hidden],
+                  expect_contain=[True])
+
+            # 22.8 一直下移到底：窗口滑到最后 10 行，再往前一步绕回首项也回到顶部
+            bk8, ui8, c8 = mk22()
+            for _ in range(29):
+                c8.move(1)
+            check("22.8 移到末项（第 30 项）：窗口滑到最底",
+                  [c8.selected, c8.view_info(), c8.visible_rows()],
+                  expect_contain=[29, (_N, _N - 10), c8.current_matches()[-10:]])
+            c8.move(1)                      # 末项 -> 绕回首项
+            check("22.8 绕回首项：窗口一起回到顶部",
+                  [c8.selected, c8.view_info()], expect_contain=[0, (_N, 0)])
+
+            # 22.9 打全名命中很靠后的候选时（第 26 项），窗口要滚过去带着它，
+            #      否则用户看不见自己选中的是什么
+            bk9, ui9, c9 = mk22()
+            c9.selected = 25
+            c9._scroll_to_selected()
+            check("22.9 选中第 26 项：窗口滚到它可见，且落在最后一行",
+                  [c9.view_info(), c9.view_selection()],
+                  expect_contain=[(_N, 16), 9])
+            check("22.9 选中项确实在这一屏里",
+                  [c9.current_matches()[25] in c9.visible_rows()],
+                  expect_contain=[True])
+
+            # 22.10 候选不足一屏：窗口永远停在 0，不出现滚动
+            bkA, uiA, cA = mk22(["num", "numArr", "numCount"], "num")
+            check("22.10 不足一屏：窗口恒为 0、全量显示",
+                  [cA.view_info(), cA.visible_rows()],
+                  expect_contain=[(3, 0), ["num", "numArr", "numCount"]])
+            check("22.10 不足一屏：候选数 < 一屏上限，不触发滚动",
+                  [cA.view_info()[0] <= cA.view_rows], expect_contain=[True])
+        except Exception as _e22:
+            check("第 22 节异常: %s" % _e22, [True], expect_contain=[False])
+
+        # ---- 第 23 节：拖滚动条时 UI 不能消失（v41 修复） ----
+        # 复现：之前拖滚动条拖一小会儿，整个列表框+滚动条就消失。
+        # 根因是弹窗点击会被"激活"、抢走 VBE 前台焦点，焦点去抖(~600ms)
+        # 后 main.py 误判"已离开 VBE"自动收起。修复：弹窗加 WS_EX_NOACTIVATE
+        # 永不抢焦点；并给 maybe_hide_on_outside_click 加"拖拽中不收起"保险。
+        class _Bk23(object):
+            def __init__(self, names, word):
+                self._names = list(names)
+                line = "    " + word
+                self._ctx = {"line_no": 3, "caret_col": len(line) + 1,
+                             "line_text": line, "in_string": False,
+                             "in_comment": False, "in_type_position": False,
+                             "in_decl_position": False, "decl_names": [],
+                             "proc_name": None, "module_name": "M1"}
+                self.applied = None
+            def get_context(self):
+                return dict(self._ctx)
+            def get_identifiers(self):
+                return [(n, "M1", None, False) for n in self._names]
+            def get_declared_names(self):
+                return list(self._names)
+            def get_type_names(self):
+                return []
+            def apply_completion(self, *a, **k):
+                self.applied = a
+            def name_exists_outside_caret(self, w, c):
+                return True
+        class _Ui23(object):
+            def __init__(self):
+                self.hidden = False
+                self._drag = None
+            def show(self, *a, **k):
+                self.hidden = False
+            def update_selection(self, sel):
+                pass
+            def hide(self):
+                self.hidden = True
+            def contains_point(self, x, y):
+                return False   # 始终模拟"点击落在弹窗外"
+        names23 = ["name%02d" % i for i in range(30)]
+        ui23 = _Ui23()
+        c23 = E.Completer(_Bk23(names23, "name"), ui23, view_rows=10)
+        c23.trigger()   # 触发：30 个候选，超过一屏
+        check("23.0 触发后弹窗可见", [c23.is_visible()], expect_contain=[True])
+        check("23.0 候选超过一屏(存在纵向滚动条)",
+              [len(c23.current_matches()) > c23.view_rows], expect_contain=[True])
+
+        # 23.1 正在拖纵向滚动条(_drag='v')时，即便 contains_point 说在外面，
+        #       maybe_hide_on_outside_click 也绝不许收起
+        ui23._drag = "v"
+        c23.maybe_hide_on_outside_click(9999, 9999)
+        check("23.1 拖滚动条途中点弹窗外：列表框不消失",
+              [c23.is_visible()], expect_contain=[True])
+
+        # 23.2 set_view_top（拖滚动条调用的核心）不会收起 UI，且真的改了窗口起点
+        c23.set_view_top(15)
+        check("23.2 拖到中部：UI 仍可见、窗口起点=15",
+              [c23.is_visible(), c23.view_info()],
+              expect_contain=[True, (30, 15)])
+        check("23.2 选中项被夹进可见窗口",
+              [c23.selected >= c23.view_top and
+               c23.selected < c23.view_top + c23.view_rows],
+              expect_contain=[True])
+
+        # 23.3 拖完松开、_drag 归位后，点在弹窗外才按旧行为正常收起
+        ui23._drag = None
+        c23.maybe_hide_on_outside_click(9999, 9999)
+        check("23.3 没在拖、点弹窗外：正常收起",
+              [c23.is_visible()], expect_contain=[False])
+
+        # ---- 24. v43：回退删字不得提示【比编辑器内容更长的旧片段】 ----
+        #
+        # 用户报的现象：定义一个很长的变量名后，按住回退键连删，弹窗会提示出
+        # 回退过程中某个【更长】的片段 —— 编辑器里剩下的字符比提示出来的还短。
+        #
+        # 根因：标识符池是带缓存的（最快 ID_REFRESH_MIN_SEC=0.4s 才重解析一次），
+        # 连删时池子里还留着"文字还长"那一刻解析出来的名字；而旧的回声防护只剔除
+        # 【与当前词完全相等】的候选，于是"当前词 + 更长尾巴"的旧片段活了下来。
+        print("\n=== 24. 回退删字不残留旧片段（v43）===")
+
+        _LONG24 = ("studengdflkgjdslkgjdslkgjdlfksgjdlfkgjdlfkgjdlkjgldsgjdslgjdsgldsjgl"
+                   "djgdlg")
+
+        class _CM24(object):
+            def __init__(self, name, text):
+                self.Name = name
+                self.text = text
+
+            @property
+            def CountOfLines(self):
+                return len(self.text.split("\n"))
+
+            def Lines(self, start, count):
+                ls = self.text.split("\n")
+                s = max(0, int(start) - 1)
+                return "".join(l + "\n" for l in ls[s:s + int(count)])
+
+        class _Comp24(object):
+            def __init__(self, name, text, ctype=1):
+                self.Name = name
+                self.Type = ctype
+                self.CodeModule = _CM24(name, text)
+
+        class _Pane24(object):
+            def __init__(self, comp):
+                self._c = comp
+                self.sel = (1, 1, 1, 1)
+
+            @property
+            def CodeModule(self):
+                return self._c.CodeModule
+
+            def GetSelection(self):
+                return self.sel
+
+        class _VBE24(object):
+            def __init__(self, comps, act):
+                self._p = type("_P24", (object,), {})()
+                self._p.Name = "VBAProject"
+                self._p.VBComponents = list(comps)
+                self.ActiveVBProject = self._p
+                self.ActiveCodePane = _Pane24(act)
+
+        class _UI24(object):
+            def __init__(self):
+                self.shown = False
+                self.rows = []
+
+            def show(self, matches, selected, completer=None):
+                self.shown = True
+                self.rows = list(matches or [])
+
+            def update_selection(self, i):
+                pass
+
+            def hide(self):
+                self.shown = False
+                self.rows = []
+
+            def contains_point(self, x, y):
+                return False
+
+        def _session24():
+            """建一次后端（它的标识符缓存要跨步骤存活）+ 一个触发器闭包。
+
+            trig(mods, active, line_no, col) 每次都【重建模块文本】——
+            真实编辑器里文本是同步缩短的；早期复现脚本没重建，才误以为
+            "工程里始终留着完整长名"。
+            """
+            holder = {}
+            VB._get_vbe_cached = lambda: holder["vbe"]
+            bk = VB.VbeBackend()
+            ui = _UI24()
+            cp = E.Completer(bk, ui)
+
+            def trig(mods, active, line_no, col):
+                comps = [_Comp24(n, t) for n, t in mods]
+                act = None
+                for c in comps:
+                    if c.Name == active:
+                        act = c
+                holder["vbe"] = _VBE24(comps, act)
+                holder["vbe"].ActiveCodePane.sel = (line_no, col, line_no, col)
+                cp.trigger(True)
+                return list(cp.current_matches())
+
+            def throttle():
+                # 复刻 main.poll_editor 的重解析限流（ID_REFRESH_MIN_SEC=0.4）
+                if time.time() - getattr(bk, "_cache_time", 0.0) > 0.4:
+                    bk.invalidate_identifiers()
+
+            return trig, throttle
+
+        _orig_get24 = VB._get_vbe_cached
+        try:
+            # 24.1 连删 15 次：绝不能提示出比编辑器当前内容【更长】的候选
+            _decl = ("Option Explicit\nSub Foo()\n    Dim {W} As Long\n"
+                     "    x = 1\nEnd Sub")
+            _both = ("Option Explicit\nSub Foo()\n    Dim {W} As Long\n"
+                     "    {W} = 1\nEnd Sub")
+            _bad24 = []
+            for _tpl in (_decl, _both):
+                _trig, _thr = _session24()
+                # 先"打全名"：此刻池子是按完整长名解析并被缓存的
+                _trig([("Module1", _tpl.replace("{W}", _LONG24))], "Module1",
+                      3, 9 + len(_LONG24))
+                for _k in range(1, 16):
+                    _typed = _LONG24[:-_k]
+                    _thr()
+                    _m = _trig([("Module1", _tpl.replace("{W}", _typed))],
+                               "Module1", 3, 9 + len(_typed))
+                    _bad24 += [n for n in _m if len(n) > len(_typed)]
+                    time.sleep(0.008)
+            check("24.1 回退删字：不提示比编辑器内容更长的旧片段",
+                  [_bad24], expect_contain=[[]])
+
+            # 24.2 真名字（本模块别处声明）的前缀补全不能被误杀
+            _trig, _thr = _session24()
+            _m2 = _trig([("Module1", "Option Explicit\nPublic numArr As Long\n"
+                                       "Sub Foo()\n    num\nEnd Sub")],
+                        "Module1", 4, 5 + 3)
+            check("24.2 真名字前缀补全仍在（num -> numArr）",
+                  [_m2], expect_contain=[["numArr"]])
+
+            # 24.3 隐式变量（别处用过、没声明）的前缀补全不能被误杀
+            _trig, _thr = _session24()
+            _m3 = _trig([("Module1", "Option Explicit\nSub Foo()\n    arr = 1\n"
+                                       "    ar\nEnd Sub")],
+                        "Module1", 4, 5 + 2)
+            check("24.3 隐式变量前缀补全仍在（ar -> arr）",
+                  [_m3], expect_contain=[["arr"]])
+
+            # 24.4 别的模块的 Public 名字仍要提示（跨模块靠"声明集合"这一路证据）
+            _trig, _thr = _session24()
+            _m4 = _trig([("Module1", "Option Explicit\nSub Foo()\n    Global\n"
+                                       "End Sub"),
+                         ("Module2", "Option Explicit\n"
+                                     "Public GlobalDataArray As Long\n")],
+                        "Module1", 3, 5 + 6)
+            check("24.4 跨模块 Public 前缀补全仍在（Global -> GlobalDataArray）",
+                  [_m4], expect_contain=[["GlobalDataArray"]])
+            # ---- 25. v44：从名字【开头】删字符也要能出提示词 ----
+            #
+            # 用户报的现象：从变量 / 函数 / 窗体 / 模块名的【结尾】【中间】删字符都能
+            # 弹出候选，但从名字【开头】删（光标停在残留名字最左边按 Delete）什么都不弹。
+            #
+            # 根因两处，都出在"只看光标左边"这个前提上：
+            #   1. engine._ident_char_before_caret（轮询触发的准入门槛）只检查光标前
+            #      一格；名字开头左邻是空格 / 括号 -> 判成"没在拼标识符" -> 直接收起。
+            #   2. engine.extract_word_before 只往光标左边取词，左边取不到就返回 None
+            #      -> 连候选都没得算。
+            # 因此"从中间 / 结尾删"（左边还剩半截词）照常工作，"从头删"永远失效。
+            print("\n=== 25. 从名字开头删字符也能出提示词（v44）===")
+
+            # 第 2 行（声明行）始终留着【完整长名】，第 4 行放"被删剩"的残词。
+            # 这样标识符池里一定有完整长名，断言与缓存刷新时机无关，不会 flaky。
+            _TPL25 = ("Option Explicit\nPublic {D} As Long\nSub Foo()\n"
+                      "    {U}\nEnd Sub")
+
+            def _src25(declared, used):
+                return _TPL25.replace("{D}", declared).replace("{U}", used)
+
+            _trig, _thr = _session24()
+            # 先打全名（模拟真实打字；同时确认池子里确实收了这个名字）
+            _m25a0 = _trig([("Module1", _src25(_LONG24, _LONG24))],
+                           "Module1", 4, 5 + len(_LONG24))
+            check("25.0 打全名：池子里有这个名字",
+                  [_LONG24 in _m25a0], expect_contain=[True])
+
+            # 25.1 从开头删：光标停在残留名字最左端（第 4 行第 5 列）
+            _r25 = []
+            for _k in (1, 5, 20):
+                _thr()
+                _m = _trig([("Module1", _src25(_LONG24, _LONG24[_k:]))],
+                           "Module1", 4, 5)
+                _r25.append(_LONG24 in _m)
+            check("25.1 从名字开头删字符 -> 仍出提示（v44）",
+                  _r25, expect_contain=[True])
+
+            # 25.2 从中间删：光标在该行词内部（原有行为不许回退）
+            _thr()
+            _m25b = _trig([("Module1", _src25(_LONG24, _LONG24))],
+                          "Module1", 4, 5 + 12)
+            check("25.2 从名字中间删字符 -> 照常出提示",
+                  [_LONG24 in _m25b], expect_contain=[True])
+
+            # 25.3 从结尾删：光标在残留词末尾
+            _thr()
+            _m25c = _trig([("Module1", _src25(_LONG24, _LONG24[:30]))],
+                          "Module1", 4, 5 + 30)
+            check("25.3 从名字结尾删字符 -> 照常出提示",
+                  [_LONG24 in _m25c], expect_contain=[True])
+
+            # 25.4 取词与替换范围（纯函数级，直接盯 extract_word_at 的返回）
+            _w25 = E.extract_word_at("    " + _LONG24[5:], 5)
+            check("25.4a 光标在名字开头：取词=残留名，范围盖住整个残留词",
+                  [_w25],
+                  expect_contain=[(_LONG24[5:], 5, 5 + len(_LONG24[5:]))])
+            check("25.4b 光标在词尾：右端就是光标列（与旧行为一致）",
+                  [E.extract_word_at("    num", 8)], expect_contain=[("num", 5, 8)])
+            check("25.4c 光标前后都不是标识符字符 -> 取不到词（不乱弹）",
+                  [E.extract_word_at("a  b", 3)],
+                  expect_contain=[(None, None, None)])
+
+            # 25.5 Tab 确认：替换范围必须盖住光标右边那截残留名字，
+            #      否则会在残留词前面插入候选，拼出"双份名字"
+            class _B25(object):
+                def __init__(self, ctx, ids):
+                    self._ctx = ctx
+                    self._ids = list(ids)
+                    self.applied = None
+
+                def get_context(self):
+                    return self._ctx
+
+                def get_identifiers(self):
+                    return self._ids
+
+                def get_declared_names(self):
+                    return [i[0] if isinstance(i, (tuple, list)) else i
+                            for i in self._ids]
+
+                def apply_completion(self, line_no, start, end, completion):
+                    self.applied = (start, end, completion)
+
+            _line25 = "    " + _LONG24[5:]
+            _b25 = _B25({"line_no": 4, "caret_col": 5, "line_text": _line25,
+                         "in_string": False, "in_comment": False,
+                         "in_type_position": False, "in_decl_position": False,
+                         "decl_names": [], "proc_name": "Foo",
+                         "module_name": "Module1"}, [_LONG24])
+            _c25 = E.Completer(_b25, _UI24())
+            _c25.trigger(True)
+            _c25.accept()
+            check("25.5 Tab 确认：整段换掉残留词（不拼出双份名字）",
+                  [_b25.applied],
+                  expect_contain=[(5, 5 + len(_LONG24[5:]), _LONG24)])
+
+            # ---- 26. v45：从名字【开头】删字符不许提示出"更长的旧片段"（回声）----
+            #
+            # 用户报的现象：把光标停在名字最左边、按 Delete 从【开头】连删时，
+            # 弹窗会提示出【完整的旧长名】（有回音、提示自己）。
+            #
+            # 与 v43"从结尾删"的回声同源，根因是回声判据只认【前缀】：
+            #   候选.startswith(当前词)
+            # 从结尾删 -> 当前词是候选的前缀 -> 命中，能剔除；
+            # 从开头删 -> 当前词是候选的【后缀】 -> 不命中 -> 回声漏了过去。
+            #
+            # 修法：判据推广为"当前词是候选名的【连续子串】"——删除只会让光标处
+            # 的词变短，剩下的必然是原词的连续一段（前缀 / 后缀 / 中段通吃）。
+            # 是否保留仍由 _name_really_exists 裁决：真名字（本模块别处出现 /
+            # 别的模块声明过）照常提示，只有"现场已删干净、别处也没有"的旧快照
+            # 才被剔除。
+            #
+            # 本节的场景里，正在编辑的【就是声明行本身】（Dim <长名> As Long），
+            # 所以删到最后现场文本里已经找不到完整长名了 —— 池子（0.4s 缓存）里
+            # 的那一份只是旧快照，必须剔除。
+            _TPL26 = ("Option Explicit\nSub Foo()\n    Dim {W} As Long\n"
+                      "    x = 1\nEnd Sub")
+
+            def _src26(typed):
+                return _TPL26.replace("{W}", typed)
+
+            # 26.1 从开头删：不许提示出比编辑器当前内容更长的旧片段
+            _trig, _thr = _session24()
+            _trig([("Module1", _src26(_LONG24))], "Module1", 3, 9 + len(_LONG24))
+            _bad26 = []
+            for _k in (1, 5, 20, 40):
+                _thr()
+                _typed = _LONG24[_k:]
+                _m = _trig([("Module1", _src26(_typed))], "Module1", 3, 9)
+                _bad26 += [n for n in _m if len(n) > len(_typed)]
+                time.sleep(0.008)
+            check("26.1 从名字开头删字符：不提示出更长的旧片段（v45）",
+                  [_bad26], expect_contain=[[]])
+
+            # 26.2 头尾都删过 -> 当前词是旧长名的【中段】，同样不许提示旧长名
+            _trig, _thr = _session24()
+            _trig([("Module1", _src26(_LONG24))], "Module1", 3, 9 + len(_LONG24))
+            _thr()
+            _mid26 = _LONG24[10:50]
+            _m26b = _trig([("Module1", _src26(_mid26))], "Module1", 3, 9)
+            check("26.2 头尾都删过：中段残词不提示旧长名（v45）",
+                  [_LONG24 in _m26b], expect_contain=[False])
+
+            # 26.3 回归：本模块别处仍留着完整长名时（编辑的不是声明行），
+            #      从头删依旧照常提示 —— 回声防护加强不许误杀真名字
+            _trig, _thr = _session24()
+            _trig([("Module1", _src25(_LONG24, _LONG24))], "Module1", 4,
+                  5 + len(_LONG24))
+            _thr()
+            _m26c = _trig([("Module1", _src25(_LONG24, _LONG24[20:]))],
+                          "Module1", 4, 5)
+            check("26.3 回归：本模块声明的真名字从头删仍提示",
+                  [_LONG24 in _m26c], expect_contain=[True])
+
+            # 26.4 回归：从结尾删（v43 场景）仍不提示更长片段（控制组）
+            _trig, _thr = _session24()
+            _trig([("Module1", _src26(_LONG24))], "Module1", 3, 9 + len(_LONG24))
+            _bad26d = []
+            for _k in (1, 5, 20):
+                _thr()
+                _typed = _LONG24[:-_k]
+                _m = _trig([("Module1", _src26(_typed))], "Module1", 3,
+                           9 + len(_typed))
+                _bad26d += [n for n in _m if len(n) > len(_typed)]
+            check("26.4 回归：从结尾删仍不提示更长片段（v43 控制组）",
+                  [_bad26d], expect_contain=[[]])
+
+            # ---- 27. v46：光标停在名字【中间】删字符，当前词取【整段名字】----
+            #
+            # 用户报的现象：变量 test / test02 / test23456789；把 test23456789
+            # 中间那个 t 删掉 -> tes23456789、光标停在 tes 之后，却仍然提示
+            # test / test02 —— 因为取词只看光标左边（tes），完全无视光标右边
+            # 还留着的 23456789。当前词改为整段名字后，tes23456789 既不匹配
+            # test 也不匹配 test02，只剩真正那一整段名字（Tab 一次换掉整段）。
+            print("\n=== 27. 从名字【中间】删字符：当前词取整段名字（v46）===")
+
+            _TPL27 = ("Option Explicit\n"
+                      "Public test As Long\n"
+                      "Public test02 As Long\n"
+                      "Public test23456789 As Long\n"
+                      "Sub Foo()\n"
+                      "    {U}\n"
+                      "End Sub")
+
+            def _src27(used):
+                return _TPL27.replace("{U}", used)
+
+            # 27.1 从中间删掉那个 t：光标停在 tes|23456789（第 6 行第 8 列）
+            _trig, _thr = _session24()
+            _trig([("Module1", _src27("test23456789"))], "Module1", 6,
+                  5 + len("test23456789"))
+            _m27a = _trig([("Module1", _src27("tes23456789"))], "Module1", 6,
+                          5 + len("tes"))
+            check("27.1 中间删字符：不再按左半截提示（无 test / test02）",
+                  [[n for n in _m27a if n.lower() in ("test", "test02")]],
+                  expect_contain=[[]])
+            check("27.2 中间删字符：整段名字本身仍提示（Tab 可一次换掉）",
+                  [_m27a], expect_contain=[["test23456789"]])
+
+            # 27.3 纯函数级：取词与替换范围
+            check("27.3 光标在名字中间：取词=整段名字，范围盖住整段",
+                  [E.extract_word_at("    tes23456789", 8)],
+                  expect_contain=[("tes23456789", 5, 16)])
+            check("27.4 光标在词尾：右端仍是光标列（旧行为不变）",
+                  [E.extract_word_at("    num", 8)],
+                  expect_contain=[("num", 5, 8)])
+            check("27.5 光标在名字开头：仍取右边整段（v44 行为不变）",
+                  [E.extract_word_at("    " + _LONG24, 5)],
+                  expect_contain=[(_LONG24, 5, 5 + len(_LONG24))])
+            check("27.6 光标前后都不是标识符字符：仍取不到词（不乱弹）",
+                  [E.extract_word_at("a  b", 3)],
+                  expect_contain=[(None, None, None)])
+
+            # 27.7 Tab 确认时传给后端的替换范围必须盖住整段名字（含右半截），
+            #      否则候选会插在 tes 之后，拼出 test23456789 + 23456789
+            class _B27(object):
+                def __init__(self, ctx, ids):
+                    self._ctx = ctx
+                    self._ids = list(ids)
+
+                def get_context(self):
+                    return self._ctx
+
+                def get_identifiers(self):
+                    return self._ids
+
+                def get_declared_names(self):
+                    return set(str(i).lower() for i in self._ids)
+
+            _ctx27 = {"line_no": 6, "caret_col": 8,
+                      "line_text": "    tes23456789",
+                      "in_string": False, "in_comment": False,
+                      "in_type_position": False, "in_decl_position": False,
+                      "proc_name": "Foo", "module_name": "Module1"}
+            _cp27 = E.Completer(_B27(_ctx27, ["test", "test02",
+                                              "test23456789"]), _UI24())
+            _cp27.trigger(True)
+            check("27.7 Tab 确认范围盖住整段名字（end_col=16 而非光标列 8）",
+                  [(bool(_cp27.visible),
+                    (_cp27.ctx or {}).get("word_end_col"))],
+                  expect_contain=[(True, 16)])
+
+
+        finally:
+            VB._get_vbe_cached = _orig_get24
+
     except Exception as _e:
         check("第 19 节不可用（vbe_bridge 导入失败）: %s" % _e, [True],
               expect_contain=[True])

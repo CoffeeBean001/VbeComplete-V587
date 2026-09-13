@@ -14,12 +14,15 @@ VbeComplete 主入口（修复版）
 
 操作方式：
   - 输入标识符字符自动弹出候选（只提示当前作用域可见的名字）；
-  - 1 / 2 / 3 ...   按候选前面的序号数字键，直接选中并写回编辑器（最快）；
   - ↑ / ↓   选择候选（循环，无需移动鼠标），再按 Tab 写回编辑器；
+    候选超过一屏（最多 15 条）时，上下键会带着窗口一起滚动，右侧显示滚动条；
+  - 滚轮    指针放在弹窗上时，上下滚动 = 上下选词（右侧的滚动条也可用鼠标拖动）；
   - Tab     确认补全（唯一确认键；回车/空格按普通输入处理，不当确认）；
   - Esc     取消；鼠标单击/双击候选也可确认；
   - ← / →   移动光标即收起列表（与"鼠标点到别处"同义），按键照常放行；
   - Ctrl+Space  手动触发。
+  注：数字键不再用于选词（会与"输入变量名里的数字"冲突，例如想打 s1 却选中
+  了 sheet1），改由 ↑/↓ + Tab 或鼠标点击选择。
 """
 
 import sys
@@ -41,7 +44,7 @@ except ImportError:
 
 import engine
 from vbe_bridge import VbeBackend, com_backoff_remaining
-from ui import Popup
+from ui import Popup, MAX_VISIBLE_ROWS
 from log import log as _log, log_boot as _log_boot
 
 
@@ -61,13 +64,6 @@ VK_RIGHT = 0x27
 VK_DOWN = 0x28
 VK_PROCESSKEY = 0xE5   # IME 组字过程中的按键（vkCode=229），不携带真实字符
 
-# 数字键：主键盘 1..9
-VK_1 = 0x31
-VK_9 = 0x39
-# 小键盘 1..9
-VK_NUMPAD1 = 0x61
-VK_NUMPAD9 = 0x69
-
 NAV_VKS = (VK_UP, VK_DOWN)
 
 # 收起键：左右方向键。
@@ -79,7 +75,16 @@ DISMISS_VKS = (VK_LEFT, VK_RIGHT)
 # 回车刻意不确认——回车在 VBE 里是换行，误触发代价太大（用户要求去掉）。
 CONFIRM_VKS = (VK_TAB,)
 
-# 轮询编辑器内容变化的间隔（毫秒）。这是触发补全的主路径：
+# 弹窗可见时这些键由 win32_filter 接管（↑/↓ 导航、Tab 确认、Esc 取消），
+# 且会被 suppress_event() 吞掉。on_press 里绝不能抢先收起弹窗，否则"按方向键
+# 选词"会退化成"按方向键弹窗消失"。
+#
+# Enter 刻意【不在】这里：回车不当确认键，按回车应当照常换行（并顺带收起弹窗）。
+_VK_HANDLED_WHEN_VISIBLE = (Key.up, Key.down, Key.tab, Key.esc)
+
+# 这些修饰键按下时不收起弹窗
+_MOD_KEYS = (Key.shift, Key.shift_r, Key.caps_lock, Key.cmd, Key.cmd_r)
+
 # 不依赖键盘事件，因此中文/输入法/粘贴都能可靠触发。
 # 100ms 对打字而言几乎无感，且能在连续快速输入时自然合并掉中间态。
 POLL_INTERVAL_MS = 100
@@ -132,25 +137,6 @@ ID_REFRESH_MIN_SEC = 0.4
 # 选词"会退化成"按方向键弹窗消失"。
 #
 # Enter 刻意【不在】这里：回车不当确认键，按回车应当照常换行（并顺带收起弹窗）。
-_VK_HANDLED_WHEN_VISIBLE = (Key.up, Key.down, Key.tab, Key.esc)
-
-# 这些修饰键按下时不收起弹窗
-_MOD_KEYS = (Key.shift, Key.shift_r, Key.caps_lock, Key.cmd, Key.cmd_r)
-
-
-def _digit_index(vk):
-    """数字键 -> 候选下标（0-based）；不是数字键返回 None。
-
-    同时支持主键盘 1..9 与小键盘 1..9。小键盘在 NumLock 关闭时是方向键，
-    那种情况下 vkCode 会是不同的值，不会被误判成数字。
-    """
-    if VK_1 <= vk <= VK_9:
-        return vk - VK_1
-    if VK_NUMPAD1 <= vk <= VK_NUMPAD9:
-        return vk - VK_NUMPAD1
-    return None
-
-_gui = None
 try:
     import win32gui as _win32gui
 
@@ -275,7 +261,8 @@ def main():
         root.withdraw()
         backend = VbeBackend()
         popup = Popup(root)
-        completer = engine.Completer(backend, popup)
+        # 滚动窗口行数以 UI 为准（两边必须是同一个数，否则窗口会露出半行）
+        completer = engine.Completer(backend, popup, view_rows=MAX_VISIBLE_ROWS)
     except Exception:
         raise
 
@@ -290,6 +277,7 @@ def main():
         "ctrl": False,
         "alt": False,
         "swallowed": set(),   # 被吞掉的 keydown 的 vk，用于吞掉配对 keyup
+        "trigger_queued": False,   # 队列里是否已有一个待执行的 trigger
         "last_focus_time": 0.0,   # 最近一次"确实在 VBE 里"的时刻
         "released": False,        # 离开 VBE 后是否已释放过 COM 资源
         "non_vbe_hwnd": None,     # 最近一次"不在 VBE"时记录的前台窗口句柄
@@ -317,6 +305,26 @@ def main():
     def post(fn, *args):
         """把动作丢给主线程队列（线程安全）。"""
         action_queue.put((fn, args))
+
+    def _run_trigger():
+        state["trigger_queued"] = False
+        completer.trigger(True)
+
+    def post_trigger():
+        """把"内容变了，重整候选"排进主线程队列，并做【合并】。
+
+        连打 / 连删时 poll_editor 每 100ms 就会排一次，而每次 trigger 都要打
+        COM（读上下文 + 解析标识符 + 现场扫描），单次可能几十到几百毫秒。若
+        全部排队执行，主线程会被连续占住，表现为"弹窗明显滞后于编辑器"，
+        也让"回退删字时的旧片段"在屏幕上多挂一会儿。
+
+        合并后同一时刻只会有一个待执行的 trigger；它执行时读的是【当时的】
+        编辑器状态，所以既不会漏哪次变化，也不会积压。
+        """
+        if state.get("trigger_queued"):
+            return
+        state["trigger_queued"] = True
+        post(_run_trigger)
 
     def drain_actions():
         """主线程循环消费动作队列。"""
@@ -367,17 +375,6 @@ def main():
                     elif vk in CONFIRM_VKS:
                         action = (completer.accept, ())
                         suppress = True
-                    elif _digit_index(vk) is not None:
-                        # 数字键 1..9：直接选中第 n 项并写入编辑器（无需再按 Tab）。
-                        # 超出候选数量的数字不放行拦截 —— 那是用户真想输入数字。
-                        idx = _digit_index(vk)
-                        try:
-                            n = len(completer.current_matches())
-                        except Exception:
-                            n = 0
-                        if idx < n:
-                            action = (completer.pick, (idx,))
-                            suppress = True
                 if suppress:
                     state["swallowed"].add(vk)
 
@@ -464,6 +461,31 @@ def main():
             post(completer.maybe_hide_on_outside_click, x, y)
         return True
 
+    def scroll_popup(x, y, dx, dy):
+        """指针停在弹窗上时，滚轮用来上下浏览候选（纵向滚动）。
+
+        必须在主线程里判 contains_point —— 窗口几何查询跨线程读会得到半截状态，
+        所以整个判断都塞进 post 里，而不是在监听器里算好再 post 结果。
+        pynput 约定 dy > 0 向上滚、dy < 0 向下滚。
+
+        v42 起列表不再有横向滚动（超长名字用 ... 省略，完整名字显示在详情行），
+        所以滚轮只做纵向。
+        """
+        try:
+            if not completer.is_visible():
+                return
+            if not popup.contains_point(x, y):
+                return
+        except Exception:
+            return
+        if dy != 0:
+            completer.move(-1 if dy > 0 else 1)
+
+    def on_mouse_scroll(x, y, dx, dy):
+        if completer.is_visible():
+            post(scroll_popup, x, y, dx, dy)
+        return True
+
     def _make_kbd():
         lst = Listener(
             on_press=on_press,
@@ -474,7 +496,7 @@ def main():
         return lst
 
     def _make_mouse():
-        lst = MouseListener(on_click=on_mouse_click)
+        lst = MouseListener(on_click=on_mouse_click, on_scroll=on_mouse_scroll)
         lst.daemon = True
         return lst
 
@@ -550,7 +572,10 @@ def main():
                     except Exception:
                         pass
             else:
-                if completer.is_visible():
+                # 正在与弹窗交互（按住鼠标 / 拖滚动条）或鼠标正停在弹窗上时，
+                # 不收起 —— 保证"选词前 UI 一直可见"（焦点抖动绝不误伤）。
+                if completer.is_visible() and not popup.is_busy() \
+                        and not popup.mouse_inside():
                     post(completer.hide)
                 # 刻意【不】立刻 release：输入法抖动已由 FOCUS_DEBOUNCE 过滤，
                 # 但在 VBE 与其它窗口之间来回切是很常见的操作，每次都清掉
@@ -635,7 +660,7 @@ def main():
                             backend.invalidate_identifiers()
                         # True: 校验光标前是否标识符字符（打空格/标点则收起）
                         _log("poll: line %s changed -> trigger" % (snap[0],))
-                        post(completer.trigger, True)
+                        post_trigger()
         except Exception:
             pass
         # 已离开 VBE（超过宽限期）、或 COM 正处于失败退避（宿主多半在关闭）

@@ -706,6 +706,33 @@ def _blank_ident_at(text, line_no, col):
     return "\n".join(lines)
 
 
+def ident_at_caret(text, line_no, col):
+    """返回 (line_no, col) 处（1-based）标识符的原文；不在标识符内则返回 ""。
+
+    与 _blank_ident_at 用同一套"哪个标识符盖住了光标"的判定，区别只在于这里
+    返回原文而不是抹掉它。
+
+    v43 用途：后端在收集标识符时记下"那一刻光标处的词"。这个词很可能是用户
+    正在输入 / 正在回退删除的词，不是工程里的真名字；引擎据此识别并剔除
+    "回退删字时残留的旧片段"（见 engine.Completer.trigger 的回声防护）。
+    """
+    if not text or not line_no or not col:
+        return ""
+    lines = text.split("\n")
+    if not (1 <= int(line_no) <= len(lines)):
+        return ""
+    line = lines[int(line_no) - 1]
+    c = int(col) - 1
+    if c < 0:
+        return ""
+    if c > len(line):
+        c = len(line)
+    for m in re.finditer(_IDENT, line):
+        if m.start() <= c <= m.end():
+            return m.group(0)
+    return ""
+
+
 def extract_implicit_records(code, module=None, is_std_module=True,
                              declared=None, scope="module", include_usage=True,
                              caret=None):

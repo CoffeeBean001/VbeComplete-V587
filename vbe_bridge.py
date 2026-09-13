@@ -679,6 +679,13 @@ class VbeBackend:
         self._cache = None
         self._cache_time = 0
         self._declared_names = set()
+        # 收集标识符那一刻，光标处那个词的原文（小写）。用来识别【回声】：
+        # 用户正在输入 / 正在回退删除的词，不该被当成工程里的真名字。
+        self._caret_word = ""
+        # 名字(小写) -> 声明它的模块名集合(小写)。让引擎能区分
+        # 【声明在别的模块】（跨模块 Public，可当证据）与【只在我正在编辑的
+        # 这个模块里声明过】（一律以现场文本为准，见 declared_elsewhere）。
+        self._declared_by_module = {}
 
     def release(self):
         """Excel/VBE 关闭或离开 VBE 时调用：清空标识符缓存并释放 COM 资源。
@@ -688,6 +695,8 @@ class VbeBackend:
         """
         self._cache = None
         self._cache_time = 0
+        self._caret_word = ""
+        self._declared_by_module = {}
         # 丢掉缓存的 VBE 对象 —— 这是 Excel 能否真正退出的关键一步。
         # 刻意【不】调 CoFreeUnusedLibraries —— 它释放不了我们持有的引用，
         # 在 Excel 关闭期间调用反而会拖慢/惊扰 COM（详见 _co_free 的说明）。
@@ -728,6 +737,7 @@ class VbeBackend:
         以便调用方用 _cache_time 做重解析的限流。
         """
         self._cache = None
+        self._caret_word = ""
 
     def get_identifiers(self):
         now = time.time()
@@ -747,6 +757,45 @@ class VbeBackend:
         if getattr(self, "_declared_names", None) is None:
             self.get_identifiers()
         return getattr(self, "_declared_names", set())
+
+    def names_outside_caret(self, caret):
+        """把光标处的词抹掉后，【当前模块】里还出现过的名字（小写集合）。
+
+        `name_exists_outside_caret` 的批量版：一次读取模块文本，供引擎在剔除
+        "回声候选"时对多个候选复用 —— 否则每个候选都要打一次 COM。
+
+        刻意只读【当前模块】：回声只可能产生于正在编辑的这个模块；全工程扫描
+        既没必要，又会在多模块大工程上明显变慢。
+        """
+        # 读不到就返回 None（= 现场证据不可用），与"真的没有名字"（空集）
+        # 区分开 —— 调用方据此决定是保守放过还是照常判定。
+        try:
+            line_no, col = int(caret[0]), int(caret[1])
+        except Exception:
+            return None
+        try:
+            vbe = _get_vbe_cached()
+            if vbe is None:
+                return None
+            cp = vbe.ActiveCodePane
+            if cp is None:
+                return None
+            cm = cp.CodeModule
+            if cm.CountOfLines <= 0:
+                return set()
+            code = cm.Lines(1, cm.CountOfLines)
+        except Exception:
+            return None
+        try:
+            src = vba_parser._blank_ident_at(code, line_no, col)
+            src = vba_parser._mask_strings_and_comments(src)
+        except Exception:
+            src = code
+        try:
+            return set(m.group(0).lower()
+                       for m in re.finditer(r"[^\W\d]\w*", src))
+        except Exception:
+            return None
 
     def name_exists_outside_caret(self, name, caret):
         """把光标处的词抹掉后，【当前模块】里 name 是否还在别处出现。
@@ -768,35 +817,37 @@ class VbeBackend:
         """
         if not name:
             return False
-        try:
-            line_no, col = int(caret[0]), int(caret[1])
-        except Exception:
-            return False
-        try:
-            vbe = _get_vbe_cached()
-            if vbe is None:
-                return False
-            cp = vbe.ActiveCodePane
-            if cp is None:
-                return False
-            cm = cp.CodeModule
-            if cm.CountOfLines <= 0:
-                return False
-            code = cm.Lines(1, cm.CountOfLines)
-        except Exception:
-            return False
-        try:
-            src = vba_parser._blank_ident_at(code, line_no, col)
-            src = vba_parser._mask_strings_and_comments(src)
-        except Exception:
-            src = code
-        target = str(name).lower()
-        try:
-            for m in re.finditer(r"[^\W\d]\w*", src):
-                if m.group(0).lower() == target:
-                    return True
-        except Exception:
-            return False
+        return str(name).lower() in (self.names_outside_caret(caret)
+                                      or ())
+
+    def caret_word_at_collect(self):
+        """返回"收集标识符那一刻光标处的词"（小写，可能为空串）。
+
+        标记符池是带缓存的：调用方拿到的候选可能来自 0.4 秒前的解析。那时
+        光标处的词，就是用户此刻可能正在回退删除的那个词 —— 引擎用它把
+        "回退途中残留的更长的旧片段"从候选里剔掉（v43）。
+        """
+        return getattr(self, "_caret_word", "") or ""
+
+    def declared_elsewhere(self, name, module_name):
+        """name 是否在【其它模块】里被真实声明过。
+
+        True  = 别的模块声明过（跨模块 Public 证据）；
+        False = 只在当前模块声明过，或压根没声明过 -> 请以现场文本为准；
+        None  = 后端不提供这项信息 -> 调用方退回旧证据（旧式 / 测试后端）。
+
+        分工：跨模块的 Public 名字只有声明集合认得它（现场扫不到），靠 True；
+        而只在【正在编辑的这个模块】里声明过的名字，一律以现场文本为准 ——
+        用户完全可能刚把它删掉，声明集合却还是 0.4 秒前解析的快照，信它就会把
+        "回退途中残留的更长的旧片段"保下来（v43 修的就是这个）。
+        """
+        by_mod = getattr(self, "_declared_by_module", None)
+        if not isinstance(by_mod, dict):
+            return None
+        m = str(module_name or "").lower()
+        for owner in (by_mod.get(str(name).lower()) or ()):
+            if owner != m:
+                return True
         return False
 
     def _collect_identifiers(self):
@@ -822,6 +873,9 @@ class VbeBackend:
         # 输入的词"与"当前声明行的名字"决定是否剔除。
         # "类型名"集合：`Dim f As <这里>` 用得上——窗体名、类模块名、标准模块名、
         # 以及代码里定义的 Type / Enum 名。
+        # 每次收集都重置：没有光标信息时它就是空串（不误伤任何候选）
+        self._caret_word = ""
+        _decl_by_mod = {}
         type_names = set()
         # 真实"声明"过的名字（Dim/Const/Sub/Function/Type/Enum 及组件名）。
         # 供引擎层区分"真名字"与"幻影"：回退删字回退出来的未定义词（如 numA）
@@ -848,6 +902,8 @@ class VbeBackend:
                         records.append((mod_name, mod_name, None, False))
                         type_names.add(mod_name)
                         declared_names.add(mod_name.lower())
+                        _decl_by_mod.setdefault(
+                            mod_name.lower(), set()).add(mod_name.lower())
                     modules.append(mod_name)
                     cm = comp.CodeModule
                     count = cm.CountOfLines
@@ -869,6 +925,19 @@ class VbeBackend:
                         code, module=mod_name, is_std_module=is_std,
                         caret=apply_caret)
                     records.extend(recs)
+                    # 记下【这一刻光标处的词】：它多半是用户正在输入 / 正在
+                    # 回退删除的词。回退删字时，缓存的池子里还留着它更长的
+                    # 旧版本，引擎靠这个词把那个幽灵剔掉（v43）。
+                    # 只在【确知光标在哪个模块】时才记：caret_mod 为空时
+                    # 同一个 caret 会被套用到所有模块，这里最后赋值的那个
+                    # 词可能来自任意模块，拿它当"光标旧词"就会误伤候选。
+                    if apply_caret and caret_mod:
+                        try:
+                            self._caret_word = vba_parser.ident_at_caret(
+                                code, apply_caret[0],
+                                apply_caret[1]).lower()
+                        except Exception:
+                            self._caret_word = ""
                     # "真名集合"必须剔除【光标所在声明行正在声明的那些名字】：
                     # 那是用户正在敲 / 正在删的词，不是"工程里已存在的真名字"。
                     #
@@ -889,6 +958,11 @@ class VbeBackend:
                     declared_names.update(
                         str(r[0]).lower() for r in recs
                         if str(r[0]).lower() not in caret_decl)
+                    for _r in recs:
+                        _n = str(_r[0]).lower()
+                        if _n not in caret_decl:
+                            _decl_by_mod.setdefault(
+                                _n, set()).add(str(mod_name).lower())
                     # 隐式变量（没写 Option Explicit 时"用到即存在"）：
                     # 只补 extract_records 没声明过的名字，避免重复与作用域冲突。
                     imp = []
@@ -908,6 +982,7 @@ class VbeBackend:
             return []
         self._type_names = type_names
         self._declared_names = declared_names
+        self._declared_by_module = _decl_by_mod
         # 只在数量变化时记日志，避免每 2 秒刷一行
         if len(records) != getattr(self, "_last_id_count", -1):
             self._last_id_count = len(records)
@@ -1009,10 +1084,15 @@ class VbeBackend:
             return None
 
     # ---- 应用补全 ----
-    def apply_completion(self, line_no, word_start_col, caret_col, completion):
-        """把 [word_start_col, caret_col) 区间的单词替换为 completion 并写回 VBE。
+    def apply_completion(self, line_no, word_start_col, end_col, completion):
+        """把 [word_start_col, end_col) 区间的单词替换为 completion 并写回 VBE。
 
-        word_start_col / caret_col 均为 1-based 字符列（与 Python 行文本一致）。
+        word_start_col / end_col 均为 1-based 字符列（与 Python 行文本一致）。
+        end_col 通常是光标列（光标左边那截已输入的前缀）；光标停在标识符【开头】
+        （按 Delete 从名字开头删字符，v44）或【中间】（从名字中间删字符，v46）时
+        它才大于光标列——此时要把光标右边那段残留名字一起换掉，否则会在残留词
+        前面插入候选、拼出双份名字。
+
         写回后把光标放到补全词尾部：
           - 若该行(含 Tab/全角)在 VBE 里按"显示列"计，就把字符列换算成显示列，
             否则光标会因 Tab 展开的格差落在词的中间；
@@ -1027,7 +1107,7 @@ class VbeBackend:
                 return None
             cm = cp.CodeModule
             line_text = cm.Lines(line_no, 1)
-            new_line = replace_word(line_text, word_start_col, caret_col, completion)
+            new_line = replace_word(line_text, word_start_col, end_col, completion)
 
             # 词尾字符下标（0-based）
             start0 = max(0, word_start_col - 1)
@@ -1042,7 +1122,7 @@ class VbeBackend:
             end0 = min(end0, len(actual))
             # VBE 自动补的括号（`Function gCalc` -> `Function gCalc()`）：
             # 光标要落进括号里，否则停在左括号左侧还得手动右移一格。
-            end0 = _skip_into_parens(actual, end0, line_text, caret_col)
+            end0 = _skip_into_parens(actual, end0, line_text, end_col)
             end0 = min(end0, len(actual))
 
             # 关键：列语义探测必须基于「写回之后」的实际行。
@@ -1074,7 +1154,7 @@ class VbeBackend:
             except Exception:
                 actual2 = actual
             if actual2 != actual:
-                end0b = _skip_into_parens(actual2, end0, line_text, caret_col)
+                end0b = _skip_into_parens(actual2, end0, line_text, end_col)
                 if end0b != end0:
                     end0 = min(end0b, len(actual2))
                     try:

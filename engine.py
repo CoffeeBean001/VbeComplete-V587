@@ -17,7 +17,10 @@ backend 需实现：
         - "x"                   纯名字（视为全局可见，便于单测）
         - ("x", scope)          旧式二元组（scope=过程名或 None）
         - ("x", mod, proc, priv) 完整记录
-  apply_completion(line_no, word_start_col, caret_col, completion)
+  apply_completion(line_no, word_start_col, end_col, completion)
+      end_col = 补全词范围的右端（1-based，开区间）。通常就是光标列；
+      光标停在标识符【开头】或【中间】时大于光标列——前者要盖住光标右边
+      那个残留标识符，后者要盖住同一个名字的后半截。取词见 extract_word_at。
 """
 
 import re
@@ -36,7 +39,11 @@ SUPPRESS_AFTER_ACCEPT = 0.35
 
 
 def extract_word_before(line_text, caret_col):
-    """返回 (word, start_col)，均为 1-based；无则返回 (None, None)。"""
+    """返回 (word, start_col)，均为 1-based；无则返回 (None, None)。
+
+    只看光标【左边】。从名字中间/结尾删字符都在这个模型内；从名字【开头】
+    删则左邻是空格或括号，取不到词——那种情形由 extract_word_at 兜住。
+    """
     prefix = line_text[:caret_col - 1] if caret_col and caret_col > 1 else ""
     m = _IDENT.search(prefix)
     if not m:
@@ -44,11 +51,71 @@ def extract_word_before(line_text, caret_col):
     return m.group(0), m.start() + 1
 
 
+# 正向标识符（从某个下标起，首字符必须是字母/下划线/中文）。
+_IDENT_FWD = re.compile(r"[^\W\d]\w*")
+
+
+def extract_word_at(line_text, caret_col):
+    """返回 (word, start_col, end_col)，均为 1-based；无则返回 (None, None, None)。
+
+    当前词 = **光标所在处那一个完整标识符**，而不是"光标左边那半截"。
+
+    v44：不再只看"光标前的词"。用户把光标停在名字最左边、按 Delete 从头删字符
+    时，光标左边是空格（或 `(`,`=` 之类），只看左边永远取不到词，弹窗因此永远
+    不出现——用户报的正是这个。那种情形改为取光标【右边】紧挨的标识符，
+    替换范围 [caret_col, end_col) 覆盖整个标识符，这样 Tab 确认时是把残留的
+    名字【整段】换掉，而不是把候选插在光标处、拼出 `abc` + `bcDef` 这种双份名字。
+
+    v46：光标左边有词时，**还要往右吞掉紧邻的标识符字符**。用户把光标停在名字
+    【中间】删字符时（test23456789 删掉中间那个 t -> tes|23456789），若只取左边
+    那半截 `tes`，候选就会按 `tes` 的前缀算，把 `test` / `test02` 提示出来，
+    完全无视光标右边还留着的 `23456789`——用户报的正是这个。当前词取【整段名字】
+    （左半截 + 右半截）后，`tes23456789` 既不匹配 `test` 也不匹配 `test02`，
+    只剩真正那一整段名字（Tab 可一次把整段换掉）。
+
+    规则三条：
+
+      1. 光标左边有词 -> 取它，再往右吞掉紧邻的标识符字符，得到整段名字，
+         替换范围 [start_col, end_col)；
+      2. 光标左边没有词，但光标【右边】紧挨着一个标识符（光标正好停在该标识符
+         开头）-> 取这个标识符，替换范围 [caret_col, end_col)；
+      3. 两边都没有（光标夹在两个非标识符之间）才返回 None，由调用方收起弹窗。
+    """
+    if not line_text or not caret_col or caret_col < 1:
+        return None, None, None
+    word, start = extract_word_before(line_text, caret_col)
+    i = caret_col - 1                     # 光标右边第一格的 0-based 下标
+    n = len(line_text)
+    if word:
+        # v46：把光标右边紧邻的标识符字符一并吞进来（同一个名字的后半截）。
+        j = i
+        while j < n and (line_text[j].isalnum() or line_text[j] == "_"):
+            j += 1
+        if j > i:
+            return line_text[start - 1:j], start, j + 1
+        return word, start, caret_col
+    # 兜底：光标停在标识符开头（左边是分隔符，右边是标识符字符）
+    if i >= n:
+        return None, None, None
+    m = _IDENT_FWD.match(line_text, i)
+    if not m:
+        return None, None, None
+    return m.group(0), m.start() + 1, m.end() + 1
+
+
 def _ident_char_before_caret(ctx):
-    """光标前一个字符是否属于标识符（字母/数字/下划线，含中文）。
+    """光标是否紧贴着标识符字符（左边一格，或右边一格）。
 
     用于"编辑器内容变化"触发的路径：若刚输入的是空格/标点/换行，
     说明用户并没有在拼标识符，应当收起弹窗（保持与按空格收起一致的行为）。
+
+    v44：判据从"光标【前】一个字符"放宽到"光标前【或】后一个字符"。因为
+    光标停在名字开头时（按 Delete 从头删字符），左邻恰恰是空格/括号，只认
+    左边就会把"正在拼标识符"误判成"已经打完"，弹窗永远弹不出来。右边紧挨
+    标识符字符，同样说明光标正贴在某个标识符上。
+
+    这不会破坏"打空格收起"：在词尾敲空格后，光标右边通常是行尾或括号，
+    右边没有标识符字符，依旧收起；具体该弹该收仍由 extract_word_at 定夺。
     """
     caret = ctx.get("caret_col") or 0
     if caret <= 1:
@@ -58,7 +125,13 @@ def _ident_char_before_caret(ctx):
     if i < 0 or i >= len(text):
         return True
     ch = text[i]
-    return ch.isalnum() or ch == "_"
+    if ch.isalnum() or ch == "_":
+        return True
+    j = caret - 1                     # 光标右边那一格
+    if j < len(text):
+        ch = text[j]
+        return bool(ch.isalnum() or ch == "_")
+    return False
 
 
 def replace_word(line_text, word_start_col, caret_col, completion):
@@ -266,8 +339,13 @@ def _name_exists_outside_caret(backend, word, line_no, caret_col):
         return False
 
 
+# 弹窗一屏显示几行。**这是窗口高度，不是候选上限** —— 候选再多也不会被丢弃，
+# 超出的排在窗口外，靠上下键 / 滚轮滚动查看。
+VIEW_ROWS = 15
+
+
 class Completer:
-    def __init__(self, backend, ui):
+    def __init__(self, backend, ui, view_rows=VIEW_ROWS):
         self.backend = backend
         self.ui = ui
         self.visible = False
@@ -280,6 +358,70 @@ class Completer:
         # 当前候选各自的命中下标：{名字: [下标, ...]}，供 UI 把命中的字符标红。
         # 由 trigger() 填写、hide() 清空。UI 通过 completer 读取，不占用 show() 签名。
         self.match_hits = {}
+        # ---- 滚动视口 ----
+        # 弹窗高度固定显示 view_rows 行，但候选永远【不会】被截断：
+        # 多余的排在窗口外，靠上下键/滚轮滚动查看。view_top 是当前窗口的起始下标。
+        self.view_rows = max(1, int(view_rows or VIEW_ROWS))
+        self.view_top = 0
+
+    def _clamp_top(self):
+        """把窗口起点夹到合法区间（不能越过列表末尾）。"""
+        n = len(self.matches)
+        if n <= self.view_rows:
+            self.view_top = 0
+            return
+        last_top = n - self.view_rows
+        if self.view_top < 0:
+            self.view_top = 0
+        elif self.view_top > last_top:
+            self.view_top = last_top
+
+    def _scroll_to_selected(self):
+        """滚动最小的幅度，让选中项落在窗口内（尽量保持在中间之外不折腾用户）。"""
+        self._clamp_top()
+        n = len(self.matches)
+        if n <= self.view_rows:
+            self.view_top = 0
+            return
+        if self.selected < self.view_top:
+            self.view_top = self.selected
+        elif self.selected >= self.view_top + self.view_rows:
+            self.view_top = self.selected - self.view_rows + 1
+        self._clamp_top()
+
+    def visible_rows(self):
+        """当前这一屏要画出来的候选（最多 view_rows 个，不会掐掉剩下的）。"""
+        top = max(0, min(self.view_top, max(0, len(self.matches) - 1)))
+        return list(self.matches[top:top + self.view_rows])
+
+    def view_selection(self):
+        """选中项在【当前这一屏】里的行号（0-based），UI 用它决定高亮哪一行。"""
+        return max(0, self.selected - self.view_top)
+
+    def view_info(self):
+        """(候选总数, 当前窗口起点) —— UI 画滚动条用。"""
+        return (len(self.matches), max(0, self.view_top))
+
+    def set_view_top(self, top):
+        """鼠标拖动纵向滚动条时，按拖到的位置设置窗口起点 view_top。
+
+        top 会被夹到合法区间；同时把选中项夹进当前可见窗口，
+        保证高亮始终可见、Tab 确认的是看得见的候选。
+        """
+        if not self.visible or not self.matches:
+            return
+        self.view_top = max(0, int(top))
+        self._clamp_top()
+        n = len(self.matches)
+        lo = self.view_top
+        hi = min(self.view_top + self.view_rows - 1, n - 1)
+        if self.selected < lo:
+            self.selected = lo
+        elif self.selected > hi:
+            self.selected = hi
+        if self.selected < 0:
+            self.selected = 0
+        self.ui.update_selection(self.selected)
 
     def _type_name_set(self):
         """后端给出的"类型名"集合（小写），供 `As` 之后的位置使用。
@@ -295,34 +437,106 @@ class Completer:
         except Exception:
             return set()
 
-    def _name_really_exists(self, name, ctx=None):
+    def _live_names_outside_caret(self, ctx=None):
+        """现场扫描当前模块：抹掉光标处的词之后，里面还出现过的名字（小写）。
+
+        可选接口 backend.names_outside_caret(caret)。
+        返回 None 表示【现场证据不可用】（后端没实现 / 读不到），
+        此时调用方退回"声明集合"这一路证据（行为等同旧版，不会更糟）。
+        """
+        if ctx is None:
+            ctx = self.ctx or {}
+        hook = getattr(self.backend, "names_outside_caret", None)
+        if not callable(hook):
+            return None
+        line_no, col = ctx.get("line_no"), ctx.get("caret_col")
+        if not line_no or not col:
+            return None
+        try:
+            got = hook((int(line_no), int(col)))
+            if got is None:
+                return None       # 后端读不到（COM 失败）
+            return set(str(n).lower() for n in got)
+        except Exception:
+            return None
+
+    def _live_evidence_available(self):
+        """后端是否支持"现场扫描当前模块"（names_outside_caret）。
+
+        幽灵判定（候选恰好等于"收集时光标处的词"就剔除）只在现场证据可用时
+        才敢下结论：拿不到现场证据时，那个词也可能确实是别的模块里的真名字，
+        宁可保守放过，也不要误杀候选。
+        """
+        return callable(getattr(self.backend, "names_outside_caret", None))
+
+    def _caret_word_at_collect(self):
+        """标识符池被解析那一刻，光标处的词（小写；后端不提供则空串）。"""
+        hook = getattr(self.backend, "caret_word_at_collect", None)
+        if not callable(hook):
+            return ""
+        try:
+            return str(hook() or "").lower()
+        except Exception:
+            return ""
+
+    def _name_really_exists(self, name, ctx=None, live=None, declared=None):
         """这个名字在工程里是【真实存在】的，还是只是光标处的回声？
 
         两条互为补充的证据，命中任一即认为真实存在：
 
         1. `get_declared_names()` 里有它 —— 全工程范围内被 Dim/Const/Sub/
            Function/Type/Enum 真正声明过。跨模块的 Public 名字靠这一条。
-        2. `name_exists_outside_caret()` 为真 —— 把光标处的词抹掉后，它在
-           当前模块别处还出现。隐式变量（用到即存在）、以及解析层没能归类
-           的声明，靠这一条兜住。
+        2. 现场扫描当前模块（把光标处的词抹掉后）还能找到它 —— 隐式变量
+           （用到即存在）、以及解析层没能归类的声明，靠这一条兜住。
 
         只用 1 会漏判隐式变量（正是 v35"打全 arr 列表消失"的成因）；
-        只用 2 会漏判跨模块的 Public 名字（`name_exists_outside_caret`
-        刻意只扫当前模块以省开销）。所以两条都要。
+        只用 2 会漏判跨模块的 Public 名字（`names_outside_caret` 刻意只扫
+        当前模块以省开销）。所以两条都要。
+
+        v43 加固：缓存里的"收集那一刻光标处的词"**不算**存在证据。它很可能
+        正是用户此刻在回退删除的那个词（候选池还没刷新），若把它当真名字保
+        下来，就会"回退时提示出更长的旧片段"。所以这条要排在声明集合之前
+        否决 —— 但只要现场能扫到（真在别处存在），仍然算数（先判 live）。
+
+        live / declared 可由调用方传入复用，避免每个候选重复打 COM。
         """
         low = str(name).lower()
         if not low:
             return False
-        try:
-            if low in self._declared_names():
-                return True
-        except Exception:
-            pass
-        if ctx is None:
-            ctx = self.ctx or {}
-        return _name_exists_outside_caret(self.backend, name,
-                                          ctx.get("line_no"),
-                                          ctx.get("caret_col"))
+        if declared is None:
+            try:
+                declared = self._declared_names()
+            except Exception:
+                declared = set()
+        if live is None:
+            live = self._live_names_outside_caret(ctx)
+        if live is None:
+            # 现场证据不可用：退回"声明集合"这一路（旧行为），
+            # 绝不因为拿不到现场数据就把候选误杀。
+            return low in declared
+        if low in live:
+            return True                      # 现场就找得到 -> 铁证
+        # 后端能区分"声明在哪个模块"时（v43）：声明证据只认【别的模块】。
+        # 只在当前正在编辑的模块里声明过的名字，一律以现场文本为准 —— 现场
+        # 扫不到就说明它已被删掉，声明集合里那一份只是 0.4 秒前的旧快照。
+        ext = None
+        hook = getattr(self.backend, "declared_elsewhere", None)
+        if callable(hook):
+            try:
+                ext = hook(name, (ctx or self.ctx or {}).get("module_name"))
+            except Exception:
+                ext = None
+        if ext is True:
+            return True                      # 别的模块声明过 -> 跨模块真名字
+        if ext is False:
+            return False                     # 只在本模块声明过，而现场已经没有
+        # 幽灵判定只在【现场证据可用】时才敢下结论（见 _live_evidence_available）：
+        # 候选恰好等于【收集那一刻光标处的词】、而现场又扫不到它 —— 它就是用户
+        # 正在回退删除的那个词的旧版本，缓存里的声明集合很可能还残留着它。
+        if (self._live_evidence_available()
+                and low == self._caret_word_at_collect()):
+            return False
+        return low in declared
 
     def _declared_names(self):
         """工程里【真实声明】过的名字（小写集合），供 trigger 区分"真名字"与"幻影"。
@@ -341,8 +555,14 @@ class Completer:
                 return set(str(n).lower() for n in (hook() or ()))
             except Exception:
                 pass
+        # 兜底（旧式 / 测试后端）：把【全部可见标识符】都算已声明。
+        # 记录可能是 "x" / ("x", scope) / ("x", mod, proc, priv) 三种形态，
+        # 必须用 _normalize_scoped 取出【名字】——直接 str(整条记录) 会得到
+        # "('num', 'M1', 'ProcA', False)" 这种垃圾，等于永远查不到，
+        # 会把本该保留的前缀候选全部误杀。
         try:
-            return set(str(i).lower() for i in self.backend.get_identifiers())
+            return set(str(r[0]).lower()
+                       for r in _normalize_scoped(self.backend.get_identifiers()))
         except Exception:
             return set()
 
@@ -376,7 +596,8 @@ class Completer:
         if require_ident_before_caret and not _ident_char_before_caret(ctx):
             self.hide()
             return
-        word, start_col = extract_word_before(ctx["line_text"], ctx["caret_col"])
+        word, start_col, end_col = extract_word_at(ctx["line_text"],
+                                                    ctx["caret_col"])
         if not word or not (word[0].isalpha() or word[0] == "_"):
             self.hide()
             return
@@ -429,19 +650,66 @@ class Completer:
             # 正确问法只有一个：**这个名字在工程里真实存在吗？**
             #   存在 -> 合法候选，打全照常提示（arr / num / test 都保留）；
             #   不存在 -> 它只是回声，剔除（numA 不提示）。
-            exact = word.lower()
-            if any(m.lower() == exact for m in matches) \
-                    and not self._name_really_exists(word, ctx):
-                matches = [m for m in matches if m.lower() != exact]
+            # 回声候选：候选名【包含当前词这一整段连续片段】——
+            #   * 候选 == 当前词         精确回声（v30 起就管了）；
+            #   * 候选 以当前词开头      从【结尾】删：剩下的是前缀（v43）；
+            #   * 候选 以当前词结尾      从【开头】删：剩下的是后缀（v45）；
+            #   * 候选 中间夹着当前词    头尾都删：剩下的是中段（v45）。
+            # 统一判据：**当前词是候选名的连续子串**。用户删除字符只会让光标处的
+            # 词变短，剩下的必然是原词的连续一段，不可能"跳着剩"——
+            # 所以"连续子串"恰好等价于"这个候选可能是被删剩下的旧版本"。
+            #
+            # 为什么会有"残留片段"：标识符池是【带缓存】的（最快也要
+            # ID_REFRESH_MIN_SEC 才重解析一次）。用户按住 Delete 连删时，池子里
+            # 还留着"文字还长"那一刻解析出来的名字，于是弹窗会提示出一个比编辑器
+            # 里实际内容【更长】的旧片段 —— 用户报的正是这个：
+            #   从结尾删 -> 删到只剩 studengd 却提示 studengd...sgjd；
+            #   从开头删 -> 删到只剩 ngdflk... 却提示完整的 studengd...sgjd。
+            #
+            # 判定候选是不是"真名字"，用两路证据（见 _name_really_exists）：
+            #   1) 声明集合（跨模块 Public 名字只有它认得）；
+            #   2) 现场扫描当前模块（隐式变量 / 解析层没归类的声明靠它）。
+            # 加固：等于"收集那一刻光标处的词"、且现场扫不到的候选，一律当幽灵
+            # 剔除 —— 缓存里的声明集合可能还残留着它（那一刻它确实写在声明行上），
+            # 不能让它把幽灵保下来。
+            #
+            # 性能：只有"缓存里没有它"或"它就是那个光标旧词"时才需要现场扫描。
+            # 正常打字路径候选都在声明集合里，一次 COM 都不会多打。
+            low_word = word.lower()
+
+            def _is_echo_candidate(name):
+                # 连续子串：前缀（结尾删）/ 后缀（开头删）/ 中段（头尾都删）
+                # 都算回声。是否保留由下面的 _name_really_exists 用现场文本
+                # 与声明证据裁决 —— 真名字（本模块别处出现 / 别的模块声明过）
+                # 一律照常提示。
+                return low_word in name.lower()
+
+            echoes = [m for m in matches if _is_echo_candidate(m)]
+            if echoes:
+                try:
+                    declared = self._declared_names()
+                except Exception:
+                    declared = set()
+                # 现场证据【每次都要取】：判断"声明在本模块的名字是不是已被
+                # 删掉"只能靠现场文本（声明集合最长滞后 0.4s）。代价是每次触发
+                # 多读一次当前模块文本，远比全量重解析便宜。
+                live = self._live_names_outside_caret(ctx)
+                matches = [
+                    m for m in matches
+                    if not _is_echo_candidate(m)
+                    or self._name_really_exists(m, ctx, live=live,
+                                                declared=declared)
+                ]
         # 注意：这里【不要】再加"唯一候选恰好等于所输词就收起"的收尾规则。
         #
         # 那条规则（v30 为修"回退键提示自己"引入）误伤了正常场景：变量 arr 已定义，
         # 输入 a / ar 都提示 arr，把 arr 打全反倒把列表关掉了 —— 用户明确要求
         # "输入完整，提示保留"，否则没法 Tab 确认、也看不出自己写对了没有。
         #
-        # 它原本要防的"提示自己"，现在由上面两条更精确的规则覆盖：
-        #   1) 词不是工程里真实声明的名字（回退出来的 numA）-> 剔除它本身；
-        #   2) 声明行上正在起的新名字 -> 剔除其完整拼法。
+        # 它原本要防的"提示自己"，现在由上面那段「回声防护」更精确地覆盖：
+        # 凡"以当前词开头"的候选，只要拿不出"真实存在"的证据（现场扫不到、
+        # 别的模块也没声明过），就一律剔除 —— 既管"就是当前词本身"，
+        # 也管"回退删字时残留的更长的旧版本"（v43）。
         # 真实存在的名字打全了就该继续提示，与打前缀行为一致。
         # 诊断：把"原始记录里有哪些同名命中、各属于哪个模块/过程"一并记下，
         # 这样日志能直接区分是"压根没收录"还是"收录了但被作用域过滤掉"。
@@ -461,7 +729,6 @@ class Completer:
             self.hide()
             return
         self.matches = matches
-        # 默认选中：若当前词恰好等于某候选（已打全），优先选中它，
         # 按 Tab 即可直接确认当前已输入的完整名字；否则选中列表首项。
         exact = word.lower()
         sel = 0
@@ -470,16 +737,28 @@ class Completer:
                 sel = idx
                 break
         self.selected = sel
+        # 换了输入词就回到列表开头，再按选中项的位置把窗口挪过去 ——
+        # 打全名时选中项可能排在很后面（几十条候选里的第 20 个），
+        # 不挪的话它在窗口外，用户看不见自己选了什么。
+        self.view_top = 0
+        self._scroll_to_selected()
         self.ctx = {
             "line_no": ctx["line_no"],
             "caret_col": ctx["caret_col"],
             "word": word,
             "word_start_col": start_col,
+            # 替换范围右端：正常等于 caret_col；光标停在标识符【开头】或
+            # 【中间】时大于它（要连光标右边那段残留名字一起换掉，
+            # 见 extract_word_at），否则会在残留词前面插入候选、拼出双份名字。
+            "word_end_col": end_col,
         }
         self.visible = True
         self.shown_at = time.time()
         self.word_is_complete = word.lower() in set(i.lower() for i in visible_ids)
-        self.ui.show(self.matches, self.selected, self)
+        # 只把【当前这一屏】交给 UI 去画：行数最多 view_rows（默认 15）行，
+        # 候选不足时还会更短，列表不会越滚越长；而完整的候选始终留在 self.matches
+        # 里，滚动即可到达。
+        self.ui.show(self.visible_rows(), self.view_selection(), self)
 
     def can_space_confirm(self):
         """
@@ -496,6 +775,9 @@ class Completer:
             return
         n = len(self.matches)
         self.selected = (self.selected + delta) % n
+        # 选中项跟着滚动走：走到窗口下沿时窗口下移一行（而不是整屏跳），
+        # 首项按上键绕到末项时直接滚到底部。
+        self._scroll_to_selected()
         self.ui.update_selection(self.selected)
 
     def accept(self):
@@ -504,8 +786,9 @@ class Completer:
         chosen = self.matches[self.selected % len(self.matches)]
         ctx = self.ctx
         try:
+            end_col = ctx.get("word_end_col") or ctx.get("caret_col")
             self.backend.apply_completion(
-                ctx["line_no"], ctx["word_start_col"], ctx["caret_col"], chosen
+                ctx["line_no"], ctx["word_start_col"], end_col, chosen
             )
         except Exception:
             # 插入失败也要保证状态复位，否则弹窗会卡住不再触发
@@ -516,10 +799,11 @@ class Completer:
             self.hide()
 
     def pick(self, index):
-        """按序号直接选中并确认（数字键 1..9 选词）。
+        """按绝对下标直接选中并确认（鼠标点击 / 程序调用）。
 
-        index 为 0-based。越界（列表没那么多项）返回 False 且不改变状态，
-        调用方据此决定"该按键是否要被吞掉"——越界时应放行，让用户正常输入数字。
+        index 为 0-based，对应 `matches` 中的绝对位置（UI 在点击时会把"屏内行号"
+        换算回绝对下标再调用，所以这里不需要知道窗口视图）。
+        越界（列表没那么多项）返回 False 且不改变状态。
         """
         if not self.visible or not self.matches:
             return False
@@ -539,6 +823,7 @@ class Completer:
         self.visible = False
         self.matches = []
         self.selected = 0
+        self.view_top = 0
         self.ctx = None
         self.word_is_complete = False
         self.match_hits = {}
@@ -552,6 +837,11 @@ class Completer:
         这里仅当“落在弹窗外”才收起。
         """
         if not self.visible:
+            return
+        # 正在拖滚动条：直接返回，不收起（确保"选词前 UI 一直可见"）。
+        # 加了 WS_EX_NOACTIVATE 后弹窗不会抢焦点，本路径本就不该触发；
+        # 这里再兜一道保险，避免任何边界情况下拖拽途中把列表框收掉。
+        if getattr(self.ui, "_drag", None) is not None:
             return
         try:
             inside = self.ui.contains_point(px, py)
