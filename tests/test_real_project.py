@@ -2869,6 +2869,145 @@ def main():
     except Exception as _e31:
         check("第 31 节异常: %s" % _e31, [True], expect_contain=[False])
 
+    # ---- 32. v52：在标识符【前面】敲空格/标点，不许把右边那个词拿来补全 ----
+    #
+    # 用户报的现象：光标停在形参首字符前面，敲一个空格 -> 弹窗把这个形参
+    # 原样提示出来（提示自己）。真实代码里形参几乎总会在本过程体内被用到，
+    # 于是"现场还能扫到它" -> 被当成真实存在的名字 -> 回声防护放行。
+    #
+    # 根因：`extract_word_at` 有一条兜底（v44 为"光标停在词首、按 Delete 从头
+    # 删字"引入）——光标左边没词、但右边紧挨着标识符时取右边那个词；入场检查
+    # `_ident_char_before_caret` 也据此放宽到"光标前【或】后是标识符即可"。
+    # 于是做完这次编辑后的那一帧快照，"敲空格"与"从词首删字"长得一模一样
+    # （左边是分隔符、右边是标识符），单看快照永远区分不开。
+    #
+    # 唯一的差别在【怎么变的】：删字是行【变短】；敲分隔符是行【变长】且插入
+    # 的那一段不含标识符字符。本节的 32.1~32.5 锁这条判据本身，32.6 起锁端到端。
+    print("\n=== 32. 标识符前敲空格/标点不许补全（v52）===")
+    try:
+        # A) 判据本身：只有"插进来一段不含标识符字符的内容"才算敲了分隔符
+        check("32.1 插入空格 -> 判定为分隔符",
+              [E.typed_separator("Public Sub B(ByVal x As String)",
+                                 "Public Sub B(ByVal  x As String)")],
+              expect_contain=[True])
+        check("32.2 删除（行变短）-> 不判定为分隔符",
+              [E.typed_separator("    Debug.Print abcd",
+                                 "    Debug.Print abc")],
+              expect_contain=[False])
+        check("32.3 插入标识符字符 -> 不判定为分隔符",
+              [E.typed_separator("    Debug.Print abc",
+                                 "    Debug.Print abcd")],
+              expect_contain=[False])
+        check("32.4 VBE 纠正大小写（替换）-> 不判定为分隔符",
+              [E.typed_separator("dim x as string", "Dim x As String")],
+              expect_contain=[False])
+        check("32.5 纯插入内容提取正确（替换/删除一律 None）",
+              [E.line_edit_inserted("ab", "aXXb"),
+               E.line_edit_inserted("ab", "b"),
+               E.line_edit_inserted("abc", "abc")],
+              expect_contain=["XX", None])
+
+        # B) 端到端：完全按 main.poll_editor 的分支跑
+        #    （31 节那套脚手架还在函数作用域里，这里直接复用；它内部是
+        #     真实解析 + 真实 VbeBackend.names_outside_caret）
+        VB31._get_vbe_cached = lambda *a, **k: _VBE31(_cur31["code"])
+
+        def _poll32(body, edit):
+            """edit(old_line, col) -> (new_line, new_col)；按 poll 的分支走一遍。"""
+            code, caret = _parse31(_HDR31 + body)
+            ln, col = caret
+            ls = code.split("\n")
+            old_line = ls[ln - 1]
+            new_line, new_col = edit(old_line, col)
+            if E.typed_separator(old_line, new_line):
+                return (False, [], new_line)          # 收起，不 trigger
+            ls[ln - 1] = new_line
+            new_code = "\n".join(ls)
+            _cur31["code"] = new_code
+            be = _B31(new_code, (ln, new_col))
+            ui = _UI31()
+            c = E.Completer(be, ui)
+            c.trigger(True)
+            return (ui.shown, sorted(c.matches or []), new_line)
+
+        def _ins32(ch):
+            def f(line, col):
+                return line[:col - 1] + ch + line[col - 1:], col + len(ch)
+            return f
+
+        def _del32(line, col):
+            return line[:col - 1] + line[col:], col     # Delete：删光标右边那个字
+
+        def _tail32(ch):
+            def f(line, col):
+                return line + ch, len(line) + len(ch) + 1
+            return f
+
+        _p32 = _poll32([
+            "",
+            "Public Sub ProcedureB(ByVal |username As String)",
+            "    Debug.Print username",
+            "End Sub"], _ins32(" "))
+        check("32.6 形参首字符前打空格 -> 不提示形参自身",
+              [_p32[0], "username" in _p32[1], _p32[2]],
+              expect_contain=[False, False,
+                              "Public Sub ProcedureB(ByVal  username As String)"],
+              expect_absent=[True])
+
+        # 控制组：绕过这道门直接 trigger，确实会提示自己 —— 证明这道门有意义
+        _c32, _k32 = _parse31(_HDR31 + [
+            "",
+            "Public Sub ProcedureB(ByVal |username As String)",
+            "    Debug.Print username",
+            "End Sub"])
+        _ls32 = _c32.split("\n")
+        _ln32, _col32 = _k32
+        _l32 = _ls32[_ln32 - 1]
+        _ls32[_ln32 - 1] = _l32[:_col32 - 1] + " " + _l32[_col32 - 1:]
+        _nc32 = "\n".join(_ls32)
+        _cur31["code"] = _nc32
+        _ui32 = _UI31()
+        _cp32 = E.Completer(_B31(_nc32, (_ln32, _col32 + 1)), _ui32)
+        _cp32.trigger(True)
+        check("32.7 对照：没有这道门时会提示形参自身（本节没白测）",
+              [_ui32.shown, sorted(_cp32.matches or [])],
+              expect_contain=[True, ["username"]])
+
+        # B) 回归：删字 / 打字母两条老路径必须原样保留，不能被一刀切
+        _p32b = _poll32([
+            "Public Function Foo() As Long",
+            "    Dim gUserName As String",
+            "    Debug.Print |gUserName",
+            "End Function"], _del32)
+        check("32.8 词首按 Delete 删字 -> 仍照旧提示（v44 路径不变）",
+              [_p32b[0], _p32b[1]],
+              expect_contain=[True, ["gUserName"]])
+
+        _p32c = _poll32([
+            "Public Function Foo() As Long",
+            "    Dim gUserName As String",
+            "    Debug.Print |",
+            "End Function"], _tail32("g"))
+        check("32.9 插入字母 -> 照常弹出候选（没被误伤）",
+              [_p32c[0], "gUserName" in _p32c[1]],
+              expect_contain=[True, True])
+
+        _p32d = _poll32([
+            "Public Function Foo() As Long",
+            "    Dim gUserName As String",
+            "    Debug.Print gUserName|",
+            "End Function"], _ins32(" "))
+        _p32e = _poll32([
+            "Public Function Foo() As Long",
+            "    Dim gUserName As String",
+            "    Debug.Print gUserName |",
+            "End Function"], _ins32("g"))
+        check("32.10 打空格收起后接着打字母 -> 能重新弹出（流程不卡死）",
+              [_p32d[0], _p32e[0], "gUserName" in _p32e[1]],
+              expect_contain=[False, True, True])
+    except Exception as _e32:
+        check("第 32 节异常: %s" % _e32, [True], expect_contain=[False])
+
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))
     if FAILURES:

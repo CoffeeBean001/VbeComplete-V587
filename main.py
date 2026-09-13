@@ -715,9 +715,19 @@ def main():
                         if (time.time() - getattr(backend, "_cache_time", 0.0)
                                 > ID_REFRESH_MIN_SEC):
                             backend.invalidate_identifiers()
-                        # True: 校验光标前是否标识符字符（打空格/标点则收起）
-                        _log("poll: line %s changed -> trigger" % (snap[0],))
-                        post_trigger()
+                        # v52：这一下敲的是空格/标点（行【变长】且插进来的
+                        # 这段不含标识符字符）-> 直接收起，别去 trigger。
+                        # 否则当它敲在某个标识符【前面】时，右边那个标识符会被
+                        # 当成"正在输入的词"拿来补全 —— 形参首字符前打空格把
+                        # 形参自己提示出来，正是这么来的（详见 engine 里
+                        # typed_separator 的说明）。删字的路径是"变短"，不受影响。
+                        if engine.typed_separator(last[1], snap[1]):
+                            _log("poll: 敲了空格/标点 -> 收起")
+                            post(completer.hide)
+                        else:
+                            # True: 校验光标前是否标识符字符（不在拼标识符则收起）
+                            _log("poll: line %s changed -> trigger" % (snap[0],))
+                            post_trigger()
         except Exception:
             pass
         # 已离开 VBE（超过宽限期）、或 COM 正处于失败退避（宿主多半在关闭）

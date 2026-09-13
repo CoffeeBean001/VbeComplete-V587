@@ -134,6 +134,58 @@ def _ident_char_before_caret(ctx):
     return False
 
 
+def line_edit_inserted(old_line, new_line):
+    """对比同一行的前后两版文本，返回本次【纯插入】的内容。
+
+    只认一种形态：新文本 = 旧文本在某个位置塞进一段新字符、其余原样（手工
+    输入正是这种）。删除、替换、多处改动一律返回 None —— 返回 None 不代表
+    没变化，只是"这一步改动无法用单一插入来解释"。
+
+    刻意只看文本、不看光标位置：后端快照为了廉价，只给 (行号, 行文本)，
+    没有列号。靠最长公共前缀 + 最长公共后缀定位改动段同样能得出结论，
+    且不引入额外的 COM 开销。
+    """
+    if old_line is None or new_line is None:
+        return None
+    if len(new_line) <= len(old_line):
+        return None                      # 没变长 -> 是删除或替换
+    n = len(old_line)
+    p = 0                                # 最长公共前缀
+    while p < n and old_line[p] == new_line[p]:
+        p += 1
+    s = 0                                # 最长公共后缀（不许越过前缀，避免重叠）
+    limit = n - p
+    while s < limit and old_line[n - 1 - s] == new_line[len(new_line) - 1 - s]:
+        s += 1
+    if p + s != n:
+        return None                      # 中段还有别的差异 -> 不是纯插入
+    return new_line[p:len(new_line) - s]
+
+
+def typed_separator(old_line, new_line):
+    """这次编辑是不是"往行里敲了一段不含标识符字符的内容"（空格 / 标点）。
+
+    v52 要治的现象：把光标停在某个标识符【最前面】（形参首字符前就是这种），
+    敲一下空格 -> 弹窗把右边那个标识符原样提示出来（形参提示形参自己）。
+
+    链路是这样的：`extract_word_at` 有一条兜底——光标左边没有词、但右边紧挨
+    着标识符时取右边的词（v44 为"光标停在词首、按 Delete 从头删字"引入的），
+    而 trigger 的入场检查 `_ident_char_before_caret` 也据此放宽到"光标前【或】
+    后一个字符是标识符即可"。于是做完这次编辑后的那一帧快照，
+    "左边是分隔符、右边是标识符"——**与"从词首删字"长得一模一样**，
+    单看快照永远区分不开。
+
+    唯一的差别在【怎么变的】：
+      * 从词首删字 -> 行【变短】（是删除）；
+      * 敲空格/标点  -> 行【变长】，且插进来的这一段不含标识符字符。
+    这里就是靠这个差别把它拦下来的。删字的路径完全不受影响。
+    """
+    ins = line_edit_inserted(old_line, new_line)
+    if not ins:
+        return False
+    return not any(ch.isalnum() or ch == "_" for ch in ins)
+
+
 def replace_word(line_text, word_start_col, caret_col, completion):
     """把 [word_start_col, caret_col) 区间的单词替换为 completion，返回新行文本。"""
     s = word_start_col - 1
