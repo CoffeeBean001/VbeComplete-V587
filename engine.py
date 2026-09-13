@@ -604,6 +604,23 @@ class Completer:
             return False
         return low in declared
 
+    def _module_level_names(self):
+        """标识符池里在【模块级】存在的名字（小写集合）。
+
+        v53 用：判断"光标处的这个词是不是全模块可见的真名字"。判据是标识符池里
+        有一条该名字的记录、且其过程名为空（模块声明区的 Dim/Const/Sub/Function…
+        或组件名）。过程内的局部变量、形参（proc 非空）都不算。
+
+        为什么不问后端要一个专门接口：`get_identifiers()` 是【带缓存】的，
+        同一次 trigger 早已取过（作用域过滤用的就是它），这里只是换个角度筛一遍，
+        一次 COM 都不会多打。
+        """
+        try:
+            recs = _normalize_scoped(self.backend.get_identifiers())
+        except Exception:
+            return set()
+        return set(str(n).lower() for n, _m, p, _pv in recs if not p)
+
     def _declared_names(self):
         """工程里【真实声明】过的名字（小写集合），供 trigger 区分"真名字"与"幻影"。
 
@@ -746,6 +763,28 @@ class Completer:
             # 由后端解析当前声明行得到（ctx["decl_names"]）。
             decl_at_caret = set(str(n).lower()
                                 for n in (ctx.get("decl_names") or ()))
+            # 【v53】正在【起新名字】的位置不提示自己。
+            #
+            # 用户报的现象：形参位置上按退格 / 敲空格 / 把别的过程的变量名粘贴
+            # 过来，弹窗都会把光标处这个名字原样提示出来（提示自己）。v51 把现场
+            # 证据按作用域收窄、v52 拦住了"敲空格"那一路，但这两条判的都是
+            # 【这次编辑是怎么变的】——粘贴一个完整名字与手动敲出最后一个字符，
+            # 前后两帧快照逐字符等价，永远区分不开。堵不住的那部分只能从【语义】
+            # 上堵：光标处这个词如果就是本行正在声明的名字（形参 / 局部 Dim /
+            # 局部 Const），用户此刻是在【造名字】而不是【引用名字】，把它原样
+            # 提示回去没有任何意义，还会盖住他刚敲的字。
+            #
+            # 只剔除【与光标处词完全相同】的候选：输入 num 仍要照常提示 numArr
+            # （v37 的教训——按"本行声明的名字"整体剔除会把前缀补全一起误杀）。
+            #
+            # 模块级真名字除外（v37 语义：`Sub test` 那一行把 test 打全，工程里
+            # 真有 Function test() 时照常提示；v51 的 updateValue 同理）：它们在
+            # 模块级真的存在，提示出来是"重用已有名字"而不是"提示自己"。过程内
+            # 的局部变量 / 形参则一律剔除——那正是"别的过程的变量名泄露到本位置"
+            # 的来源（用户报的就是这种）。
+            if low_word in decl_at_caret:
+                if low_word not in self._module_level_names():
+                    matches = [m for m in matches if m.lower() != low_word]
             # 若"正在输入的词"本身就是这里正在声明的名字，且声明发生在【过程内】，
             # 那它此刻的作用域是过程局部的 —— 现场证据也必须限定在同一个窗口里
             # 取（模块级 + 本过程），别的过程里的出现不算数。

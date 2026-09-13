@@ -1132,9 +1132,22 @@ class VbeBackend:
             # 当前声明行正在声明的名字集合（小写）。供引擎在 in_decl_position
             # 时精确剔除"正在输入的那个词本身"（打全名才隐藏，前缀照常提示），
             # 从而修好"输入 num 只提醒 num、不提醒 numArr"的前缀补全误杀。
-            # 只在声明行上算，平时为空、零额外开销。
+            # 只在声明行（含 v53 的续行）上算，平时为空、开销极小。
             decl_names = []
-            if in_decl:
+            # v53：声明【续行】也算声明行。形参常常独占一行（长签名被拆成
+            # `Sub Foo( _` + 缩进的形参行），续行本身没有 Sub/Dim 关键字，
+            # is_caret_in_declaration() 看不出来；但用户在那里打 / 退格 /
+            # 粘贴形参名，与在首行上是同一件事——不把这条逻辑行的声明名算出来，
+            # 引擎就没法拦住"形参提示形参自己"（用户报的正是续行上的退格）。
+            # 判定很便宜：只额外读上一行，看它是否以续行符 `_` 结尾。
+            cont_decl = False
+            if not in_decl and sl > 1:
+                try:
+                    cont_decl = vba_parser.is_continuation_line(
+                        cm.Lines(sl - 1, 1))
+                except Exception:
+                    cont_decl = False
+            if in_decl or cont_decl:
                 try:
                     full = cm.Lines(1, cm.CountOfLines)
                     dn = vba_parser.decl_names_at_caret(full, (sl, ec_char))

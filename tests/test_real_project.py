@@ -2792,9 +2792,19 @@ def main():
             "Public Sub ProcedureB(ByVal username| As String)",
             "End Sub",
         ]
-        # 31.1 旧行为确实会"提示自己"——证明这条回归确实有意义
-        check("31.1 对照：旧行为下形参重名会提示自己",
-              [_trig31(_leak31, force_broad=True)],
+        # 31.1 旧行为确实会"提示自己"——证明这条回归确实有意义。
+        # v53 起引擎又多了一道"正在造名字的位置不提示自己"的语义护栏，它与
+        # 宽/窄窗口完全独立；对照必须【连它一起短路】，否则根本复现不出旧行为，
+        # 这条控制组就变成了恒真的空测。
+        _orig_ml31 = E.Completer._module_level_names
+        E.Completer._module_level_names = lambda _self: set(
+            str(_r[0]).lower() for _r in _self.backend.get_identifiers())
+        try:
+            _ctl31 = _trig31(_leak31, force_broad=True)
+        finally:
+            E.Completer._module_level_names = _orig_ml31
+        check("31.1 对照：宽窗口 + 关掉 v53 护栏时形参重名会提示自己",
+              [_ctl31],
               expect_contain=[(True, ["username"])])
         # 31.2 修复后：不再提示自己
         check("31.2 形参名与其他过程的变量重名 -> 不提示自己",
@@ -2967,9 +2977,17 @@ def main():
         _nc32 = "\n".join(_ls32)
         _cur31["code"] = _nc32
         _ui32 = _UI31()
-        _cp32 = E.Completer(_B31(_nc32, (_ln32, _col32 + 1)), _ui32)
-        _cp32.trigger(True)
-        check("32.7 对照：没有这道门时会提示形参自身（本节没白测）",
+        # 同理（见 31.1）：v53 的语义护栏也会挡住这一例，对照要把它一并关掉，
+        # 才能真正测出"没有 v52 这道门时会提示自己"。
+        _orig_ml32 = E.Completer._module_level_names
+        E.Completer._module_level_names = lambda _self: set(
+            str(_r[0]).lower() for _r in _self.backend.get_identifiers())
+        try:
+            _cp32 = E.Completer(_B31(_nc32, (_ln32, _col32 + 1)), _ui32)
+            _cp32.trigger(True)
+        finally:
+            E.Completer._module_level_names = _orig_ml32
+        check("32.7 对照：两道门都关掉时会提示形参自身（本节没白测）",
               [_ui32.shown, sorted(_cp32.matches or [])],
               expect_contain=[True, ["username"]])
 
@@ -3007,6 +3025,209 @@ def main():
               expect_contain=[False, True, True])
     except Exception as _e32:
         check("第 32 节异常: %s" % _e32, [True], expect_contain=[False])
+
+    # ---- 33. v53：形参位置上按退格 / 粘贴，不许提示形参自己 ----
+    #
+    # 用户报的现象：光标停在形参首字符前按【退格】，或把别的过程的变量名【粘贴】
+    # 到形参里，弹窗都会把这个形参原样提示出来（v52 只堵住了"敲空格"那一路）。
+    #
+    # 根因：v51（现场证据按作用域收窄）与 v52（typed_separator）判的都是
+    # 【这一次编辑是怎么变的】。而"粘贴一个完整名字"与"手动敲出最后一个字符"
+    # 前后两帧快照逐字符等价 —— 从编辑动作上永远区分不开。何况真实代码里形参总
+    # 会在本过程体内被用到（Debug.Print username），窄窗口里它就是"真实存在"的，
+    # 回声防护照样放行。
+    #
+    # 修法（语义级、与按键无关）：光标处的词若正是【本行正在声明的名字】
+    # （形参 / 局部 Dim），且它在模块级并不存在（过程内的局部变量不是全模块可见
+    # 的真名字），就把与它完全同名的候选剔除。
+    #   * 前缀照常提示（v37 教训：按"本行声明的名字"整体剔除会误杀 num -> numArr）；
+    #   * 模块级真名字照常提示（31.5 的 updateValue / 31.7 的模块级声明行）。
+    # 另外：形参常常独占一行（长签名被拆成 `Sub Foo( _` + 缩进的形参行），
+    # 续行上没有声明关键字，后端据此把【声明续行】也算作声明行（v53 配套改动），
+    # 否则续行上的退格依然会提示自己。
+    print("\n=== 33. 形参位置不提示自己：退格 / 粘贴（v53）===")
+    try:
+        import vbe_bridge as VB33
+
+        # A) 判据：续行识别 + 逻辑行合并出形参名
+        check("33.1 以 `_` 结尾的行 -> 认定为续行",
+              [P.is_continuation_line("Public Sub B( _"),
+               P.is_continuation_line("    B( _  "),
+               P.is_continuation_line("    Debug.Print a_b")],
+              expect_contain=[True, True, False])
+
+        _sig33 = "\n".join(_HDR31 + [
+            "Public Sub ProcedureB( _",
+            "    username As String, _",
+            "    ByVal other As Long)",
+            "    Debug.Print username",
+            "End Sub"])
+        check("33.2 续行上的 decl_names 含全部形参（合并逻辑行）",
+              [sorted(P.decl_names_at_caret(_sig33, (8, 5)) or [])],
+              expect_contain=[["other", "procedureb", "username"]])
+
+        # B) 真机 VbeBackend.get_context()：续行也必须算出 decl_names
+        #    （只在真机后端上，才会暴露"只在 in_decl 时才去算"这个漏洞）
+        class _CM33(object):
+            def __init__(self, code):
+                self._code = code
+
+            @property
+            def CountOfLines(self):
+                return len(self._code.split("\n"))
+
+            def Lines(self, start, count):
+                _ls = self._code.split("\n")
+                return "\n".join(_ls[start - 1:start - 1 + count])
+
+            @property
+            def Name(self):
+                return "Module1"
+
+        class _CP33(object):
+            def __init__(self, cm, sel):
+                self.CodeModule = cm
+                self._sel = sel
+
+            def GetSelection(self):
+                return self._sel
+
+        class _VBE33(object):
+            def __init__(self, code, sel):
+                self.ActiveCodePane = _CP33(_CM33(code), sel)
+
+        _cur33 = {"code": _sig33, "sel": (8, 5, 8, 5)}
+        _orig_get33 = VB33._get_vbe_cached
+        VB33._get_vbe_cached = lambda *a, **k: _VBE33(_cur33["code"],
+                                                     _cur33["sel"])
+        _be33 = VB33.VbeBackend()
+        _ctx33 = _be33.get_context()
+        _cur33["sel"] = (10, 24, 10, 24)
+        _ctx33b = _be33.get_context()
+        VB33._get_vbe_cached = _orig_get33
+        check("33.3 真机 get_context：续行上有 decl_names（否则引擎拦不住）",
+              [_ctx33.get("decl_names"), _ctx33.get("proc_name")],
+              expect_contain=[["other", "procedureb", "username"], "ProcedureB"])
+        check("33.4 真机 get_context：用法行 decl_names 仍为空（不误伤）",
+              [_ctx33b.get("decl_names")],
+              expect_contain=[[]])
+
+        # C) 端到端：完全照 main.poll_editor 的分支跑
+        #    （复用 31 节那套脚手架：真实解析 + 真实 names_outside_caret）
+        VB31._get_vbe_cached = lambda *a, **k: _VBE31(_cur31["code"])
+
+        _CODE33 = [
+            "Public Sub ProcedureA()",
+            "    Dim username As String",
+            '    username = "abc"',
+            "    Debug.Print username",
+            "End Sub",
+            "",
+        ]
+
+        def _poll33(body, edit):
+            _code, _caret = _parse31(_HDR31 + body)
+            _ln, _col = _caret
+            _ls = _code.split("\n")
+            _old = _ls[_ln - 1]
+            _new, _ncol = edit(_old, _col)
+            if E.typed_separator(_old, _new):      # v52 那道门照旧生效
+                return (False, [], _new)
+            _ls[_ln - 1] = _new
+            _nc = "\n".join(_ls)
+            _cur31["code"] = _nc
+            _ui = _UI31()
+            _c = E.Completer(_B31(_nc, (_ln, _ncol)), _ui)
+            _c.trigger(True)
+            return (_ui.shown, sorted(_c.matches or []), _new)
+
+        def _paste33(txt):
+            def f(line, col):
+                return line[:col - 1] + txt + line[col - 1:], col + len(txt)
+            return f
+
+        def _back33(line, col):
+            if col <= 1:
+                return line, col
+            return line[:col - 2] + line[col - 1:], col - 1
+
+        _p = _poll33(_CODE33 + ["Public Sub ProcedureB(ByVal | )",
+                                "    Debug.Print username",
+                                "End Sub"], _paste33("username"))
+        check("33.5 粘贴别的过程的变量名到形参 -> 不提示自己",
+              [_p[0], _p[1]], expect_contain=[False, []])
+
+        _p = _poll33(_CODE33 + ["Public Sub ProcedureB( _",
+                                "    |username As String)",
+                                "    Debug.Print username",
+                                "End Sub"], _back33)
+        check("33.6 续行形参首字符前按退格 -> 不提示自己",
+              [_p[0], _p[1]], expect_contain=[False, []])
+
+        _p = _poll33(_CODE33 + [
+            "Public Sub ProcedureB(ByVal a As Long,|username As String)",
+            "    Debug.Print username",
+            "End Sub"], _back33)
+        check("33.7 同行形参首字符前按退格 -> 不提示自己",
+              [_p[0], _p[1]], expect_contain=[False, []])
+
+        _p = _poll33(_CODE33 + ["Public Sub ProcedureB()",
+                                "    Dim |",
+                                "    Debug.Print username",
+                                "End Sub"], _paste33("username"))
+        check("33.8 粘贴到局部 Dim 位置 -> 不提示自己",
+              [_p[0], _p[1]], expect_contain=[False, []])
+
+        _p = _poll33(_CODE33 + ["Public Sub ProcedureB(ByVal | )",
+                                "    Debug.Print username",
+                                "End Sub"], _paste33("username"))
+        _orig_ml33 = E.Completer._module_level_names
+        E.Completer._module_level_names = lambda _self: set(
+            str(_r[0]).lower() for _r in _self.backend.get_identifiers())
+        try:
+            _p_off = _poll33(_CODE33 + ["Public Sub ProcedureB(ByVal | )",
+                                        "    Debug.Print username",
+                                        "End Sub"], _paste33("username"))
+        finally:
+            E.Completer._module_level_names = _orig_ml33
+        check("33.9 对照：关掉 v53 护栏时会提示形参自身（本节没白测）",
+              [_p_off[0], "username" in _p_off[1]],
+              expect_contain=[True, True])
+
+        # D) 防误杀：模块级真名字 / 前缀补全 / 用法位置都不许被砍
+        _p = _poll33(["Public Sub updateValue()",
+                      "End Sub",
+                      "",
+                      "Public Sub ProcedureB(ByVal updateValue| As String)",
+                      "End Sub"], _back33)
+        check("33.10 形参同名于模块级过程名 -> 照常提示（v37 / 31.5）",
+              [_p[0], "updateValue" in _p[1]], expect_contain=[True, True])
+
+        _p = _poll33(["Public Function test() As Long",
+                      "    test = 1",
+                      "End Function",
+                      "",
+                      "Public Sub |()",
+                      "End Sub"], _paste33("test"))
+        check("33.11 Sub 行写全 test，工程里有 Function test() -> 照常提示",
+              [_p[0], "test" in [x.lower() for x in _p[1]]],
+              expect_contain=[True, True])
+
+        _p = _poll33(["Public Sub ProcedureB()",
+                      "    Dim numArr As Long",
+                      "    Dim | As Long",
+                      "End Sub"], _paste33("num"))
+        check("33.12 局部声明行输入前缀 num -> 仍提示 numArr（不许误杀前缀）",
+              [_p[0], "numArr" in _p[1]], expect_contain=[True, True])
+
+        _p = _poll33(["Public Sub ProcedureA()",
+                      "    Dim username As String",
+                      "    Debug.Print userna|",
+                      "End Sub"], _paste33("m"))
+        check("33.13 同过程内用法位置打前缀 -> 照常提示（31.6 语义不变）",
+              [_p[0], "username" in _p[1]], expect_contain=[True, True])
+    except Exception as _e33:
+        check("第 33 节异常: %s" % _e33, [True], expect_contain=[False])
 
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))

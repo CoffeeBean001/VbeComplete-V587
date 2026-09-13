@@ -485,6 +485,20 @@ def _logical_line_at(lines, idx):
                     for i in range(start, end + 1))
 
 
+def is_continuation_line(line_text):
+    """这一行是否以行继续符 `_` 结尾（因此【下一行】是它的续行）。
+
+    v53：形参常常独占一行（长签名被 VBE 拆成 `Sub Foo( _` + 缩进的形参行）。
+    续行本身没有 Sub/Dim 之类的声明关键字，is_caret_in_declaration() 看不出来，
+    但用户在那里打 / 退格 / 粘贴形参名与在首行上完全是一回事。后端据此把续行
+    也算作"声明行"，把该逻辑行正在声明的名字（含形参）交给引擎。
+
+    只看一行文本，不做任何跨行读取——调用方（vbe_bridge.get_context）只需
+    额外读一行就能判定。
+    """
+    return bool(_RE_CONT_AT_END.search((line_text or "").rstrip("\r")))
+
+
 def _inside_type_block(lines, idx):
     """第 idx 行（0-based）是否位于 Type / Enum 块内部（用于识别成员行）。"""
     depth = 0
