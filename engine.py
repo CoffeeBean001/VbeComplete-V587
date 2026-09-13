@@ -23,10 +23,22 @@ backend 需实现：
       那个残留标识符，后者要盖住同一个名字的后半截。取词见 extract_word_at。
 """
 
+import os
 import re
 import time
 
 from log import log as _log
+
+# VBE 自带提示列表的让位开关（v55）。
+#
+# 光标停在 VBE 自己会弹「自动列出成员」的位置时我们让位（详见
+# vbe_list_expected）。若某台机器上 VBE 的自动列出成员是关掉的、或你想
+# 永远用我们的列表，设 VBECOMPLETE_NO_YIELD=1 关掉这套让位。
+try:
+    YIELD_TO_VBE_LIST = (
+        os.environ.get("VBECOMPLETE_NO_YIELD", "0").strip() != "1")
+except Exception:
+    YIELD_TO_VBE_LIST = True
 
 # 标识符（含中文）：首字符为字母/下划线，其后可跟字母/数字/下划线。
 # [^\W\d] = 非“非单词字符”且非数字 = 字母或下划线（Unicode 感知，含中文）。
@@ -184,6 +196,85 @@ def typed_separator(old_line, new_line):
     if not ins:
         return False
     return not any(ch.isalnum() or ch == "_" for ch in ins)
+
+
+# ---------------------------------------------------------------------------
+# v55：VBE 自己会弹「自动列出成员」的位置 —— 我们让位
+# ---------------------------------------------------------------------------
+#
+# VBE 的提示列表【没有独立窗口】：现场实测（发 Ctrl+J 后全系统扫描）一个
+# 新窗口都没出现，代码窗格底下连个编辑控件子窗口都没有 —— 那个列表是 VBE
+# 自己画在代码窗格上的。所以窗口探测（找类名 / 找属主弹窗 / 探光标下方窗口）
+# 既探不到真列表，又会把别的程序的无标题栏浮窗误当成它（v54 就这么把工具
+# 搞成"不管输入什么都不弹"）。
+#
+# 改成看【光标所在处的语法位置】。VBE 会自己弹列表的位置里，最确定、也最常
+# 跟我们撞车的就是成员访问：光标停在 `标识符.` 之后、正在输入成员名 ——
+# `UserForm1.` / `Me.` / `Sheet1.Range(...).` 全是这种。
+#
+# 只认这一种，宁可少拦也别再弄成"一直不弹"：让位只在那个位置成立，成员名
+# 一打完（空格、等号、换行）立刻恢复。
+
+# 点号左边允许出现的"能取成员的东西"末尾字符
+_MEMBER_OWNER_TAIL = "_)]}"
+
+
+def _in_comment_or_string(line_text, col):
+    """光标（1-based 列）左边是否落在字符串 / 注释里（极简扫描）。
+
+    VBE 在注释和字符串里不会弹列表，那种位置我们照旧弹自己的。
+    """
+    if not line_text or not col or col < 1:
+        return False
+    in_str = False
+    n = min(col - 1, len(line_text))
+    for i in range(n):
+        c = line_text[i]
+        if in_str:
+            if c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+        elif c == "'":
+            return True                  # 注释一直延续到行尾
+    return in_str
+
+
+def vbe_list_expected(line_text, caret_col):
+    """光标是否正停在 VBE 会自己弹「自动列出成员」列表的位置（是则我们让位）。
+
+    判据：光标左边形如 `xxx.` + 正在输入的成员名（成员名可以还没开始打）。
+    纯文本判定，不碰窗口、不碰 COM，可单测。
+    """
+    if not line_text or not caret_col or caret_col < 1:
+        return False
+    i = min(caret_col - 1, len(line_text))
+    # 1) 跳过光标左边正在输入的成员名
+    j = i - 1
+    while j >= 0 and (line_text[j].isalnum() or line_text[j] == "_"):
+        j -= 1
+    # 2) 成员名左边应当是点号（`X .` 这种带空格的写法也认）
+    k = j
+    while k >= 0 and line_text[k] in " \t":
+        k -= 1
+    if k < 0 or line_text[k] != ".":
+        return False
+    # 3) 点号左边得是能取成员的东西：标识符 / ) / ] / }
+    m = k - 1
+    while m >= 0 and line_text[m] in " \t":
+        m -= 1
+    if m < 0:
+        return False
+    if not (line_text[m].isalnum() or line_text[m] in _MEMBER_OWNER_TAIL):
+        return False
+    # 4) `1.5` 这种小数点：点号左边整段是纯数字，VBE 不弹列表
+    s = m
+    while s >= 0 and (line_text[s].isalnum() or line_text[s] == "_"):
+        s -= 1
+    if line_text[s + 1:m + 1].isdigit():
+        return False
+    # 5) 注释 / 字符串里 VBE 不弹，我们照旧弹
+    return not _in_comment_or_string(line_text, k + 1)
 
 
 def replace_word(line_text, word_start_col, caret_col, completion):
@@ -676,6 +767,15 @@ class Completer:
         # 变量与过程名依旧静默（v22 的初衷：填类型名时冒出一堆变量名是噪音）。
         in_type = bool(ctx.get("in_type_position"))
         type_names = self._type_name_set() if in_type else None
+        # v55：光标停在 `标识符.` 之后输入成员名时，VBE 自己会弹「自动列出成员」
+        # 列表 -> 我们让位，不跟它抢同一块地方（两个列表会互相遮挡、还抢键盘）。
+        # 只拦【轮询自动触发】：手动 Ctrl+Space 是用户点名要我们的列表，照旧弹。
+        if require_ident_before_caret and YIELD_TO_VBE_LIST \
+                and vbe_list_expected(ctx.get("line_text"),
+                                      ctx.get("caret_col")):
+            _log("trigger: VBE 自带列表位置 -> 让位")
+            self.hide()
+            return
         if require_ident_before_caret and not _ident_char_before_caret(ctx):
             self.hide()
             return

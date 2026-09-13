@@ -26,6 +26,11 @@ VbeComplete 主入口（修复版）
   - Ctrl+Space  手动触发。
   注（v49）：数字键 1~9 不再用于选词，候选也不再显示序号 —— 弹窗开着时
   照常输入数字，定义 `s1` / `arr17` 这类名字不会被列表抢走。
+
+  v55：VBE 自己弹「自动列出成员」时我们让位（写 `UserForm1.` 后输入成员名、
+  或按 Ctrl+J），只让位那一会儿，成员名一打完就恢复。VBE 那个列表是画在代码
+  窗格上的、没有独立窗口，所以判据走光标的语法位置（见 engine.vbe_list_expected）。
+  想彻底关掉让位：设环境变量 VBECOMPLETE_NO_YIELD=1。
 """
 
 import sys
@@ -49,7 +54,7 @@ except ImportError:
 import engine
 import vbe_bridge
 from vbe_bridge import VbeBackend, com_backoff_remaining
-from ui import Popup, MAX_VISIBLE_ROWS, caret_screen_rect
+from ui import Popup, MAX_VISIBLE_ROWS
 from log import log as _log, log_boot as _log_boot
 
 
@@ -279,28 +284,16 @@ def _reconcile_resources(focused, released, backoff, last_focus_time, now, grace
     return mount_hooks, release_com
 
 
-def _vbe_list_up():
-    """VBE 自己是不是正在显示「自动列出成员」列表（是则我们让位）。
-
-    拿不准 / 出任何异常一律返回 False —— 宁可两个列表同时出现，也不能让
-    工具整个哑掉。判据见 vbe_bridge.vbe_list_visible。
-    """
-    try:
-        return vbe_bridge.vbe_list_visible(caret_screen_rect())
-    except Exception:
-        return False
-
-
-def _poll_action(typed_sep, vbe_list_up):
+def _poll_action(typed_sep):
     """纯函数：本轮轮询该做什么 —— 'hide' 还是 'trigger'。
 
-    - typed_sep  ：这一下敲的是空格 / 标点（v52，别拿右边的词来补全）；
-    - vbe_list_up：VBE 自己的提示列表已经弹出来了（v54）。
+    typed_sep：这一下敲的是空格 / 标点（v52，别拿右边的词来补全）。
 
-    后者与前者同等对待：直接收起、不去 trigger。两个列表同时出现会互相
-    遮挡、还抢键盘，VBE 已经给了就让它给。
+    v55 注：「VBE 自己也在弹列表」的让位不在这里判 —— VBE 那个列表画在代码
+    窗格上、没有独立窗口，探不到；改为在引擎里按光标的语法位置判（光标停在
+    `标识符.` 之后时 VBE 必然弹成员列表），见 engine.vbe_list_expected。
     """
-    if typed_sep or vbe_list_up:
+    if typed_sep:
         return "hide"
     return "trigger"
 
@@ -482,6 +475,23 @@ def main():
                 lst.suppress_event()   # 抛异常 -> 由 pynput 转成 hook 返回 1
         return True
 
+    def _is_vk_char(key, ch):
+        """按键是否是某个字母（Ctrl+J 这类组合键用）。
+
+        Ctrl 按住时 pynput 有时给不出 char（ToUnicode 会折算成控制字符），
+        所以 vk 与 char 两条路都认。
+        """
+        try:
+            if getattr(key, "vk", None) == ord(ch.upper()):
+                return True
+        except Exception:
+            pass
+        try:
+            c = getattr(key, "char", None)
+            return bool(c) and c.lower() == ch.lower()
+        except Exception:
+            return False
+
     def _is_ident_char(key):
         """是否是标识符字符（字母/数字/下划线）。空格、标点、功能键都不算。"""
         try:
@@ -500,9 +510,16 @@ def main():
             elif key in _MOD_KEYS:
                 pass
             elif key == Key.space and state["ctrl"] and not state["alt"]:
-                # v54：Ctrl+Space 也是 VBE 唤列表的键，它已经弹了就别再弹
-                if in_vbe_code_pane() and not _vbe_list_up():
+                # 手动触发：用户点名要我们的列表。即便光标停在 VBE 也会弹列表
+                # 的位置（`标识符.` 之后）也照弹 —— 引擎只对【轮询自动触发】
+                # 让位，手动唤出永远有效。
+                if in_vbe_code_pane():
                     post(completer.trigger)
+            elif state["ctrl"] and not state["alt"] and _is_vk_char(key, "j"):
+                # Ctrl+J / Ctrl+Shift+J = VBE 唤出它自己的「列出属性/方法」。
+                # 这是唯一能确定"VBE 列表马上要出现"的时刻（文本没变，轮询看
+                # 不出来），这里直接收起我们的，让它弹。
+                post(completer.hide)
             elif completer.is_visible() and not _is_ident_char(key) \
                     and key not in _VK_HANDLED_WHEN_VISIBLE:
                 # 弹窗开着时按了非标识符、非导航键（空格/标点/退格/换行等）
@@ -728,13 +745,6 @@ def main():
         try:
             snap = backend.snapshot() if _com_allowed() else None
             if snap is not None:
-                # v54：VBE 自己也在弹列表 -> 让位（两个列表同时出现会
-                # 互相遮挡、抢键盘）。文本变没变都要查：按 Ctrl+J 手动
-                # 唤出 VBE 列表时文本是不变的，只有这里能拦住。
-                vbe_up = _vbe_list_up()
-                if vbe_up and completer.is_visible():
-                    _log("poll: VBE 自带列表已出现 -> 收起")
-                    post(completer.hide)
                 last = state.get("last_snap")
                 if last is None:
                     state["last_snap"] = snap      # 首次只记录，不触发
@@ -757,11 +767,9 @@ def main():
                         # 形参自己提示出来，正是这么来的（详见 engine 里
                         # typed_separator 的说明）。删字的路径是"变短"，不受影响。
                         if _poll_action(
-                                engine.typed_separator(last[1], snap[1]),
-                                vbe_up) == "hide":
-                            _log("poll: %s -> 收起"
-                                 % ("VBE 自带列表已出现" if vbe_up
-                                    else "敲了空格/标点"))
+                                engine.typed_separator(last[1],
+                                                       snap[1])) == "hide":
+                            _log("poll: 敲了空格/标点 -> 收起")
                             post(completer.hide)
                         else:
                             # True: 校验光标前是否标识符字符（不在拼标识符则收起）

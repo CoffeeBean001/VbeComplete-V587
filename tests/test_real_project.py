@@ -3231,101 +3231,118 @@ def main():
 
 
     # ==================================================================
-    # 34. VBE 自带提示列表出现时让位（v54）
+    # 34. VBE 自带提示列表出现时让位（v55）
     # ==================================================================
-    # VBE 的「自动列出成员」下拉列表跟我们的弹窗会出现在同一处（光标下方），
-    # 两个列表同时出现会互相遮挡、还抢键盘。所以 VBE 一旦自己弹了，我们就
-    # 不弹。这里测两件事：决策函数、以及三条探测判据的接通与兜底。
-    print("\n=== 34. VBE 自带列表出现时让位（v54）===")
+    # VBE 的「自动列出成员」跟我们的弹窗会出现在同一处（光标下方），两个列表
+    # 同时出现会互相遮挡、还抢键盘，所以光标停在会让 VBE 弹列表的位置时我们
+    # 让位。判据走【光标的语法位置】而不是窗口探测——真机实测：给 VBE 发
+    # Ctrl+J 后全系统扫描，一个新窗口都没出现，那个列表是画在代码窗格上的。
+    print("\n=== 34. VBE 自带列表出现时让位（v55）===")
     try:
-        import vbe_bridge as VB54
-
-        # --- 决策：谁该让位（纯函数，与 Win32 无关）---
+        # --- 决策：本轮轮询该 hide 还是 trigger（纯函数）---
         if M is not None:
-            check("34.1 没敲分隔符、VBE 没弹 -> trigger",
-                  [M._poll_action(False, False)],
-                  expect_contain=["trigger"])
+            check("34.1 没敲分隔符 -> trigger",
+                  [M._poll_action(False)], expect_contain=["trigger"])
             check("34.2 敲了空格/标点 -> hide（v52 语义不变）",
-                  [M._poll_action(True, False)],
-                  expect_contain=["hide"])
-            check("34.3 VBE 自带列表已出现 -> hide（本版新增）",
-                  [M._poll_action(False, True)],
-                  expect_contain=["hide"])
+                  [M._poll_action(True)], expect_contain=["hide"])
         else:
             check("34.1 main 不可用", [True], expect_contain=[False])
 
-        # --- 窗口形态：尺寸像不像一个下拉列表 ---
-        check("34.4 300x150 像列表",
-              [VB54._looks_like_list(300, 150)], expect_contain=[True])
-        check("34.5 40x18（细长工具条）不像列表",
-              [VB54._looks_like_list(40, 18)], expect_contain=[False])
-        check("34.6 1900x1000（整屏窗口）不像列表",
-              [VB54._looks_like_list(1900, 1000)], expect_contain=[False])
+        # --- 语义判据：光标是不是停在 VBE 会自己弹列表的位置 ---
+        _yl = E.vbe_list_expected
+        check("34.3 UserForm1. 之后（还没开始输成员名）-> 让位",
+              [_yl("    UserForm1.", 15)], expect_contain=[True])
+        check("34.4 UserForm1.Cap 输入成员名中 -> 让位",
+              [_yl("    UserForm1.Cap", 18)], expect_contain=[True])
+        check("34.5 Me. -> 让位",
+              [_yl("    Me.", 8)], expect_contain=[True])
+        check("34.6 Range(\"A1\"). 之后（点号左边是括号）-> 让位",
+              [_yl('    Range("A1").', 17)], expect_contain=[True])
+        check("34.7 普通变量名（没有点号）-> 不让位",
+              [_yl("    userName = 1", 12)], expect_contain=[False])
+        check("34.8 小数点 1. -> 不让位（VBE 也不弹）",
+              [_yl("    x = 1.", 11)], expect_contain=[False])
+        check("34.9 注释里的点号 -> 不让位",
+              [_yl("    ' UserForm1.", 17)], expect_contain=[False])
+        check("34.10 字符串里的点号 -> 不让位",
+              [_yl('    s = "a."', 12)], expect_contain=[False])
+        check("34.11 行首就是点号 -> 不让位",
+              [_yl(".", 2)], expect_contain=[False])
+        check("34.12 成员名打完（等号后）-> 立刻恢复，不让位",
+              [_yl("    UserForm1.Caption = ", 25)], expect_contain=[False])
+        check("34.13 空行 / 列号缺失 -> 不让位（不炸）",
+              [_yl("", 1), _yl("    x", None), _yl(None, 3)],
+              expect_contain=[False])
 
-        # --- 探测总入口：三条判据各自能接通，且拿不准一律不拦 ---
-        _o_h = VB54._vbe_main_hwnd
-        _o_a = VB54._find_list_by_class
-        _o_b = VB54._find_list_owned
-        _o_c = VB54._list_at_caret
-        _o_y = VB54._YIELD_TO_VBE_LIST
+        # --- 引擎集成：轮询自动触发时让位，手动 Ctrl+Space 照弹 ---
+        class _UI55(object):
+            def __init__(self):
+                self.shown = False
+
+            def show(self, *a, **k):
+                self.shown = True
+
+            def update_selection(self, *a, **k):
+                pass
+
+            def hide(self, *a, **k):
+                self.shown = False
+
+            def contains_point(self, *a, **k):
+                return False
+
+        class _B55(object):
+            def __init__(self, ctx):
+                self.ctx = ctx
+
+            def get_context(self):
+                return self.ctx
+
+            def get_identifiers(self):
+                return [("Caption", None, None, False),
+                        ("userName", None, None, False)]
+
+            def apply_completion(self, *a, **k):
+                return None
+
+        def _ctx55(text, col):
+            return {"line_no": 1, "caret_col": col, "line_text": text,
+                    "in_string": False, "in_comment": False,
+                    "in_type_position": False, "in_decl_position": False,
+                    "proc_name": None, "module_name": "M1"}
+
+        _ui55 = _UI55()
+        _c55 = E.Completer(_B55(_ctx55("    UserForm1.Cap", 18)), _ui55)
+        _c55.trigger(True)          # 轮询自动触发 -> 让位
+        check("34.14 轮询触发 + VBE 列表位置 -> 不弹（让位）",
+              [_ui55.shown], expect_contain=[False])
+
+        _ui55b = _UI55()
+        _c55b = E.Completer(_B55(_ctx55("    UserForm1.Cap", 18)), _ui55b)
+        _c55b.trigger()             # 手动 Ctrl+Space -> 用户点名要我们的
+        check("34.15 手动触发（Ctrl+Space）即使在 VBE 列表位置也照弹",
+              [_ui55b.shown], expect_contain=[True])
+
+        _ui55c = _UI55()
+        _c55c = E.Completer(_B55(_ctx55("    userN", 11)), _ui55c)
+        _c55c.trigger(True)         # 普通位置：完全不受影响
+        check("34.16 普通标识符位置照旧弹出（没被误伤）",
+              [_ui55c.shown], expect_contain=[True])
+
+        # 34.17 逃生门：VBECOMPLETE_NO_YIELD=1 -> 一律不让位
+        _orig_yield = E.YIELD_TO_VBE_LIST
         try:
-            VB54._find_list_by_class = lambda m: 0
-            VB54._find_list_owned = lambda m: 0
-            VB54._list_at_caret = lambda r, m: 0
-
-            VB54._vbe_main_hwnd = lambda: 0
-            check("34.7 VBE 没开 -> 不拦（拿不准就不拦）",
-                  [VB54.vbe_list_visible((10, 20, 34))],
-                  expect_contain=[False])
-
-            VB54._vbe_main_hwnd = lambda: 0x1234
-            check("34.8 三条判据都没命中 -> 正常弹我们的",
-                  [VB54.vbe_list_visible((10, 20, 34))],
-                  expect_contain=[False])
-
-            VB54._find_list_by_class = lambda m: 0xAAAA
-            check("34.9 判据 A（已知类名）命中 -> 让位",
-                  [VB54.vbe_list_visible((10, 20, 34))],
-                  expect_contain=[True])
-
-            VB54._find_list_by_class = lambda m: 0
-            VB54._find_list_owned = lambda m: 0xBBBB
-            check("34.10 判据 B（主窗口 OWNED 的裸弹窗）命中 -> 让位",
-                  [VB54.vbe_list_visible((10, 20, 34))],
-                  expect_contain=[True])
-
-            VB54._find_list_owned = lambda m: 0
-            VB54._list_at_caret = lambda r, m: 0xCCCC
-            check("34.11 判据 C（光标下方被 VBE 弹窗盖住）命中 -> 让位",
-                  [VB54.vbe_list_visible((10, 20, 34))],
-                  expect_contain=[True])
-
-            # 34.12 逃生门：VBECOMPLETE_NO_YIELD=1 时一律不拦，工具照旧工作
-            VB54._YIELD_TO_VBE_LIST = False
-            check("34.12 关掉让位开关 -> 一律不拦（逃生门）",
-                  [VB54.vbe_list_visible((10, 20, 34))],
-                  expect_contain=[False])
-
-            # 34.13 Win32 调用本身炸了也不能把工具搞哑 —— 这是最容易踩的坑：
-            # 探测代码出异常若向外抛，主循环就会整段停摆，补全彻底失效。
-            VB54._YIELD_TO_VBE_LIST = True
-
-            def _boom54(_m):
-                raise RuntimeError("Win32 炸了")
-
-            VB54._find_list_by_class = _boom54
-            VB54._list_at_caret = lambda r, m: 0
-            check("34.13 探测过程抛异常 -> 不拦（绝不因探测失败而哑掉）",
-                  [VB54.vbe_list_visible((10, 20, 34))],
-                  expect_contain=[False])
+            E.YIELD_TO_VBE_LIST = False
+            _ui55d = _UI55()
+            _c55d = E.Completer(_B55(_ctx55("    UserForm1.Cap", 18)), _ui55d)
+            _c55d.trigger(True)
+            check("34.17 关掉让位开关 -> 照旧弹出（逃生门）",
+                  [_ui55d.shown], expect_contain=[True])
         finally:
-            VB54._vbe_main_hwnd = _o_h
-            VB54._find_list_by_class = _o_a
-            VB54._find_list_owned = _o_b
-            VB54._list_at_caret = _o_c
-            VB54._YIELD_TO_VBE_LIST = _o_y
+            E.YIELD_TO_VBE_LIST = _orig_yield
     except Exception as _e34:
         check("第 34 节异常: %s" % _e34, [True], expect_contain=[False])
+
 
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))
