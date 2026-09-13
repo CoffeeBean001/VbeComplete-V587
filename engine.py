@@ -341,6 +341,9 @@ def _name_exists_outside_caret(backend, word, line_no, caret_col):
 
 # 弹窗一屏显示几行。**这是窗口高度，不是候选上限** —— 候选再多也不会被丢弃，
 # 超出的排在窗口外，靠上下键 / 滚轮滚动查看。
+#
+#
+# v49 恢复 15：v47 取 9 只是为了对齐「数字键 1~9 选词」，该功能已移除。
 VIEW_ROWS = 15
 
 
@@ -755,7 +758,7 @@ class Completer:
         self.visible = True
         self.shown_at = time.time()
         self.word_is_complete = word.lower() in set(i.lower() for i in visible_ids)
-        # 只把【当前这一屏】交给 UI 去画：行数最多 view_rows（默认 15）行，
+        # 只把【当前这一屏】交给 UI 去画：行数最多 view_rows（默认 9）行，
         # 候选不足时还会更短，列表不会越滚越长；而完整的候选始终留在 self.matches
         # 里，滚动即可到达。
         self.ui.show(self.visible_rows(), self.view_selection(), self)

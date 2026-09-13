@@ -18,15 +18,19 @@ VbeComplete 主入口（修复版）
     候选超过一屏（最多 15 条）时，上下键会带着窗口一起滚动，右侧显示滚动条；
   - 滚轮    指针放在弹窗上时，上下滚动 = 上下选词（右侧的滚动条也可用鼠标拖动）；
   - Tab     确认补全（唯一确认键；回车/空格按普通输入处理，不当确认）；
+  - Shift+Enter  在当前行下方【新起一行】：当前行不拆分（光标右侧的代码留在
+    原行），新行缩进与上一行代码起始位置对齐，光标落在新行缩进之后。等价于
+    "先把光标移到行尾再按回车"，但一步到位（光标在行中间时同样适用）；
   - Esc     取消；鼠标单击/双击候选也可确认；
   - ← / →   移动光标即收起列表（与"鼠标点到别处"同义），按键照常放行；
   - Ctrl+Space  手动触发。
-  注：数字键不再用于选词（会与"输入变量名里的数字"冲突，例如想打 s1 却选中
-  了 sheet1），改由 ↑/↓ + Tab 或鼠标点击选择。
+  注（v49）：数字键 1~9 不再用于选词，候选也不再显示序号 —— 弹窗开着时
+  照常输入数字，定义 `s1` / `arr17` 这类名字不会被列表抢走。
 """
 
 import sys
 import time
+import ctypes
 import queue
 import tkinter as tk
 
@@ -56,6 +60,7 @@ WM_SYSKEYUP = 0x0105
 
 VK_TAB = 0x09
 VK_RETURN = 0x0D
+VK_SHIFT = 0x10         # 只用来查"Shift 是否按住"（Shift+Enter = 新起一行）
 VK_ESCAPE = 0x1B
 VK_SPACE = 0x20
 VK_LEFT = 0x25
@@ -65,6 +70,35 @@ VK_DOWN = 0x28
 VK_PROCESSKEY = 0xE5   # IME 组字过程中的按键（vkCode=229），不携带真实字符
 
 NAV_VKS = (VK_UP, VK_DOWN)
+
+
+def _is_newline_shortcut(vk, shift_down):
+    """Shift+Enter 是否应触发"在当前行下方新起一行"（纯判断，便于单测）。
+
+    只认 Enter：Shift+Tab（反缩进）等一律不管。小键盘回车在 VBE 里同样是
+    VK_RETURN，因此与主键盘一视同仁。
+    """
+    return vk == VK_RETURN and bool(shift_down)
+
+
+def _shift_down():
+    """Shift 此刻是否被按住 —— 直接问系统，不靠按键事件自己累积。
+
+    为什么不用 on_press 维护一个布尔量（ctrl / alt 就是那么做的）：
+    pynput 的 win32_event_filter 跑在【系统钩子线程】里（_util/win32.py 的
+    _handler -> _convert 同步调用它），而 on_press 是钩子把消息 post 给监听器
+    消息循环之后才执行的（keyboard/_win32.py 的 _process）—— 两者不同线程、
+    且隔着一次排队。"按住 Shift 再按 Enter"这两个事件紧挨着，等队列里的
+    on_press 把状态记下来往往已经晚了。
+    GetAsyncKeyState 拿的是 OS 的实时按键状态（pynput 自己也用它判定修饰键），
+    与线程 / 队列无关。取不到（非 Windows 等）就返回 False —— 那时 Shift+Enter
+    退化成 VBE 原生的回车行为，不会吞掉用户的按键。
+    """
+    try:
+        return bool(ctypes.windll.user32.GetAsyncKeyState(VK_SHIFT) & 0x8000)
+    except Exception:
+        return False
+
 
 # 收起键：左右方向键。
 # 与"鼠标点到别处"同义——光标离开了正在拼的那个词，补全上下文就失效了，
@@ -132,11 +166,6 @@ HOOK_SUPPRESS_SEC = 2.5
 # 迟迟不进候选。0.4s 兼顾：连打时最多 2.5 次/秒。
 ID_REFRESH_MIN_SEC = 0.4
 
-# 弹窗可见时，这些键由 win32_filter 接管（↑/↓ 导航、Tab 确认、Esc 取消），
-# 且会被 suppress_event() 吞掉。on_press 里绝不能抢先收起弹窗，否则"按方向键
-# 选词"会退化成"按方向键弹窗消失"。
-#
-# Enter 刻意【不在】这里：回车不当确认键，按回车应当照常换行（并顺带收起弹窗）。
 try:
     import win32gui as _win32gui
 
@@ -326,6 +355,24 @@ def main():
         state["trigger_queued"] = True
         post(_run_trigger)
 
+    def _new_line_here():
+        """Shift+Enter：在当前行下方新起一行（缩进对齐上一行）。
+
+        等价于用户"先把光标移到本行末尾，再按回车"，但一步到位 —— 当前行
+        【不拆分】（光标右侧的代码留在原行），新行复制上一行的行首空白，
+        光标落到新行缩进之后。细节见 VbeBackend.new_line_below。
+
+        顺序：先收起弹窗（光标要换行了，列表留着没意义），再动文本。
+        """
+        try:
+            completer.hide()
+        except Exception:
+            pass
+        try:
+            backend.new_line_below()
+        except Exception:
+            pass
+
     def drain_actions():
         """主线程循环消费动作队列。"""
         try:
@@ -355,7 +402,17 @@ def main():
             vk = data.vkCode
 
             if msg in (WM_KEYDOWN, WM_SYSKEYDOWN):
-                if completer.is_visible():
+                # Shift+Enter = 在当前行下方新起一行（缩进对齐上一行）。
+                # 与"弹窗是否可见"无关：弹窗开着也照样接管（顺带收起弹窗）。
+                # 只在【焦点在 VBE 代码窗】且【COM 没在失败退避】时才吞键；
+                # 否则放行，让 VBE 按原生行为处理（原生 Shift+Enter == 回车），
+                # 绝不"吞了按键却什么都没发生"。
+                if (_is_newline_shortcut(vk, _shift_down())
+                        and com_backoff_remaining() <= 0
+                        and in_vbe_code_pane()):
+                    action = (_new_line_here, ())
+                    suppress = True
+                elif completer.is_visible():
                     if not in_vbe_code_pane():
                         # 焦点已离开 VBE：收起弹窗，按键照常放行
                         post(completer.hide)

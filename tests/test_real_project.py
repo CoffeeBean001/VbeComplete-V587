@@ -860,13 +860,15 @@ def main():
           [ok9, ui_k2.shown, c_k2.selected],
           expect_contain=[False, True, 0])
 
-    # ---- 11.12 v40：候选不再带序号（数字键选词已移除）----
+    # ---- 11.12 v49：候选不再带序号（数字键选词已移除），一屏 15 行 ----
     try:
         import ui as _ui
-        check("v40: 候选显示即名字本身（无 1. 序号前缀）",
-              [_ui.format_row(0, "num"), _ui.format_row(2, "numCount")],
-              expect_contain=["num", "numCount"])
-        check("v42: 一屏最多显示 15 行（候选不足时列表高度随之缩短，不补空行）",
+        check("v49: 候选显示就是名字本身（无 `N. ` 前缀）",
+              [_ui.format_row(0, "num") == "num",
+               _ui.format_row(2, "numCount") == "numCount",
+               _ui.format_row(8, "numArr") == "numArr"],
+              expect_contain=[True, True, True])
+        check("v49: 一屏最多 15 行（候选不足则列表更短）",
               [_ui.MAX_VISIBLE_ROWS], expect_contain=[15])
         check("v42: 列表宽度固定 30 字符（不再有横向滚动条）",
               [_ui.NAME_CHARS, hasattr(_ui.Popup, "has_hscroll")],
@@ -874,7 +876,7 @@ def main():
         check("v42: 超长名字用 ... 省略",
               [_ui.ELLIPSIS], expect_contain=["..."])
     except Exception as e:                                # pragma: no cover
-        check("v32: 候选显示带序号（跳过：ui 不可用 %s）" % e, [True],
+        check("v49: 候选显示不带序号（跳过：ui 不可用 %s）" % e, [True],
               expect_contain=[True])
 
     # ---- 12. v23-3：模块名 / 窗体名 / 类名参与提示 ----
@@ -2398,6 +2400,137 @@ def main():
                     (_cp27.ctx or {}).get("word_end_col"))],
                   expect_contain=[(True, 16)])
 
+
+            # ---- 第 29 节：Shift+Enter 在光标行下方新起一行（v48） ----
+            #
+            # 用户要求：光标停在代码行【中间】时想另起一行，老办法是"先把光标移到
+            # 本行末尾再按回车"，太麻烦。现在按 Shift+Enter 一步完成，且新行起始
+            # 位置要与上一行代码起始位置对齐（IDEA 的 Start New Line 同款）。
+            #
+            # 关键点：当前行【不拆分】—— 光标右侧的代码留在原行；新行内容 = 上一行的
+            # 行首空白；光标落在新行缩进之后。后端实现见 VbeBackend.new_line_below()。
+            print("\n=== 29. Shift+Enter 在当前行下方新起一行（v48）===")
+            try:
+                import main as _mn29
+                _orig_get29 = VB._get_vbe_cached
+
+                # 29.1 纯判断：只认"按住 Shift 的回车"
+                check("29.1 只认 Shift+回车（裸回车 / Shift+Tab 都不算）",
+                      [_mn29._is_newline_shortcut(0x0D, True),
+                       _mn29._is_newline_shortcut(0x0D, False),
+                       _mn29._is_newline_shortcut(0x09, True),
+                       _mn29._is_newline_shortcut(0x0D, 0)],
+                      expect_contain=[True, False, False, False])
+
+                # 29.2 对齐依据：行首空白（空格 / Tab / 无缩进 / 空行）
+                check("29.2 行首空白提取（新行对齐上一行代码起始位置的依据）",
+                      [VB._leading_ws("    x = 1"), VB._leading_ws("\t If x"),
+                       VB._leading_ws("x = 1"), VB._leading_ws("")],
+                      expect_contain=["    ", "\t ", "", ""])
+
+                # 29.3 缩进之后的光标列（字符列语义 = len + 1）
+                check("29.3 缩进之后的光标列：4 空格 -> 第 5 列；无缩进 -> 第 1 列",
+                      [VB._indent_end_col("    "), VB._indent_end_col("")],
+                      expect_contain=[5, 1])
+
+                class _CM29(object):
+                    def __init__(self, lines):
+                        self.lines = list(lines)
+                        self.Name = "Module1"
+
+                    @property
+                    def CountOfLines(self):
+                        return len(self.lines)
+
+                    def Lines(self, start, count):
+                        s0 = max(0, int(start) - 1)
+                        return "".join(l + "\n"
+                                       for l in self.lines[s0:s0 + int(count)])
+
+                    def InsertLines(self, start, text):
+                        i = min(max(0, int(start) - 1), len(self.lines))
+                        for k, ln in enumerate(str(text).split("\n")):
+                            self.lines.insert(i + k, ln)
+
+                class _FPane29(object):
+                    def __init__(self, cm, sel):
+                        self.CodeModule = cm
+                        self.sel = sel
+
+                    def GetSelection(self):
+                        return self.sel
+
+                    def SetSelection(self, sl, sc, el, ec):
+                        self.sel = (sl, sc, el, ec)
+
+                class _FVBE29(object):
+                    def __init__(self, pane):
+                        self.ActiveCodePane = pane
+
+                def _nl29(lines, line_no, col):
+                    cm29 = _CM29(lines)
+                    pane29 = _FPane29(cm29, (line_no, col, line_no, col))
+                    VB._get_vbe_cached = lambda: _FVBE29(pane29)
+                    ok29 = VB.VbeBackend().new_line_below()
+                    return ok29, cm29.lines, pane29.sel
+
+                _SRC29 = ["Option Explicit", "Sub Foo()", "    Dim x",
+                          "    x = 1 + 2", "End Sub"]
+
+                # 29.4 核心：光标停在行中间 -> 当前行不拆、新行缩进对齐、光标在缩进后
+                _ok29, _ls29, _sel29 = _nl29(_SRC29, 4, 11)
+                check("29.4 光标在行中间 -> 新行插在下方、缩进与上一行对齐、不拆行",
+                      [_ok29, _ls29, _sel29],
+                      expect_contain=[True,
+                                      ["Option Explicit", "Sub Foo()", "    Dim x",
+                                       "    x = 1 + 2", "    ", "End Sub"],
+                                      (5, 5, 5, 5)])
+
+                # 29.5 光标在行尾 / 行首：结果一致（都按"本行缩进"新起一行）
+                _r29 = []
+                for _c29 in (14, 5):
+                    _ok, _ls, _sel = _nl29(_SRC29, 4, _c29)
+                    _r29.append((_ok, _ls[4], _sel))
+                check("29.5 行尾 / 行首同样新起一行，且都不拆行",
+                      [_r29],
+                      expect_contain=[[(True, "    ", (5, 5, 5, 5)),
+                                       (True, "    ", (5, 5, 5, 5))]])
+
+                # 29.6 末行：追加到模块末尾（InsertLines 起始行超出即追加）
+                _ok29b, _ls29b, _sel29b = _nl29(_SRC29, 5, 8)
+                check("29.6 光标在模块最后一行 -> 新行追加到末尾、光标在第 1 列",
+                      [_ok29b, _ls29b, _sel29b],
+                      expect_contain=[True, _SRC29 + [""], (6, 1, 6, 1)])
+
+                # 29.7 Tab 缩进的行：显示列语义下光标要按 tab stop 展开
+                _sem29 = VB._sem_cache.get("info")
+                VB._sem_cache["info"] = ("disp", 4, False)
+                try:
+                    _ok29c, _ls29c, _sel29c = _nl29(
+                        ["Sub Foo()", "\tIf x Then", "End Sub"], 2, 11)
+                finally:
+                    VB._sem_cache["info"] = _sem29
+                check("29.7 Tab 缩进：新行仍是 Tab，光标按显示列落在其后（第 5 列）",
+                      [_ok29c, _ls29c[2], _sel29c],
+                      expect_contain=[True, "\t", (3, 5, 3, 5)])
+
+                # 29.8 取不到 VBE（不在代码窗 / Excel 已关）必须返回 False ——
+                #      调用方据此【不吞键】，让 VBE 按原生行为处理
+                VB._get_vbe_cached = lambda: None
+                check("29.8 取不到 VBE -> 返回 False（绝不吞掉用户的按键）",
+                      [VB.VbeBackend().new_line_below()],
+                      expect_contain=[False])
+
+                # 29.9 空模块（光标行号为 0）也要安全返回 False
+                VB._get_vbe_cached = lambda: _FVBE29(
+                    _FPane29(_CM29([]), (0, 0, 0, 0)))
+                check("29.9 光标行号为 0（无有效行）-> 返回 False",
+                      [VB.VbeBackend().new_line_below()],
+                      expect_contain=[False])
+
+                VB._get_vbe_cached = _orig_get29
+            except Exception as _e29:
+                check("第 29 节异常: %s" % _e29, [True], expect_contain=[False])
 
         finally:
             VB._get_vbe_cached = _orig_get24

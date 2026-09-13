@@ -27,6 +27,8 @@ IMPLICIT_SCOPE = "proc"
 
 # 合法标识符（含中文）的模块名/窗体名/类名，用于把组件名纳入候选
 _RE_PLAIN_IDENT = re.compile(r"^[^\W\d]\w*$")
+# 行首空白（空格 / Tab）：新起一行时用它对齐上一行的代码起始位置。
+_RE_LEADING_WS = re.compile(r"[ \t]*")
 
 # 跨工程作用域：
 #   False（默认）—— 只收集【当前活动工程】里的标识符。
@@ -165,6 +167,36 @@ def _detect_semantics_passive(line_text, ec):
 
 # 列语义是"编辑器级"属性（不随行变化），因此探测一次即可长期复用。
 _sem_cache = {"info": None, "probe_broken": False}
+
+
+def _leading_ws(line_text):
+    """行首空白（空格 / Tab）。
+
+    新起一行时用它对齐上一行的代码起始位置 —— VBE 自己按回车也遵循这个规则
+    （新行继承上一行缩进），我们在光标位于行中间时代劳，必须手工复刻。
+    """
+    m = _RE_LEADING_WS.match(line_text or "")
+    return m.group(0) if m else ""
+
+
+def _indent_end_col(indent):
+    """缩进【之后】那一列（1-based）——新行光标要停在这里。
+
+    缩进只由空格与 Tab 组成、不含全角字符，因此：
+      * 编辑器按【字符列】计时 col = len(indent) + 1；
+      * 编辑器按【显示列】计时，Tab 要展开到下一个 tab stop。
+    列语义是编辑器级属性（与 apply_completion 共用 _sem_cache）；拿不到缓存时
+    按字符列算 —— 缩进全是空格（最常见）时两种算法结果一致。
+    """
+    info = _sem_cache.get("info")
+    if info:
+        try:
+            sem, tabw, wide2 = info
+            if sem == "disp":
+                return _disp_width(indent, tabw, wide2) + 1
+        except Exception:
+            pass
+    return len(indent) + 1
 
 
 def _probe_semantics(cm, cp, line_no, line_text):
@@ -1169,4 +1201,45 @@ class VbeBackend:
             # CodeModule / CodePane / VBE 的引用，而 Excel 退出时正是要把这个
             # 工程写回文件 —— 立刻放手，别把它的退出流程钉住。
             # （"只改工作表不卡、改过 VBA 才卡"的针对性处理。）
+            _release_vbe_proxy()
+
+    # ---- 新起一行（Shift+Enter） ----
+    def new_line_below(self):
+        """在光标所在行的【下方】新起一行：缩进与上一行对齐，光标落在缩进之后。
+
+        等价于"先把光标移到本行末尾，再按回车"，但一步到位 —— 而且当前行
+        【不拆分】（光标右侧的代码留在原行）。VBE 只在"光标已在行尾"时按回车
+        才继承上一行缩进；光标停在行中间时按回车会把行拆开，所以必须由我们代劳。
+
+        实现上刻意不依赖光标列，也不移动光标：直接读本行文本、取它的行首空白
+        作为新行内容，再把光标放到新行缩进之后。
+
+        成功返回 True；不在代码窗 / 取不到 COM / 出任何异常都返回 False ——
+        调用方据此"不吞键"，让 VBE 按原生行为处理，绝不吞掉用户的换行。
+        """
+        try:
+            vbe = _get_vbe_cached()
+            if vbe is None:
+                return False
+            cp = vbe.ActiveCodePane
+            if cp is None:
+                return False
+            cm = cp.CodeModule
+            sl, _sc, el, _ec = cp.GetSelection()
+            # 有选区时以选区【末行】为基准（正常情况下 sl == el）。
+            anchor = max(int(sl), int(el))
+            if anchor <= 0:
+                return False
+            indent = _leading_ws(cm.Lines(anchor, 1))
+            # InsertLines 在 anchor+1 处插入（anchor == CountOfLines 时即追加到末尾），
+            # 已有行自动下移 —— 正是"在本行下方新起一行"。
+            cm.InsertLines(anchor + 1, indent)
+            col = _indent_end_col(indent)
+            cp.SetSelection(anchor + 1, col, anchor + 1, col)
+            return True
+        except Exception:
+            return False
+        finally:
+            # 与 apply_completion 同理：写过代码（VBAProject 变脏），立刻放开
+            # 手里的 COM 代理，别拖住 Excel 的退出/写回。
             _release_vbe_proxy()

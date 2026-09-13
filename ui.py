@@ -99,11 +99,11 @@ def split_by_hits(name, positions):
 
 
 def format_row(index, name):
-    """列表第 index 行（0-based）的显示文本。
+    """列表第 index 行（0-based）的显示文本：v49 起就是名字本身。
 
-    v39 起候选前面不再画序号（数字键选词已移除，避免与"变量名里的数字"冲突），
-    所以这里直接返回名字本身，仅作测试 / 调试用途。真正的补全值始终按【下标】
-    从 matches 里取，与显示文本无关。
+    数字键选词已移除、序号也不再显示，所以显示文本 = 名字；保留 index 参数
+    只为兼容调用方。仅作测试 / 调试用途 —— 真正的补全值始终按【下标】从
+    matches 里取，与显示文本无关。
     """
     return name
 
@@ -160,15 +160,14 @@ class Popup:
 
     为什么不用 Listbox：Listbox 每一行只能有一种前景色，没法把"命中的字
     符"单独标红。Canvas 可以逐段 create_text，想怎么着色就怎么着色。
-
     每行画两样东西：选中底色 → 名字（按命中位置切成若干段，命中的段用高亮色）。
-    v39 起候选前面不再画序号。
+    v49 起不再画序号（数字键选词已移除），名字从列表最左侧开始。
 
-    布局（v42，仿 IDEA）：
-      - 列表宽度【固定】= NAME_CHARS(30) 个字符，不再随内容伸缩，也没有横向滚动条；
-        名字超过 30 个字符用 ... 省略。
-      - 一屏最多 MAX_VISIBLE_ROWS(15) 行；候选不足时列表高度随之缩短，
-        超过 15 行才出现【纵向】滚动条（贴列表右边界，支持滚轮与鼠标拖动）。
+    布局（v42 起，仿 IDEA）：
+      - 列表宽度【固定】= NAME_CHARS(30) 个字符，不再随内容伸缩，也没有横向
+        滚动条；名字超过 30 个字符用 ... 省略。
+      - 一屏最多 MAX_VISIBLE_ROWS(15) 行；候选不足时列表高度随之缩短，超过
+        15 行才出现【纵向】滚动条（贴列表右边界，支持滚轮与鼠标拖动）。
       - 名字被省略时，把当前"活动"候选（鼠标悬停优先，否则上下键选中项）的
         【完整名字】显示在列表下方的"详情行"里（窗口为此行按需加宽），这样
         选中的超长名字永远能看全 —— 与 IDEA 显示完整补全项的思路一致。
@@ -447,7 +446,7 @@ class Popup:
     def _draw(self):
         """把当前这一屏画到 Canvas 上。
 
-        布局（v42，仿 IDEA）：
+        布局（v42 起，仿 IDEA）：
           - 行数 = 实际候选数，但最多 MAX_VISIBLE_ROWS(=15) 行；候选不足时列表框
             高度跟着缩短（显示几行就几行高）。
           - 宽度【固定】= NAME_CHARS(30) 个字符（+ 滚动条），不再随内容伸缩，
@@ -475,13 +474,15 @@ class Popup:
         except Exception:
             cw = 7.0
         text_w = float(NAME_CHARS) * cw
+        # 名字列起点：v49 去掉序号列后，名字从列表最左侧开始
+        name_x0 = PAD_X
 
         # 纵向滚动条：候选超过一屏才需要
         vscroll = self._total > MAX_VISIBLE_ROWS
         sb_v_w = (SCROLL_W + SCROLL_PAD) if vscroll else 0
         # 列表区（含右留白）宽度 —— 选中底色、滚动条都以此为界
-        list_w = PAD_X + text_w + sb_v_w + PAD_X
-        list_bg_right = PAD_X + text_w + PAD_X
+        list_w = name_x0 + text_w + sb_v_w + PAD_X
+        list_bg_right = name_x0 + text_w + PAD_X
 
         # 详情行：当前"活动"候选被省略时，显示其完整名字（悬停优先，否则选中项）
         active = None
@@ -525,7 +526,7 @@ class Popup:
                                    fill=bg, outline="")
             # 固定宽度：超过 30 字用 ... 省略；命中下标只保留仍在可见前缀内的
             disp, _trunc, prefix = self._truncate_to_width(name, text_w)
-            x = PAD_X
+            x = name_x0
             for seg, is_hit in split_by_hits(disp, [p for p in hit_pos if p < prefix]):
                 c.create_text(x, ym, anchor="w", text=seg,
                               fill=hit_fg if is_hit else fg,
