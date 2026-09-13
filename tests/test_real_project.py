@@ -3464,6 +3464,18 @@ def main():
                   [_bk.insert_pair("(")], expect_contain=[False])
         finally:
             VB35._get_vbe_cached = _orig_g
+
+        # --- 右半边：`)` 也是"跨过去"，但只在右边真的有 `)` 时 ---
+        check("35.16 Shift+0 -> )",
+              [M._pair_char_for_key(0x30, True) if M is not None else None],
+              expect_contain=[")"])
+        check("35.17 补完 () 后再按 ) -> 跨过去，不多出一个",
+              list(_pair_run("x = ()", 6, ")")),
+              expect_contain=["x = ()", 7, True])
+        check("35.18 右边没有 ) 时按 ) -> 放行让 VBE 自己插",
+              [_pair_run("x = ab", 5, ")")[2],
+               _pair_run("x = ab", 5, ")")[0]],
+              expect_contain=[False, "x = ab"])
     except Exception as _e35:
         check("第 35 节异常: %s" % _e35, [True], expect_contain=[False])
 

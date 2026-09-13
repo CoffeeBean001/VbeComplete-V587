@@ -1133,7 +1133,7 @@ class VbeBackend:
     # VBE 原生【不会】自动闭合括号和引号（VBE_Extras / Rubberduck 都把它当增强
     # 功能往外加），所以这里补上不会出现"两边都补"的双份。唯一要注意的是 VBE
     # 会在【行尾按回车时】补齐缺失的右引号，那与逐字符输入无关，不受影响。
-    _PAIR_CLOSE = {"(": ")", '"': '"'}
+    _PAIR_CLOSE = {"(": ")", '"': '"', ")": ")"}
 
     def insert_pair(self, open_ch):
         """在光标处插入一对符号（`(` -> `()`、`"` -> `""`），光标落在中间。
@@ -1163,8 +1163,15 @@ class VbeBackend:
             col0 = max(0, min(col - 1, len(line_text)))
             if _classify(line_text, col0 + 1)[1]:
                 return False          # 注释里不自动配对（VBE 也不）
-            new_line, caret_off = _pair_insertion(
-                line_text, col0, open_ch, close_ch)
+            if open_ch == ")":
+                # 右半边已经在光标右边 -> 只跨过去（补完 `()` 后再按 `)` 不该
+                # 多出一个）；否则【放行】，让用户真的插入一个右括号。
+                if col0 >= len(line_text) or line_text[col0] != ")":
+                    return False
+                new_line, caret_off = None, col0 + 1
+            else:
+                new_line, caret_off = _pair_insertion(
+                    line_text, col0, open_ch, close_ch)
             if new_line is not None:
                 cm.ReplaceLine(sl, new_line)
                 try:

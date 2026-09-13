@@ -114,6 +114,8 @@ def _pair_char_for_key(vk, shift_down):
         return None
     if ch == "9":
         return "("
+    if ch == "0":
+        return ")"          # 右半边已在光标右边时"跨过去"，不重复插
     if ch in ("'", '"'):
         return '"'
     return None
