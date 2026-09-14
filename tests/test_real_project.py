@@ -5467,6 +5467,165 @@ def main():
     except Exception as _e45:
         check("第 45 节异常: %s" % _e45, [True], expect_contain=[False])
 
+    # ==================================================================
+    # 46. 宿主枚举匹配的廉价预筛（v69）—— 纯性能，行为必须一字不变
+    #
+    # v68 的闸门"输入里存在一段长度 >= 4 的连续块"有个极便宜的必要条件：从输入里
+    # 随便取一个 4 连片断，它必须【真的连续出现在】候选名里 —— C 层一句 `in` 就够，
+    # 比逐条跑 fuzzy_match + _longest_run 便宜一个量级（实测 2173 条锚定候选
+    # 5.9ms -> 0.8ms，整条 trigger 由约 10.6ms 降到约 6.2ms）。
+    #
+    # 预筛只可能"多留"（留下的还要照跑 fuzzy_match 与闸门复核），绝不"少留"：
+    # 真命中的候选，其命中下标里必有一段长度 >= 4 的连续段，那段对应的输入片断
+    # 当然就在名字里。这一节就守这个不变式 —— 用真实 4538 条清单。
+    #
+    # 为什么必须守：预筛一旦"少留"，症状是"某些 xl* 突然补不出来了"，
+    # 而模糊匹配本身看不出问题（v67 那次漏收就是这么难查）。
+    # ==================================================================
+    print("\n=== 46. 宿主枚举匹配的廉价预筛（v69）===")
+    try:
+        import engine as E46
+        import time as _t46
+
+        try:
+            _items46 = list(_items45)
+        except Exception:
+            _items46 = []
+        check("46.1 真机清单可用（%d 条；拿不到就跳过本节的实质断言）"
+              % len(_items46), [len(_items46) > 0], expect_contain=[True])
+
+        WORDS46 = ("xlworkfaul", "xlworkfau", "xlworkf", "xlwork", "xlwo",
+                   "xlwb", "xlwd", "xlcell", "xlcount", "xlco", "xlce", "xla",
+                   "xlms", "xlm", "xldef", "xlde", "xld", "xlrange", "xlsheet",
+                   "xlcolu", "xlrow", "xlnum", "xlzz", "xlab", "xlj", "ms",
+                   "mso", "msobu", "xl")
+
+        def _old_inner46(q):
+            """v68 的内层循环（无预筛）：锚定 + run>=4。"""
+            ql = q.lower()
+            lw = len(q)
+            got = []
+            for n, need in _items46:
+                low = n.lower()
+                if lw < need:
+                    continue
+                if low.startswith(ql):
+                    got.append(n)
+                    continue
+                if not ql.startswith(low[:need]):
+                    continue
+                r = E46.fuzzy_match(n, q)
+                if r is None or E46._longest_run(r[1]) < E46.HOST_ENUM_FUZZY_RUN:
+                    continue
+                got.append(n)
+            return got
+
+        def _new_inner46(q):
+            """v69 的内层循环：多一层 4-gram 预筛。"""
+            ql = q.lower()
+            lw = len(q)
+            grams = tuple(ql[k:k + E46.HOST_ENUM_FUZZY_RUN]
+                          for k in range(lw - E46.HOST_ENUM_FUZZY_RUN + 1))
+            got = []
+            for n, need in _items46:
+                low = n.lower()
+                if lw < need:
+                    continue
+                if low.startswith(ql):
+                    got.append(n)
+                    continue
+                if not ql.startswith(low[:need]):
+                    continue
+                if not grams or not any(g in low for g in grams):
+                    continue
+                r = E46.fuzzy_match(n, q)
+                if r is None or E46._longest_run(r[1]) < E46.HOST_ENUM_FUZZY_RUN:
+                    continue
+                got.append(n)
+            return got
+
+        if _items46:
+            _bad46 = [q for q in WORDS46
+                      if _old_inner46(q) != _new_inner46(q)]
+            check("46.2 ★等价性：预筛前后候选集合与顺序完全一致（%d 个输入）"
+                  % len(WORDS46), [_bad46], expect_contain=[[]])
+
+            # 性质：过闸门 ==> 过预筛（真数据上零反例）
+            _c46 = 0
+            _viol46 = []
+            for q in WORDS46:
+                ql = q.lower()
+                grams = [ql[k:k + E46.HOST_ENUM_FUZZY_RUN]
+                         for k in range(len(ql) - E46.HOST_ENUM_FUZZY_RUN + 1)]
+                for n, need in _items46:
+                    low = n.lower()
+                    if len(ql) < need or not ql.startswith(low[:need]):
+                        continue
+                    r = E46.fuzzy_match(n, q)
+                    if r is None:
+                        continue
+                    if E46._longest_run(r[1]) < E46.HOST_ENUM_FUZZY_RUN:
+                        continue
+                    _c46 += 1
+                    if not any(g in low for g in grams):
+                        _viol46.append((q, n))
+            check("46.3 过闸门的候选 %d 条，全部过得了预筛（有反例 = 预筛会误杀）"
+                  % _c46, [_viol46, _c46 > 0], expect_contain=[[], True])
+
+            # 短输入（< RUN 个字符）时预筛为空 = 非前缀锚定候选直接跳过，
+            # 与闸门"连续块不可能够长"等价 —— 拿 xla / xlms / xlco 对一遍。
+            _short46 = [q for q in ("xla", "xlms", "xlco", "xlm", "xlce", "ms")
+                        if _old_inner46(q) != _new_inner46(q)]
+            check("46.4 短输入（不足 4 字符）走空预筛也一字不差",
+                  [_short46], expect_contain=[[]])
+
+            # 性能护栏（相对比较，阈值宽松）：同样的锚定候选，预筛必须更快
+            _q46 = "xlworkfaul"
+            _anch46 = [n for n, need in _items46
+                       if len(_q46) >= need
+                       and _q46.startswith(n.lower()[:need])
+                       and not n.lower().startswith(_q46)]
+            _grams46 = [_q46[k:k + E46.HOST_ENUM_FUZZY_RUN]
+                        for k in range(len(_q46)
+                                       - E46.HOST_ENUM_FUZZY_RUN + 1)]
+
+            def _t_gate46():
+                for n in _anch46:
+                    r = E46.fuzzy_match(n, _q46)
+                    if r is not None:
+                        E46._longest_run(r[1])
+
+            def _t_pre46():
+                for n in _anch46:
+                    low = n.lower()
+                    if any(g in low for g in _grams46):
+                        r = E46.fuzzy_match(n, _q46)
+                        if r is not None:
+                            E46._longest_run(r[1])
+
+            def _best46(fn, times=5):
+                b = None
+                for _ in range(times):
+                    _t0 = _t46.perf_counter()
+                    fn()
+                    _dt = _t46.perf_counter() - _t0
+                    b = _dt if b is None else min(b, _dt)
+                return b
+
+            _tb46 = _best46(_t_gate46)
+            _tp46 = _best46(_t_pre46)
+            check("46.5 性能护栏：%d 条锚定候选，预筛 %.2fms < 全量模糊 %.2fms"
+                  % (len(_anch46), _tp46 * 1000, _tb46 * 1000),
+                  [_tp46 < _tb46 * 0.8], expect_contain=[True])
+
+            # 端到端（真引擎 + 真实清单）：预筛没把用户要的候选弄丢
+            check("46.6 端到端：xlworkfaul -> 唯一 xlWorkbookDefault"
+                  "（预筛不误杀；真引擎 + %d 条）" % len(_items46),
+                  [_trig45("xlworkfaul", pool=_real45, host=_rhost45)[0]],
+                  expect_contain=[["xlWorkbookDefault"]])
+    except Exception as _e46:
+        check("第 46 节异常: %s" % _e46, [True], expect_contain=[False])
+
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))
     if FAILURES:

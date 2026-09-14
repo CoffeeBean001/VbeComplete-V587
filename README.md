@@ -80,6 +80,8 @@
     而**跳着打**也能命中（v68）—— `xlworkfaul` → `xlWorkbookDefault`、
     `xlcell` → `xlCellTypeVisible`（前缀）`+ xlLastCell`（跳步，永远排在前缀之后）。
     输入不足 4 个字符时退化成纯前缀，与只认前缀时**一模一样**，不会平白多出噪音。
+    （v69 给这一段加了一层廉价的"4 连片断"预筛：候选集一字不变，宿主那段耗时
+    约降到三分之一。见"跳着打补不出来"那条。）
   只想留某个家族：`set VBECOMPLETE_HOST_ENUM_FAMILIES=xl`；整批关掉：
   `set VBECOMPLETE_NO_HOST_ENUMS=1`。
 - **打全名照样提示**：名字打全了列表不会消失（`Sub tes` → `Sub test` 始终提示 `test`），
@@ -270,6 +272,16 @@
   若连 `mso*` 都不想要（Excel VBA 里用得比 `xl*` 少），
   用 `set VBECOMPLETE_HOST_ENUM_FAMILIES=xl` 只留 Excel 那一族；
   想整批不要：`set VBECOMPLETE_NO_HOST_ENUMS=1`。
+- **`xl` 后面只打两个字母（`xlde` / `xd`）补不出 `xlWorkbookDefault`**：
+  这是**故意的**，别再放宽 —— 放宽了也不会出现，只会更糟。实测真机 4538 条：
+  `xlde`（家族前缀 + 2 字母）若接受"跳着凑"，会命中 731 条，而目标排在**第 291 位**；
+  连家族前缀都不要求（`xd`）则是 1032 条、目标排**第 450 位**。
+  候选窗一屏只有 15 行 —— 目标躺在第 291 位 = 翻 20 屏也看不到，还会把
+  `ms`→233 条、`open`→484 条这类噪音全带回来。
+  **原因不是规则太紧，是 `xlWorkbookDefault` 对这种输入本来就是"弱匹配"**：
+  `xlDe` 对 `xlDefault` / `xlDelimited` 是连着打中的，对它却跳过了 8 个字符。
+  想让它当场浮上来，就**连着打 4 个字母**：`xlwo`（9 条，可见）/ `xlwork`（31 条，第 9）/
+  `xlworkf`（2 条，第 2）/ `xlworkfaul`（1 条，第 1）。
 - **括号 / 引号不想自动配对**：`set VBECOMPLETE_NO_AUTOPAIR=1`。
   若只是偶尔想只敲半边：先按一下 `"` 补出一对、光标在中间，直接输入内容即可；
   结对后按 `"` / `)` 是"跨过去"，不会多出字符。
