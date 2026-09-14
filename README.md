@@ -58,6 +58,25 @@
   候选按「精确 > 前缀 > 词首缩略 > 连续块 > 分散」排序，同级再比命中是否更靠前、
   跨度是否更小、名字是否更短——最像的永远排第一，列表不会因为放开了模糊匹配就变乱。
   输入普通前缀（如 `num`）时结果与纯前缀匹配完全一致，不会平白多出一堆噪音。
+- **语言自带的名字、宿主库的常量都能补**（v61 / v62 / v67）。这些名字代码里
+  **一个字都没写过**也照样提示 —— 它们由语言运行时和工程引用的类型库决定存在：
+  - **VBA 内建函数 / 常量 / 数据类型**（v61）：`MsgBox`、`Left`、`Split`、`vbCrLf`、
+    `vbYesNo`、`String` …（`ENABLE_VBA_BUILTINS`）；
+  - **VBA 语言关键字**（v62）：`Sub`、`Dim`、`If`、`For`、`Set` …（`ENABLE_VBA_KEYWORDS`）；
+  - **宿主类型库的枚举常量**（v67）：Excel 的 `xl*`（`xlUp`、`xlToRight`、
+    `xlCellTypeVisible` …）与 Office 的 `mso*`（`msoTrue` …）。这批是**运行时从工程
+    "引用"里现读**的，你引用了什么库就补什么，Excel 换版本也自动跟着变
+    （`ENABLE_HOST_ENUMS`）。
+
+  ⚠️ 这三批的**匹配口径比工程内名字紧**，否则它们会淹掉你自己的名字：
+  - 内建名字 + 关键字（约 400 个）：**纯跳步命中要求输入至少 4 个字符** ——
+    `ms`→`MsgBox`、`vbc`→`vbCrLf`、`slct`→`Select` 照常，`ar` 不会冒出
+    `vbAbortRetryIgnore`；
+  - 宿主常量（约 4500 条）：**只认从头开始的前缀**，且输入长度不低于家族前缀 ——
+    `xl`→`xl*`、`xlu`→`xlUp`、`mso`→`mso*` 照常，而 `ms` 只出 `MsgBox`（绝不带出
+    `mso*`）、`count` / `cell` / `range` 一条 `xl*` 都不会多出来。
+  只想留某个家族：`set VBECOMPLETE_HOST_ENUM_FAMILIES=xl`；整批关掉：
+  `set VBECOMPLETE_NO_HOST_ENUMS=1`。
 - **打全名照样提示**：名字打全了列表不会消失（`Sub tes` → `Sub test` 始终提示 `test`），
   包括**正在写函数/变量声明行**的时候——只要那个名字在工程里真实存在就一直提示。
   真正会被剔掉的只有"幻影词"：工程里哪都不存在、只是你正在敲的那几个字符
@@ -190,6 +209,7 @@
 ## 文件说明
 
 - `parser.py` — VBA 标识符提取（纯文本）
+- `vba_builtins.py` — VBA 语言自带名字的清单（内建函数/常量/数据类型 + 关键字）
 - `engine.py` — 补全引擎（触发/模糊匹配/排序/选择/插入，纯逻辑）
 - `vbe_bridge.py` — 对接真实 VBE（pywin32 COM，唯一需 Excel 的部分）
 - `ui.py` — 悬浮弹窗（tkinter Canvas 自绘，支持命中字符高亮）
@@ -226,6 +246,23 @@
   用 `set VBECOMPLETE_VBE_POPUP_CLASS=类名` 追加（探测与避让都用这份清单）。
   若成员列表那一侧仍撞车，用 `set VBECOMPLETE_VBE_YIELD_CLASS=类名` 追加到
   "让位清单"即可。
+- **输入 `xl` / `mso` 没有任何提示（或该补的 `xl*` 常量补不出来）**：这批常量
+  是**运行时从工程的"引用"里现读**的，读不到就整批不出现，而**不会**影响其它提示。
+  逐条排查：
+  1. 工程里得真有那两条引用 —— VBE 菜单 **工具 → 引用**，`Excel` 与 `Office`
+     都在（默认就在；被取消勾选过就会缺）；
+  2. 家族前缀是**自动推导**的（能盖住该库一半以上成员的最长公共前缀），
+     推导不出就**整库跳过**（例如 `stdole` 那种 `Checked` / `Color` 各说各话的库，
+     故意不收 —— 它们全是通用词，收进来只会污染你自己的变量名）；
+  3. 是不是被环境变量关了：`VBECOMPLETE_NO_HOST_ENUMS=1` 或
+     `ENABLE_HOST_ENUMS=False`；
+  4. 日志里搜 `host-enums:` —— 会写明每个库"推导出的家族前缀 + 保留多少条"，
+     以及哪几个库因为"无家族前缀"被跳过。
+- **提示里冒出一堆 `xl*` / `mso*`，觉得吵**：它们只在你**敲出家族前缀**时才出现
+  （`xl` / `xlu` / `mso`），输 `count` / `cell` / `range` 这类词**一条都不会多出来**。
+  若连 `mso*` 都不想要（Excel VBA 里用得比 `xl*` 少），
+  用 `set VBECOMPLETE_HOST_ENUM_FAMILIES=xl` 只留 Excel 那一族；
+  想整批不要：`set VBECOMPLETE_NO_HOST_ENUMS=1`。
 - **括号 / 引号不想自动配对**：`set VBECOMPLETE_NO_AUTOPAIR=1`。
   若只是偶尔想只敲半边：先按一下 `"` 补出一对、光标在中间，直接输入内容即可；
   结对后按 `"` / `)` 是"跨过去"，不会多出字符。

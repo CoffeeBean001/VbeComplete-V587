@@ -49,6 +49,33 @@ ENABLE_VBA_KEYWORDS = True
 #      这条规则误杀（详见 engine._name_really_exists）。
 _BUILTIN_MODULE = "VBA"
 
+# 宿主类型库的枚举常量是否纳入提示（v67）。
+#
+# 用户报："输入 vb 会提示一堆 VBA 枚举值，输入 xl 却不提示任何 xl 开头的枚举值。"
+# 前者是 v61 收的 VBA 内建常量（vb*），后者是【宿主 Excel 类型库】的枚举常量
+# （xl*）—— 那是一整套库，从来没收过，于是同一个动作在 xl 上一个提示都没有。
+#
+# 这些常量与内建名字同源：由【工程引用的类型库】决定存在，与代码文本无关
+# （代码里从没写过 xlUp，打 xl 也该补得出来）。所以走完全相同的四路承接。
+#
+# 与内建名字的关键区别是【匹配口径】—— 它们数量极大（Excel + Office 两个库
+# 实测 4538 条），若像工程内名字那样接受跳步匹配，输入 3~4 个字母就会带出
+# 几百条无关项。所以：
+#   * 只收"有统一家族前缀"的库（Excel -> xl，Office -> mso），
+#     没有家族前缀的库（stdole 的 Checked / Gray / Color 这种通用词）一概不收；
+#   * 只认【从头开始的连续前缀】命中，且输入长度不低于家族前缀长度 ——
+#     于是 xl -> xl*、xlu -> xlUp；而 ms 只出 MsgBox，绝不带出 mso*。
+ENABLE_HOST_ENUMS = True
+# 家族前缀的覆盖率门槛：某前缀能盖住该库这么多比例的枚举成员，才算"家族前缀"。
+_HOST_ENUM_FAMILY_PCT = 0.5
+# 允许的家族前缀白名单（小写，逗号分隔）。留空 = 自动推导（推荐）。
+#   例：想只留 Excel 的 xl*，设 VBECOMPLETE_HOST_ENUM_FAMILIES=xl
+_HOST_ENUM_FAMILIES = tuple(
+    p.strip().lower() for p in
+    os.environ.get("VBECOMPLETE_HOST_ENUM_FAMILIES", "").split(",") if p.strip())
+# 宿主常量挂靠的虚拟模块名（同 _BUILTIN_MODULE 的道理，见那边的说明）。
+_HOST_ENUM_MODULE = "宿主库"
+
 # 合法标识符（含中文）的模块名/窗体名/类名，用于把组件名纳入候选
 _RE_PLAIN_IDENT = re.compile(r"^[^\W\d]\w*$")
 # 行首空白（空格 / Tab）：新起一行时用它对齐上一行的代码起始位置。
@@ -1338,6 +1365,209 @@ def _locate_inserted(after, written, open_ch, close_ch, col0):
     return None
 
 
+def enum_family_prefix(names):
+    """一个类型库的枚举成员里，覆盖率达标的最长【小写家族前缀】（长度 >= 2）。
+
+    用来回答"这个库的枚举常量有没有统一的写法"：
+      * Excel 库 -> "xl"（97% 的成员都以 xl 打头）—— 用户本来就得敲 xl 才找得到；
+      * Office 库 -> "mso"（83%）；
+      * stdole  -> ""（Checked / Gray / Color 各说各话，没有共同前缀）。
+
+    没有家族前缀的库【整库丢弃】：那种库的成员都是 Checked / Default / Color
+    这类通用词，收进来只会污染用户自己的变量候选（用户口径：宁可少提示，也不
+    要噪音）。
+
+    为什么用"覆盖率"而不是"最长公共前缀"：Excel 库里还夹着 rgb* / sigdet* 等
+    零散成员，最长公共前缀只有 1 个字符，判不出任何东西。取"能盖住一半以上成员
+    的最长前缀"才能稳稳落在 xl / mso 上。
+
+    前缀越长覆盖率越低（子集关系），所以一旦某长度不达标就可以直接停。
+    """
+    lows = [str(n).lower() for n in names if n]
+    if not lows:
+        return ""
+    total = len(lows)
+    best = ""
+    for k in range(2, 25):
+        counts = {}
+        for x in lows:
+            if len(x) >= k:
+                p = x[:k]
+                counts[p] = counts.get(p, 0) + 1
+        if not counts:
+            break
+        p, n = max(counts.items(), key=lambda kv: kv[1])
+        if n < total * _HOST_ENUM_FAMILY_PCT:
+            break
+        best = p
+    return best
+
+
+def host_enum_family(names):
+    """(家族前缀, 该前缀下的成员名列表)。没有家族前缀则 ("", [])。"""
+    p = enum_family_prefix(names)
+    if not p:
+        return "", []
+    if _HOST_ENUM_FAMILIES and p not in _HOST_ENUM_FAMILIES:
+        return "", []      # 白名单模式：不在清单里的家族整库跳过
+    return p, [str(n) for n in names
+               if str(n).lower().startswith(p)]
+
+
+def _tlb_member_name(ti, memid):
+    """ITypeInfo.GetNames 的兼容封装（各版本 pywin32 的参数个数不同）。"""
+    try:
+        return ti.GetNames(memid)
+    except TypeError:
+        return ti.GetNames(memid, 256)
+
+
+def _tlb_enum_members(guid, major, minor):
+    """按 GUID + 版本加载已注册的类型库，返回其【常量枚举】的全部成员名。
+
+    只读、不碰 VBE 内容；任何一步失败都返回 []（绝不抛 —— 这条路上出异常会
+    让整个候选池收集失败，得不偿失）。
+
+    注意 VBA 自己的库加载不了：它没有注册成类型库（在 VBE7.DLL 里），
+    LoadRegTypeLib 会报"库没有注册"。VBA 自带的名字本来就有 vba_builtins.py
+    那份静态清单兜着，不依赖这里。
+    """
+    try:
+        import pythoncom
+        import pywintypes
+    except Exception:
+        return []
+    try:
+        tlb = pythoncom.LoadRegTypeLib(
+            pywintypes.IID(str(guid)), int(major), int(minor), 0)
+    except Exception:
+        return []
+    out = []
+    try:
+        count = tlb.GetTypeInfoCount()
+    except Exception:
+        return []
+    for i in range(count):
+        try:
+            ti = tlb.GetTypeInfo(i)
+            attr = ti.GetTypeAttr()
+            if int(attr.typekind) != int(pythoncom.TKIND_ENUM):
+                continue
+            for j in range(attr.cVars):
+                try:
+                    vd = ti.GetVarDesc(j)
+                    nm = _tlb_member_name(ti, vd.memid)[0]
+                except Exception:
+                    continue
+                if nm and _RE_PLAIN_IDENT.match(nm):
+                    out.append(nm)
+        except Exception:
+            continue
+    return list(dict.fromkeys(out))
+
+
+def _host_enum_refs():
+    """当前 VBE 里各工程引用的类型库 -> [(名称, GUID, 主版本, 次版本), ...]。
+
+    读不到（Excel 没开 / COM 失败）返回 None —— 与"读完发现没有引用"区分开，
+    调用方据此决定要不要缓存结果。
+    """
+    try:
+        vbe = _get_vbe_cached()
+        if vbe is None:
+            return None
+        projects = []
+        try:
+            active = vbe.ActiveVBProject
+        except Exception:
+            active = None
+        if active is not None:
+            projects.append(active)
+        else:
+            try:
+                col = vbe.VBProjects
+                for i in range(1, col.Count + 1):
+                    try:
+                        projects.append(col.Item(i))
+                    except Exception:
+                        continue
+            except Exception:
+                projects = []
+        refs = []
+        seen = set()
+        for pj in projects:
+            try:
+                col = pj.References
+                n = col.Count
+            except Exception:
+                continue
+            for i in range(1, n + 1):
+                try:
+                    r = col.Item(i)
+                    key = (str(r.GUID).upper(), int(r.Major), int(r.Minor))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    refs.append((str(getattr(r, "Name", "") or ""),) + key)
+                except Exception:
+                    continue
+        return refs
+    except Exception:
+        return None
+
+
+# 宿主枚举常量的进程级缓存：加载三个类型库约 15ms，而引用清单几乎不变，
+# 所以按"引用签名"缓存 —— 用户新增/删除引用后签名一变就重新枚举一次。
+_host_enum_cache = {"key": None, "items": []}
+
+
+def host_enum_constants():
+    """工程引用的类型库里那些枚举常量 -> [(规范名, 最短输入长度), ...]。
+
+    最短输入长度 = 该库的家族前缀长度（xl / mso 各 2、3）。引擎据此要求
+    "输入至少这么长、且候选从头开始以它开头"才提示这类名字 ——
+    于是 xl -> xl*、xlu -> xlUp，而 ms 只出 MsgBox、绝不带出 mso*。
+
+    顺序稳定、已去重；取不到一律返回 []（引擎行为与旧版完全一致）。
+    """
+    if not ENABLE_HOST_ENUMS:
+        return []
+    if os.environ.get("VBECOMPLETE_NO_HOST_ENUMS", "0").strip() == "1":
+        return []
+    try:
+        refs = _host_enum_refs()
+    except Exception:
+        refs = None
+    if not refs:
+        return []
+    key = tuple(sorted(refs))
+    if _host_enum_cache["key"] == key:
+        return _host_enum_cache["items"]
+    items = []
+    fams = []
+    for name, guid, major, minor in refs:
+        members = _tlb_enum_members(guid, major, minor)
+        if not members:
+            continue
+        fam, kept = host_enum_family(members)
+        if not fam:
+            _log("host-enums: %-12s 无家族前缀 -> 整库跳过（%d 个枚举成员）"
+                 % (name, len(members)))
+            continue
+        fams.append("%s->%s(%d)" % (name, fam, len(kept)))
+        for m in kept:
+            items.append((m, len(fam)))
+    # 去重：同名的以先出现的为准（Excel 里也有 xl* 同名项）
+    uniq = {}
+    for m, ml in items:
+        uniq.setdefault(m.lower(), (m, ml))
+    out = list(uniq.values())
+    _host_enum_cache["key"] = key
+    _host_enum_cache["items"] = out
+    _log("host-enums: %d 条（%s）" % (len(out), " ".join(fams)))
+    return out
+
+
 class VbeBackend:
     def __init__(self):
         self._cache = None
@@ -1364,6 +1594,11 @@ class VbeBackend:
         # v62 语言关键字）。引擎对这批名字的模糊匹配收紧一档（纯分散命中要求
         # 输入至少 4 个字符，详见 engine.trigger 里的说明）。
         self._builtin_names = set()
+        # 宿主类型库的枚举常量（v67）：{小写名: 最短输入长度}。
+        # 只收"有家族前缀"的库（Excel -> xl*、Office -> mso*），引擎对这批名字
+        # 只认"从头开始的连续前缀"命中，且输入长度不低于家族前缀长度 ——
+        # 它们数量太大（实测 4538 条），放开跳步匹配会淹没正常候选。
+        self._host_enum_names = {}
 
     def release(self):
         """Excel/VBE 关闭或离开 VBE 时调用：清空标识符缓存并释放 COM 资源。
@@ -1377,6 +1612,7 @@ class VbeBackend:
         self._declared_by_module = {}
         self._structural_names = set()
         self._builtin_names = set()
+        self._host_enum_names = {}
         # 丢掉缓存的 VBE 对象 —— 这是 Excel 能否真正退出的关键一步。
         # 刻意【不】调 CoFreeUnusedLibraries —— 它释放不了我们持有的引用，
         # 在 Excel 关闭期间调用反而会拖慢/惊扰 COM（详见 _co_free 的说明）。
@@ -1624,6 +1860,8 @@ class VbeBackend:
         # 已经自己声明过同名时以用户的为准，那些名字【不】算内建 —— 于是引擎
         # 对它们收紧匹配时不会连用户自己的定义一起收紧。
         builtin_names = set()
+        # 宿主类型库枚举常量 -> 最短输入长度（v67），见下面的收集段。
+        host_min = {}
         try:
             for comp in _collect_components(vbe, caret_mod):
                 try:
@@ -1804,11 +2042,36 @@ class VbeBackend:
                 builtin_names.add(_kl)
                 _decl_by_mod.setdefault(_kl, set()).add(_BUILTIN_MODULE)
 
+        # ---- 宿主类型库的枚举常量（v67）----
+        # 用户报："输入 vb 会提示一堆 VBA 枚举值，输入 xl 却一个 xl 开头的枚举值
+        # 都不提示。" vb* 是 v61 收的 VBA 内建常量；xl* 属于【宿主 Excel 类型库】，
+        # 一直没收 —— 于是同一个动作用在 xl 上什么都出不来。
+        #
+        # 与内建名字同源：由工程【引用的类型库】决定存在，代码文本里从没写过
+        # xlUp 也照样该补得出来。所以四路承接完全一样（池子 / declared_names /
+        # structural_names / _decl_by_mod）—— 少任何一路，回声防护都会把
+        # "代码里从未出现过的 xlUp" 当幽灵剔掉（v60 窗体名、v61 内建函数、
+        # v62 关键字都栽在这一件事上，这是第四次）。
+        #
+        # 唯一的差别在【匹配口径】：后端把 {小写名: 最短输入长度} 交给引擎，
+        # 引擎只认"从头开始的连续前缀"且输入长度不低于该值。理由见 engine.trigger。
+        if ENABLE_HOST_ENUMS:
+            for _hname, _hmin in host_enum_constants():
+                _hl2 = _hname.lower()
+                if _hl2 in declared_names:
+                    continue
+                records.append((_hname, _HOST_ENUM_MODULE, None, False))
+                declared_names.add(_hl2)
+                structural_names.add(_hl2)
+                _decl_by_mod.setdefault(_hl2, set()).add(_HOST_ENUM_MODULE)
+                host_min[_hl2] = _hmin
+
         self._type_names = type_names
         self._declared_names = declared_names
         self._declared_by_module = _decl_by_mod
         self._structural_names = structural_names
         self._builtin_names = builtin_names
+        self._host_enum_names = host_min
         # 只在数量变化时记日志，避免每 2 秒刷一行
         if len(records) != getattr(self, "_last_id_count", -1):
             self._last_id_count = len(records)
@@ -1837,8 +2100,12 @@ class VbeBackend:
         过、现场文本又扫不到 -> 当幽灵剔掉"的规则（v60 组件名与控件名、v61 VBA
         内建名字：打 ms 要能补出从没写过的 MsgBox；v62 关键字：打 if 要能补出
         新模块里还没写过的 If）。
+
+        ⚠️ 直接交回内部集合（**只读，调用方不得修改**）：v67 收进宿主枚举常量后
+        这个集合有 4600 多条，而引擎的回声防护会对每个候选查一次 —— 每次调用都
+        复制一份的话，输入 xl（一次带出 2000 多个候选）光复制就要 2 秒。
         """
-        return set(getattr(self, "_structural_names", set()) or set())
+        return getattr(self, "_structural_names", None) or set()
 
     def get_builtin_names(self):
         """返回真正作为"语言自带词汇"收录的那些（小写集合，v61 / v62）。
@@ -1851,7 +2118,35 @@ class VbeBackend:
 
         后端不提供该接口时引擎不做任何收紧（旧式 / 测试后端行为不变）。
         """
-        return set(getattr(self, "_builtin_names", set()) or set())
+        return getattr(self, "_builtin_names", None) or set()
+
+    def get_host_enum_names(self):
+        """宿主类型库的枚举常量 -> {小写名: 最短输入长度}（v67）。
+
+        内容：工程【引用的类型库】里的枚举常量，且只收有家族前缀的库
+        （Excel 的 xl*、Office 的 mso*）。值是"该家族前缀的长度"，引擎据此
+        要求输入至少这么长、且候选从头开始以它开头才提示 ——
+        于是 xl -> xl*、xlu -> xlUp，而 ms 只出 MsgBox、绝不带出 mso*。
+
+        为什么必须单独给一份而不是并进 get_builtin_names：内建那批（400 来个）
+        是"收紧一档跳步匹配"，这批（4500 多条）得直接【只认前缀】—— 同一条
+        规则套两批名字，轻则噪音爆炸（实测输入 ms 会带出 2365 条 mso*），
+        重则把内建名字该有的跳步补全也一起砍掉。
+
+        工程里已经自己声明过同名的以用户的定义为准，那些名字不会出现在这里。
+
+        后端不提供该接口时引擎不做任何收紧（旧式 / 测试后端行为不变）。
+        约定：键已经是小写；直接交回内部字典（**只读，调用方不得修改**）——
+        它有 4500 多条，每次调用复制一份纯属浪费。
+        """
+        if not getattr(self, "_host_enum_names", None):
+            # 空就现收一次（顺带把标识符池建起来）—— __init__ 里它初始化为 {}，
+            # 光判 None 会让"还没收集过"被当成"没有宿主常量"。
+            try:
+                self.get_identifiers()
+            except Exception:
+                return {}
+        return getattr(self, "_host_enum_names", None) or {}
 
     def vbe_popup_visible(self):
         """VBE 自带的提示窗（参数信息 / 列出成员）此刻是否可见（v63）。

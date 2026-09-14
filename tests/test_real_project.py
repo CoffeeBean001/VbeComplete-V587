@@ -5030,6 +5030,245 @@ def main():
     except Exception as _e43:
         check("第 43 节异常: %s" % _e43, [True], expect_contain=[False])
 
+    # ==================================================================
+    # 44. v67：宿主类型库的枚举常量（Excel 的 xl*、Office 的 mso*）
+    #
+    # 用户报："输入 vb 会提示一堆 VBA 枚举值，输入 xl 却一个 xl 开头的枚举值
+    # 都不提示。" vb* 是 v61 收的 VBA 内建常量；xl* 属于宿主 Excel 类型库，
+    # 一直没收 —— 不是泄露，是漏收。
+    #
+    # 收进来的同时必须收紧口径：这批名字 4500 多条、全是长复合词，放开跳步
+    # 匹配的话输入 ms 会带出 2365 条 mso*、输入 count 会带出 130 条 xl*。
+    # 所以只认"从头开始的连续前缀"，且输入长度不低于家族前缀长度。
+    # ==================================================================
+    print("\n=== 44. 宿主类型库枚举常量（v67）===")
+    try:
+        import vbe_bridge as VB44
+        import engine as E44
+
+        # ---- 44.1~44.5 家族前缀推导（纯函数，不碰 Excel）----
+        _excel_like = ["xlUp", "xlDown", "xlToRight", "xlCellTypeVisible",
+                       "xlContinuous", "rgbCadetBlue", "sigdetFoo"]
+        _office_like = ["msoTrue", "msoFalse", "msoLineSolid", "msoAlignLeft",
+                        "msoCTLPush", "rgbCadetBlue", "sigdetFoo"]
+        _stdole_like = ["Unchecked", "Checked", "Gray", "Default",
+                        "Monochrome", "VgaColor", "Color"]
+        check("44.1 Excel 类库 -> 家族前缀 xl",
+              [VB44.enum_family_prefix(_excel_like)], expect_contain=["xl"])
+        check("44.2 Office 类库 -> 家族前缀 mso",
+              [VB44.enum_family_prefix(_office_like)], expect_contain=["mso"])
+        check("44.3 各说各话的库（stdole）-> 无家族前缀",
+              [VB44.enum_family_prefix(_stdole_like)], expect_contain=[""])
+        check("44.4 空清单 -> 空串（不抛）",
+              [VB44.enum_family_prefix([]), VB44.enum_family_prefix(["a"])],
+              expect_contain=["", ""])
+        _split = ["abOne", "abTwo", "cdOne", "cdTwo", "efOne"]
+        check("44.5 没有任何前缀过半 -> 空串（宁可整库不要，也不放通用词进来）",
+              [VB44.enum_family_prefix(_split)], expect_contain=[""])
+
+        # ---- 44.6~44.7 家族过滤 + 白名单 ----
+        _fam, _kept = VB44.host_enum_family(_excel_like)
+        check("44.6 host_enum_family 只留家族成员（%r）" % (_kept,),
+              [_fam, sorted(_kept), "rgbCadetBlue" in _kept],
+              expect_contain=["xl", ["xlCellTypeVisible", "xlContinuous",
+                                     "xlDown", "xlToRight", "xlUp"], False])
+        _old_fam44 = VB44._HOST_ENUM_FAMILIES
+        VB44._HOST_ENUM_FAMILIES = ("zz",)
+        try:
+            _wf44 = VB44.host_enum_family(_excel_like)
+        finally:
+            VB44._HOST_ENUM_FAMILIES = _old_fam44
+        check("44.7 白名单不含 xl -> 整库跳过（用于只想留某个家族）",
+              [_wf44], expect_contain=[("", [])])
+
+        # ---- 44.8~44.9 真机：真能枚举出引用类型库的枚举常量 ----
+        # ⚠️ 必须单独加载一份干净的 vbe_bridge 来跑这一节：本文件前面的小节把
+        # `VB._get_vbe_cached` 打桩成了假 VBE（第 31/33 节），桩没还原，真机
+        # 接口在那儿只会读到假工程（引用清单为空 -> 枚举出 0 条）。
+        # 用 importlib 重新 exec 一份独立实例，验的就是真实链路。
+        _fresh44 = None
+        try:
+            import importlib.util as _iu44
+            _spec44 = _iu44.spec_from_file_location(
+                "vbe_bridge_fresh44",
+                os.path.join(os.path.dirname(os.path.dirname(
+                    os.path.abspath(__file__))), "vbe_bridge.py"))
+            _fresh44 = _iu44.module_from_spec(_spec44)
+            _spec44.loader.exec_module(_fresh44)
+        except Exception:
+            _fresh44 = None
+        _VB44R = _fresh44 or VB44
+        try:
+            _items44 = _VB44R.host_enum_constants()
+            _mins44 = sorted({m for _n, m in _items44})
+            _nxl44 = len([1 for n, _m in _items44 if n.lower().startswith("xl")])
+            _nms44 = len([1 for n, _m in _items44 if n.lower().startswith("mso")])
+            _ok44 = (isinstance(_items44, list)
+                     and all(m >= 2 for _n, m in _items44)
+                     and _nxl44 >= 1000 and _nms44 >= 1000
+                     and all(n.lower().startswith(("xl", "mso"))
+                             for n, _m in _items44))
+            _desc44 = "共 %d 条，xl*=%d mso*=%d，最短输入长度=%s" % (
+                len(_items44), _nxl44, _nms44, _mins44)
+        except Exception as _e44:
+            _ok44, _desc44 = "异常: %s" % _e44, ""
+        check("44.8 真机：枚举出 %s" % (_desc44,), [_ok44], expect_contain=[True])
+
+        _hm44 = None
+        try:
+            _hm44 = _VB44R.VbeBackend().get_host_enum_names()
+            _okhm44 = (isinstance(_hm44, dict) and _hm44.get("xlup") == 2
+                       and _hm44.get("msotrue") == 3)
+        except Exception as _e44b:
+            _okhm44 = "异常: %s" % _e44b
+        check("44.9 后端 get_host_enum_names() -> 小写名到最短长度的字典",
+              [_okhm44], expect_contain=[True])
+
+        # ---- 44.10~44.15 引擎接线：前缀专用通道 ----
+        _HOST44 = {"xlup": 2, "xlcellvalue": 2, "xldown": 2, "xltoright": 2,
+                   "msotrue": 3, "msofalse": 3}
+        _POOL44 = [("xlUp", "宿主库", None, False),
+                   ("xlCellValue", "宿主库", None, False),
+                   ("xlDown", "宿主库", None, False),
+                   ("xlToRight", "宿主库", None, False),
+                   ("msoTrue", "宿主库", None, False),
+                   ("msoFalse", "宿主库", None, False),
+                   ("numArr", "M1", None, False),
+                   ("countRows", "M1", None, False),
+                   ("cellText", "M1", None, False)]
+
+        class _B44(_B40Base):
+            """宿主枚举常量的现场：池子里既有宿主常量，也有用户自己的名字。"""
+
+            def __init__(self, word="xl", host=True, hook=True, **kw):
+                self._word, self._host, self._hook = word, host, hook
+                self.struct_calls = 0
+
+            def _line(self):
+                return "    " + self._word
+
+            def get_context(self):
+                _ln = self._line()
+                return {"line_no": 3, "caret_col": len(_ln) + 1,
+                        "line_text": _ln, "in_string": False,
+                        "in_comment": False, "in_type_position": False,
+                        "in_decl_position": False, "decl_names": [],
+                        "proc_name": None, "module_name": "M1"}
+
+            def get_identifiers(self):
+                return list(_POOL44)
+
+            def get_declared_names(self):
+                return [r[0].lower() for r in _POOL44]
+
+            def declared_elsewhere(self, name, module_name):
+                return str(name).lower() in [r[0].lower() for r in _POOL44]
+
+            def get_structural_names(self):
+                self.struct_calls += 1
+                return [r[0].lower() for r in _POOL44]
+
+            def get_builtin_names(self):
+                return []
+
+            def get_type_names(self):
+                return []
+
+            def names_outside_caret(self, caret, scope_only=False):
+                return set()
+
+            def get_host_enum_names(self):
+                if not self._hook:
+                    raise RuntimeError("boom")
+                return dict(_HOST44) if self._host else {}
+
+        def _trig44(cls=_B44, **kw):
+            _be = cls(**kw)
+            _ui = _UI40()
+            _c = E44.Completer(_be, _ui)
+            _c.trigger(True)
+            return sorted(_c.matches or []), _ui.shown, _be.struct_calls
+
+        _h44, _v44, _c44 = _trig44(word="xl")
+        check("44.10 输入 xl -> 出 xl* 家族（★用户点名要的），不出 mso*",
+              [_v44, _h44, any(m.lower().startswith("mso") for m in _h44)],
+              expect_contain=[True, ["xlCellValue", "xlDown", "xlToRight",
+                                     "xlUp"], False])
+        check("44.11 输入 xlu -> 只出 xlUp（前缀命中）",
+              [_trig44(word="xlu")[0]], expect_contain=[["xlUp"]])
+        check("44.12 输入 ms -> 只出 mso*，不出别的；输入 mso 才出 mso*",
+              [_trig44(word="ms")[0], _trig44(word="mso")[0]],
+              expect_contain=[[], ["msoFalse", "msoTrue"]])
+        check("44.13 输入 count / cell -> 一条 xl* 都不多出（★防噪音核心）",
+              [_trig44(word="count")[0], _trig44(word="cell")[0]],
+              expect_contain=[["countRows"], ["cellText"]])
+
+        class _B44No(_B44):
+            """更老的桩后端：连 get_host_enum_names 这个接口都没有。"""
+            get_host_enum_names = None
+
+        _nb44 = _trig44(cls=_B44No, word="cell")[0]
+        check("44.14 老后端（不提供该接口）-> 退回普通模糊匹配"
+              "（cell 照样命中 xlCellValue，行为与 v66 完全一致）",
+              [_nb44, _trig44(word="cell")[0]],
+              expect_contain=[["cellText", "xlCellValue"], ["cellText"]])
+        _boom44 = _trig44(word="xlu", hook=False)[0]
+        check("44.15 接口抛异常 -> 不崩，且与「没有该接口」同行为（%r）"
+              % (_boom44,),
+              [_boom44 == _trig44(cls=_B44No, word="xlu")[0],
+               "xlUp" in _boom44], expect_contain=[True, True])
+
+        # ---- 44.16 结构性名字集合按一次触发取一份（v67 性能护栏）----
+        # 修复前每个回声候选都重建一次集合；池子涨到 4600 多条后，
+        # 输入 xl（一次 2000 多个候选）光这一步就要 2 秒（真机实测 2135ms）。
+        check("44.16 一次触发里 get_structural_names() 只取一次（实际 %d 次）"
+              % (_c44,), [_c44], expect_contain=[1])
+
+        # ---- 44.17 诊断段受日志开关约束（否则每次触发多跑一遍全池匹配）----
+        _orig_fm44, _orig_log44 = E44.fuzzy_match, E44._LOG_ENABLED
+        _cnt44 = [0]
+
+        def _fm44(name, query):
+            _cnt44[0] += 1
+            return _orig_fm44(name, query)
+
+        try:
+            E44.fuzzy_match = _fm44
+            E44._LOG_ENABLED = False
+            _cnt44[0] = 0
+            _trig44(word="xl")
+            _off44 = _cnt44[0]
+            E44._LOG_ENABLED = True
+            _cnt44[0] = 0
+            _trig44(word="xl")
+            _on44 = _cnt44[0]
+        finally:
+            E44.fuzzy_match, E44._LOG_ENABLED = _orig_fm44, _orig_log44
+        # 关日志：只有 3 个非宿主名字走模糊匹配；开日志：多跑一遍全池（9 条）
+        check("44.17 关日志时诊断段不跑（模糊匹配 %d 次 vs 开日志 %d 次）"
+              % (_off44, _on44), [_off44, _on44], expect_contain=[3, 12])
+
+        # ---- 44.18 vbe_bridge 收集段接线护栏 ----
+        try:
+            import inspect as _inspect44
+            _src44 = _inspect44.getsource(VB44)
+            _okwire44 = all(k in _src44 for k in (
+                "ENABLE_HOST_ENUMS", "VBECOMPLETE_NO_HOST_ENUMS",
+                "host_enum_constants()", "_HOST_ENUM_MODULE",
+                "_host_enum_names = host_min", "def get_host_enum_names",
+                "def enum_family_prefix", "def host_enum_family",
+                "def _tlb_enum_members"))
+        except Exception as _e44c:
+            _okwire44 = "异常: %s" % _e44c
+        check("44.18 vbe_bridge 收集段四路承接 + 开关 + 家族推导都在",
+              [_okwire44], expect_contain=[True])
+        check("44.19 坏 GUID -> 返回空清单、不抛",
+              [VB44._tlb_enum_members("{00000000-0000-0000-0000-000000000000}",
+                                      9, 9)],
+              expect_contain=[[]])
+    except Exception as _e44x:
+        check("第 44 节异常: %s" % _e44x, [True], expect_contain=[False])
+
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))
     if FAILURES:

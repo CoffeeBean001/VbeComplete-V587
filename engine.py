@@ -28,6 +28,7 @@ import re
 import time
 
 from log import log as _log
+from log import LOG_ENABLED as _LOG_ENABLED
 
 # VBE 自带提示列表的让位开关（v55）。
 #
@@ -565,6 +566,8 @@ class Completer:
         # 多余的排在窗口外，靠上下键/滚轮滚动查看。view_top 是当前窗口的起始下标。
         self.view_rows = max(1, int(view_rows or VIEW_ROWS))
         self.view_top = 0
+        # 结构性名字的本次触发缓存（v67）。见 _structural_names 的说明。
+        self._struct_cache = None
 
     def _clamp_top(self):
         """把窗口起点夹到合法区间（不能越过列表末尾）。"""
@@ -834,14 +837,31 @@ class Completer:
         _name_really_exists）。
 
         可选接口；后端不提供时返回空集，旧式/测试后端行为完全不变。
+
+        ⚠️ v67：结果按【一次触发】缓存。回声防护会对每个候选问一次
+        _name_really_exists()，而它第一步就要查这个集合 —— 候选一多就是
+        O(候选数 × 集合大小)。v67 收进宿主枚举常量后集合涨到 4600 多条，
+        输入 xl 这种会一次带出 2000 多个候选，逐次重建集合直接拖到 2 秒
+        （真机实测 2135ms）。触发入口处会把它置空，所以每次触发仍然是最新
+        快照（候选池本身按 _CACHE_TTL 刷新，刷新粒度不变）。
         """
+        if self._struct_cache is not None:
+            return self._struct_cache
         hook = getattr(self.backend, "get_structural_names", None)
         if not callable(hook):
-            return set()
+            self._struct_cache = set()
+            return self._struct_cache
         try:
-            return set(str(n).lower() for n in (hook() or ()))
+            got = hook()
         except Exception:
-            return set()
+            got = None
+        # 后端直接交出内部集合时不复制 —— 复制一份 4600 条的集合在每个候选上
+        # 各来一遍，正是上面那个 2 秒的来源。
+        if isinstance(got, (set, frozenset)):
+            self._struct_cache = got
+        else:
+            self._struct_cache = set(str(n).lower() for n in (got or ()))
+        return self._struct_cache
 
     def _builtin_names(self):
         """后端给出的"VBA 语言自带名字"集合（小写）。可选接口。
@@ -859,6 +879,30 @@ class Completer:
             return set(str(n).lower() for n in (hook() or ()))
         except Exception:
             return set()
+
+    def _host_enum_names(self):
+        """后端给出的"宿主类型库枚举常量" -> {小写名: 最短输入长度}。可选接口。
+
+        v67。用户报"输入 vb 会提示一堆 VBA 枚举值，输入 xl 却一个 xl 开头的
+        都不提示"：vb* 是 v61 收的 VBA 内建常量，xl* 属于宿主 Excel 类型库，
+        一直没收。收进来的同时必须收紧匹配口径 —— 这批名字数量极大
+        （实测 Excel + Office 共 4538 条），若像工程内名字那样接受跳步匹配，
+        三四个字母的输入就能带出几百条无关项（实测 输入 ms -> 2365 条 mso*，
+        输入 count -> 130 条、输入 cell -> 174 条）。所以这批【只认前缀】：
+        候选必须从头开始以所输的词开头，且输入长度不低于家族前缀长度
+        （xl / mso）。详见 trigger 里的快速路径。
+
+        后端不提供时返回 {} -> 不做任何限制（旧式 / 测试后端行为完全不变）。
+        约定：后端给的键必须已经是小写（VbeBackend 就是这么给的）。
+        """
+        hook = getattr(self.backend, "get_host_enum_names", None)
+        if not callable(hook):
+            return {}
+        try:
+            got = hook()
+        except Exception:
+            return {}
+        return got if isinstance(got, dict) else {}
 
     def _vbe_popup_showing(self):
         """VBE 自带的【成员列表】此刻是否显示着 —— 是则我们让位（v63→v65）。可选接口。
@@ -918,6 +962,9 @@ class Completer:
         # 刚确认过补全：静默期内不再弹，避免"收起后立刻又冒出来"
         if time.time() < self._suppress_until:
             return
+        # 结构性名字的集合按"一次触发"取一份快照（v67）：本次触发里所有回声
+        # 判定复用同一份，别再逐个候选重建（那会退化成 O(候选数 × 集合大小)）。
+        self._struct_cache = None
         ctx = self.backend.get_context()
         if ctx is None:
             self.hide()
@@ -984,10 +1031,47 @@ class Completer:
         # "命中越靠前 / 跨度越小 / 名字越短"越好——保证最像的那个永远排第一，
         # 不会因为放开模糊匹配就让列表变成一锅粥。
         scored = []
-        for i in visible_ids:
-            r = fuzzy_match(i, word)
-            if r is not None:
-                scored.append((r[0], i, r[1]))
+        # v67：宿主类型库的枚举常量（xl* / mso* …）走【前缀专用】通道。
+        #
+        # 为什么不能跟工程内名字一起丢进 fuzzy_match：这批名字有 4500 多条、
+        # 全是长复合词，任何三四个字母都能在里面凑出子序列。实测（真实工程）：
+        #   输入 ms    -> 2365 条 mso*（用户要的其实是 MsgBox）
+        #   输入 count -> 130 条 xlCount / xlCountryCode …
+        #   输入 cell  -> 174 条 xlCell*
+        #   输入 open  -> 492 条
+        # 全是噪音，而用户口径是"宁可少提示，也不要噪音"。
+        #
+        # 所以这批只用【从头开始的连续前缀】命中，且输入长度不低于家族前缀长度
+        # （后端给的下限：xl 是 2、mso 是 3）：
+        #   xl / xlu / xlup -> xlUp 家族          ✓ 用户点名要的
+        #   ms              -> 只出 MsgBox         ✓ mso* 被前缀长度挡在外面
+        #   count / cell    -> 一条都不多出        ✓
+        #
+        # 顺带一个性能好处：前缀命中不必跑 _word_boundaries（正则），4500 个名字
+        # 各跑一遍会把每次按键拖到 ~10ms，走快捷路径实测 ~2.8ms。
+        host_min = self._host_enum_names()
+        if not host_min:
+            for i in visible_ids:
+                r = fuzzy_match(i, word)
+                if r is not None:
+                    scored.append((r[0], i, r[1]))
+        else:
+            _lw = len(word)
+            _qlow = word.lower()
+            _hits = list(range(_lw))
+            for i in visible_ids:
+                _low = i.lower()
+                _need = host_min.get(_low, 0)
+                if _need:
+                    if _lw < _need or not _low.startswith(_qlow):
+                        continue
+                    # 前缀命中：kind 3（前缀）/ 4（完全相同），命中位置从 0 起
+                    _kind = 4 if _lw == len(_low) else 3
+                    scored.append(((_kind, 0, -_lw, -len(_low)), i, _hits))
+                    continue
+                r = fuzzy_match(i, word)
+                if r is not None:
+                    scored.append((r[0], i, r[1]))
         # v61：VBA 内建名字（内建函数 / 常量 / 数据类型）+ v62 语言关键字，
         # 单独收紧一档匹配。
         #
@@ -1149,18 +1233,25 @@ class Completer:
         # 真实存在的名字打全了就该继续提示，与打前缀行为一致。
         # 诊断：把"原始记录里有哪些同名命中、各属于哪个模块/过程"一并记下，
         # 这样日志能直接区分是"压根没收录"还是"收录了但被作用域过滤掉"。
-        _log("trigger: line=%s col=%s word=%r proc=%r module=%r visible=%d matches=%r"
-             % (ctx.get("line_no"), ctx.get("caret_col"), word,
-                ctx.get("proc_name"), ctx.get("module_name"),
-                len(visible_ids), matches))
-        try:
-            hits = [r for r in self.backend.get_identifiers()
-                    if fuzzy_match(str(r[0]), word) is not None]
-            _log("  raw hits for %r: %s" % (word, hits[:40]))
-            _log("  hit positions: %s" % ({k: v for k, v in
-                                           list(self.match_hits.items())[:10]},))
-        except Exception:
-            pass
+        #
+        # ⚠️ v67：这一段的开销与【候选池大小】成正比（它对全池再跑一遍
+        # fuzzy_match，含正则分词）。池子 367 条时约 0.7ms，无所谓；v67 收进
+        # 4500 多条宿主枚举常量后变成 ~18ms/次 —— 而它唯一的用途就是喂日志。
+        # 所以只在开着日志（run_debug.bat）时才跑；日常使用完全不付这份开销。
+        if _LOG_ENABLED:
+            _log("trigger: line=%s col=%s word=%r proc=%r module=%r"
+                 " visible=%d matches=%r"
+                 % (ctx.get("line_no"), ctx.get("caret_col"), word,
+                    ctx.get("proc_name"), ctx.get("module_name"),
+                    len(visible_ids), matches))
+            try:
+                hits = [r for r in self.backend.get_identifiers()
+                        if fuzzy_match(str(r[0]), word) is not None]
+                _log("  raw hits for %r: %s" % (word, hits[:40]))
+                _log("  hit positions: %s" % (
+                    {k: v for k, v in list(self.match_hits.items())[:10]},))
+            except Exception:
+                pass
         if not matches:
             self.hide()
             return
