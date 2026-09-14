@@ -545,6 +545,31 @@ def _longest_run(positions):
     return best
 
 
+def _env_int(name, default):
+    """环境变量给整数阈值（未设置 / 认不出 -> default）。"""
+    try:
+        return int(str(os.environ.get(name, "")).strip())
+    except Exception:
+        return default
+
+
+# v71：内建"公共词汇"（内建函数 / 数据类型 / 语言关键字）在 **2~3 字符短输入**下，
+# 允许"跳步命中"的最低输入长度门槛。
+#
+#   2（默认）—— 2~3 字符也接受跳步命中，但**首字母必须与候选名的首字母相同**
+#               （`ve` -> VarType 可以；`xl` -> Explicit 不行）。
+#   4         —— 旧口径（v61~v70）：2~3 字符只留 精确/前缀/词首缩略/连续块 命中，
+#               任何跳步命中一律挡掉。`set VBECOMPLETE_BUILTIN_SCATTER_MIN=4` 即可。
+#
+# ⚠️ 只影响 2~3 字符；4 个字符以上的输入两种口径下完全一样。
+#
+# 为什么现在敢放宽：v70 把内置枚举（vb* / xl* / mso*）默认关掉之后，真机候选池
+# 从 5000+ 条掉到 265 条，而 v61 当年收紧正是为了压住那批超长枚举名带来的噪音
+# （"vbc 冒 29 条、22 条是碰巧凑出来的"）。实测放宽后只多出几条，且全部落在
+# kind 0 档，不会顶掉任何精确 / 前缀 / 连续命中；耗时零变化。
+BUILTIN_SCATTER_MIN = _env_int("VBECOMPLETE_BUILTIN_SCATTER_MIN", 2)
+
+
 def _name_exists_outside_caret(backend, word, line_no, caret_col):
     """把光标处的词抹掉之后，这个 name 在工程里还存不存在。
 
@@ -1143,34 +1168,57 @@ class Completer:
                 r = fuzzy_match(i, word)
                 if r is not None:
                     scored.append((r[0], i, r[1]))
-        # v61：VBA 内建名字（内建函数 / 常量 / 数据类型）+ v62 语言关键字，
-        # 单独收紧一档匹配。
+        # v61：VBA 内建名字（内建函数 / 数据类型）+ v62 语言关键字这一批，当年
+        # 单独收紧过一档匹配：kind >= 1（连续块 / 词首缩略 / 前缀 / 精确）放行，
+        # 纯分散命中（kind == 0）要求输入至少 4 个字符。
         #
-        # 它们是【语言自带的公共词汇】，近 400 个，而且几乎任何字母组合都能在
-        # 里面凑出子序列；若与"你自己工程里的名字"一样接受跳步匹配，任何 1~3 个
-        # 字符的输入都会冒出一大串无关项 —— 真机实测（候选池 373 条）：
-        #   输入 ar  -> vbAbortRetryIgnore / VarType / Partition 全挤进列表；
-        #   输入 vbc -> 29 条，其中 22 条是这种"碰巧凑得出"的。
+        # 【当年为什么要收紧】这批"语言自带的公共词汇"有近 400 个，里面还夹着
+        # vbAbortRetryIgnore 这类超长枚举名 —— 几乎任何两三个字母都能在里面凑出
+        # 子序列（输入 vbc 会冒出 29 条，其中 22 条是"碰巧凑得出"的）。
         #
-        # 收紧规则：kind >= 1（连续块 / 词首缩略 / 前缀 / 精确）一律放行，纯分散
-        # 命中（kind == 0）则要求输入至少 4 个字符。效果：
-        #   ms / msg -> MsgBox           （前缀）      照常
-        #   vbc      -> vbCrLf           （前缀）      照常
-        #   spli     -> Split            （前缀）      照常
-        #   instrr   -> InStrRev         （连续块）    照常
-        #   formcur  -> FormatCurrency   （跳步，7 字符）照常
-        #   slct     -> Select           （跳步，4 字符）照常
-        #   ar       -> vbAbortRetryIgnore（跳步，2 字符）被挡掉 —— 正是要滤掉的噪音
-        # 这条只作用于【内建公共词汇】；你自己工程里的名字不受限
+        # 【v71 放宽】那个前提已经不成立了：
+        #   1) v70 起内置枚举默认就不收了（vb* 102 条 + 宿主 xl* / mso* 4538 条），
+        #      真机候选池从 5000+ 掉到 265 条（261 内建 + 你工程自己的名字）；
+        #   2) 真机实测（同一套池子对跑，详见 2026-09-15.md）：
+        #        ve -> 10 条 -> 13 条，VarType 第 11 位（一屏 15 行，看得见）
+        #        vr ->  0 条 ->  2 条，VarType 第 1 位
+        #        ce -> 3 -> 14   le 17 -> 21   re 19 -> 22   ar 10 -> 12
+        #        ms ->  1 条（仍是 MsgBox 一条）xl -> 0 条
+        #      多出来的全部落在 kind 0（分散）档 —— 精确 / 前缀 / 词首缩略 / 连续块
+        #      命中的候选**一个都不会被顶掉**，排序不变式不受影响；
+        #   3) 耗时零成本：0.71ms vs 0.69ms（真机池 265 条），
+        #      565 条时 1.65ms vs 1.65ms —— 匹配本来就在 1ms 量级，瓶颈在 COM。
+        #
+        # 于是放宽成【两条同时满足】：
+        #   a) 输入至少 2 个字符（BUILTIN_SCATTER_MIN）—— 单字符输入本来就只有连续
+        #      命中，够不着这条规则；且
+        #   b) **跳着打的时候，第一个字母必须是候选名的首字母** —— `ve` -> VarType
+        #      （v 开头、后面还有个 e）放行，而 `xl` -> Explicit（x 不在开头）、
+        #      `ms` -> Implements（m 不在开头）一律挡掉。
+        #      实测这条闸门把噪音砍掉一半（ce 21->14、re 35->22、le 32->21），
+        #      而用户要的 ve / vr -> VarType 一位不差 —— 它不只是更安静，也更合理：
+        #      "你说的那个名字确实以这个字母打头"。
+        # ⚠️ 只管 2~3 字符：**4 个字符以上的输入一字不动**（还是 v61 起的老行为），
+        #    免得动到已经调好的长输入路径。
+        # 想整个回到旧口径（2~3 字符也只留连续/前缀/词首命中 = v61~v70）：
+        #   set VBECOMPLETE_BUILTIN_SCATTER_MIN=4
+        #
+        # 这条只作用于【内建公共词汇】；你自己工程里的名字一直不受限
         # （getse3 -> getSettingTitle3 照旧）。
-        #
-        # v62 起语言关键字与内建名字【共用这一档】（后端 get_builtin_names 把两者
-        # 一并给出）：关键字同样是"打前缀就能补全"的用法，没有理由区别对待。
         if len(word) < 4:
             _bl = self._builtin_names()
             if _bl:
-                scored = [t for t in scored
-                          if t[0][0] >= 1 or t[1].lower() not in _bl]
+                if len(word) < BUILTIN_SCATTER_MIN:
+                    # 单字符：只留连续 / 前缀 / 词首缩略命中（其实单字符本来就只有
+                    # 连续命中，这一档是留给"把阈值调大 = 回到旧口径"用的）
+                    scored = [t for t in scored
+                              if t[0][0] >= 1 or t[1].lower() not in _bl]
+                else:
+                    # 2~3 字符（v71 放宽）：允许跳步，但首字母必须对齐
+                    _w0 = word[0].lower()
+                    scored = [t for t in scored
+                              if t[0][0] >= 1 or t[1].lower() not in _bl
+                              or t[1].lower().startswith(_w0)]
         # sorted 稳定：同分时保持后端原来的顺序
         scored.sort(key=lambda t: t[0], reverse=True)
         matches = [name for _, name, _ in scored]

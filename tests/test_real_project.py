@@ -3984,13 +3984,21 @@ def main():
         check("38.12 同名候选只保留一条（实得 %d 条）" % len(_vis38),
               [len(_vis38) == 1], expect_contain=[True])
 
-        # 38.13~38.15：内建名字的匹配收紧一档（防噪音）
-        check("38.13 短输入 msb（跳步，3 字符）不冒内建名",
+        # 38.13~38.15：内建名字的匹配收紧档（v61 加、**v71 放宽到"实际不再收紧"**）
+        # v71 起"纯分散命中"的最低输入长度 = BUILTIN_SCATTER_MIN(2) —— 3 字符的
+        # 跳步输入也能命中；把阈值调回 4 就复现旧口径（38.14 就是这么对照的）。
+        _sm38 = E.BUILTIN_SCATTER_MIN
+        try:
+            E.BUILTIN_SCATTER_MIN = 4
+            _strict38 = _trig38("msb", elsewhere=True)
+        finally:
+            E.BUILTIN_SCATTER_MIN = _sm38
+        check("38.13 v71：3 字符跳步输入 msb -> 提示 MsgBox（阈值已从 4 放到 2）",
               _trig38("msb", elsewhere=True),
-              expect_absent=["MsgBox"])
-        check("38.14 对照：不收紧时 msb 命中 MsgBox（说明规则真在起作用）",
-              _trig38("msb", elsewhere=True, builtin=False),
-              expect_contain=["MsgBox"])
+              expect_contain=["MsgBox"], expect_absent=["msgGhost"])
+        check("38.14 对照：阈值调回 4（旧口径）-> 同样的 msb 被挡掉"
+              "（说明这条规则确实在起作用）",
+              _strict38, expect_absent=["MsgBox"])
         check("38.15 前缀命中不受收紧影响（ms -> MsgBox）",
               _trig38("ms", elsewhere=True),
               expect_contain=["MsgBox"])
@@ -4257,12 +4265,19 @@ def main():
         check("39.10 关键字在别的模块也提示（按模块级 priv=False 收录）",
               _trig39("di", structural=True, elsewhere=True, module="模块3"),
               expect_contain=["Dim"])
-        check("39.11 短输入 dm（跳步，2 字符）不冒关键字（收紧规则同内建名）",
-              _trig39("dm", elsewhere=True),
-              expect_absent=["Dim"])
-        check("39.12 对照：不收紧时 dm 命中 Dim（说明规则真在起作用）",
-              _trig39("dm", elsewhere=True, builtin=False),
-              expect_contain=["Dim"])
+        # v71：关键字与内建名字共用这一档，阈值放到 2 之后 2 字符的跳步输入也能命中；
+        # 调回 4 即复现 v61~v70 的旧口径（39.12 就是那个对照）。
+        _sm39 = E.BUILTIN_SCATTER_MIN
+        try:
+            E.BUILTIN_SCATTER_MIN = 4
+            _strict39 = _trig39("dm", elsewhere=True)
+        finally:
+            E.BUILTIN_SCATTER_MIN = _sm39
+        check("39.11 v71：2 字符跳步输入 dm -> 提示 Dim（阈值已从 4 放到 2）",
+              _trig39("dm", elsewhere=True), expect_contain=["Dim"])
+        check("39.12 对照：阈值调回 4（旧口径）-> 同样的 dm 被挡掉"
+              "（说明这条规则确实在起作用）",
+              _strict39, expect_absent=["Dim"])
 
         # 39.13~39.16：真实 VbeBackend 全链路（临时把两个开关都打开）
         _saved39 = (VB39R.ENABLE_VBA_BUILTINS, VB39R.ENABLE_VBA_KEYWORDS)
@@ -5867,6 +5882,162 @@ def main():
               [_okwire47], expect_contain=[True])
     except Exception as _e47:
         check("第 47 节异常: %s" % _e47, [True], expect_contain=[False])
+
+    # ==================================================================
+    # 48. v71：公共词汇的"纯分散命中"阈值 4 -> 2（池子小了，可以放宽了）
+    #
+    # 背景：v61 收紧这一档，是因为当年内建清单近 400 条、还夹着 vbAbortRetryIgnore
+    # 这类超长枚举名 —— 两三个字母就能凑出一大串。v70 把内置枚举默认关掉之后，
+    # 真机池子掉到 265 条（261 内建 + 工程自己的名字），那个前提没了。
+    #
+    # 真机实测（详见当日日志 2026-09-15.md）：
+    #   ve 10->15 条（VarType 第 11 位）   vr 0->7 条（第 1 位）
+    #   se 30->41   ce 3->21   ar 10->21   ms 1->4（MsgBox 仍是第 1）
+    #   耗时 0.71ms vs 0.69ms（零成本）
+    #
+    # 这一节用【确定性池子】（内建清单 + 两个工程名）守三件事，不依赖 Excel：
+    #   1) 目标真浮上来了（ve / vr -> VarType 在一屏内）；
+    #   2) ★排序不变式：阈值 4 的候选列表必须是阈值 2 的【子序列】——
+    #      放宽只是"往后追加"，绝不会重排、不会顶掉原有首选；
+    #   3) 代价可度量：单字符输入与"完全不收紧"逐条一致；fuzzy_match 调用次数
+    #      两次完全相同（放宽不花额外匹配），耗时也在毫秒级。
+    # ==================================================================
+    print("\n=== 48. 公共词汇的分散命中阈值 4 -> 2（v71）===")
+    try:
+        import vba_builtins as VB48
+        import inspect as _inspect48
+        import time as _t48
+
+        _POOL48 = []
+        for _seq in (VB48.BUILTIN_FUNCTIONS, VB48.BUILTIN_TYPE_NAMES,
+                     VB48.BUILTIN_KEYWORDS):
+            _POOL48 += [(n, "VBA", None, False) for n in _seq]
+        _POOL48 += [("numArr", "模块1", None, False),
+                    ("countRows", "模块1", None, False)]
+        _bl48 = set(r[0].lower() for r in _POOL48)
+
+        class _B48(object):
+            def __init__(self, word):
+                self._word = word
+
+            def get_context(self):
+                _ln = "    " + self._word
+                return {"line_no": 1, "line_text": _ln,
+                        "caret_col": len(_ln) + 1, "in_string": False,
+                        "in_comment": False, "in_type_position": False,
+                        "in_decl_position": False, "decl_names": [],
+                        "proc_name": None, "module_name": "模块1"}
+
+            def get_identifiers(self):
+                return list(_POOL48)
+
+            def get_declared_names(self):
+                return sorted(_bl48)
+
+            def declared_elsewhere(self, name, module_name):
+                return str(name).lower() in _bl48
+
+            def get_structural_names(self):
+                return sorted(_bl48)
+
+            def get_builtin_names(self):
+                return set(_bl48)
+
+            def get_type_names(self):
+                return list(VB48.BUILTIN_TYPE_NAMES)
+
+            def get_host_enum_names(self):
+                return {}
+
+            def names_outside_caret(self, caret, scope_only=False):
+                return set()
+
+            def apply_completion(self, *a, **k):
+                return None
+
+        class _UI48(object):
+            def show(self, rows, sel, c):
+                pass
+
+            def hide(self):
+                pass
+
+            def update_selection(self, sel):
+                pass
+
+            def contains_point(self, x, y):
+                return False
+
+        def _trig48(word, scatter_min=None, count_fm=False):
+            _sm = E.BUILTIN_SCATTER_MIN
+            _ofm = E.fuzzy_match
+            _cnt = [0]
+            if scatter_min is not None:
+                E.BUILTIN_SCATTER_MIN = scatter_min
+            if count_fm:
+                def _fm(n, q):
+                    _cnt[0] += 1
+                    return _ofm(n, q)
+                E.fuzzy_match = _fm
+            _c = None
+            try:
+                _c = E.Completer(_B48(word), _UI48())
+                _t0 = _t48.perf_counter()
+                _c.trigger()
+                _dt = (_t48.perf_counter() - _t0) * 1000
+            finally:
+                E.BUILTIN_SCATTER_MIN = _sm
+                E.fuzzy_match = _ofm
+            return list((_c.matches if _c else None) or []), _dt, _cnt[0]
+
+        check("48.1 默认口径：BUILTIN_SCATTER_MIN == 2，且可用环境变量调回去",
+              [E.BUILTIN_SCATTER_MIN,
+               "VBECOMPLETE_BUILTIN_SCATTER_MIN" in _inspect48.getsource(E)],
+              expect_contain=[2, True])
+
+        _ve, _tve, _ = _trig48("ve")
+        _ve4, _, _ = _trig48("ve", scatter_min=4)
+        check("48.2 ★ve -> VarType 浮上来且在一屏内（放宽后 %d 条，第 %s 位；"
+              "阈值 4 时 %s）"
+              % (len(_ve), (_ve.index("VarType") + 1) if "VarType" in _ve
+                 else "-", "也有" if "VarType" in _ve4 else "没有"),
+              ["VarType" in _ve, "VarType" not in _ve4],
+              expect_contain=[True, True])
+
+        _vr, _, _ = _trig48("vr")
+        check("48.3 vr -> VarType 稳居第 1 位（%d 条；分散命中里"
+              "命中越靠前越优先）" % len(_vr),
+              [_vr[:1]], expect_contain=[["VarType"]])
+
+        # ★排序不变式：收紧版是放宽版的子序列 ⇒ 放宽只"往后追加"
+        _it48 = iter(_ve)
+        check("48.4 ★排序不变式：阈值 4 的候选列表是阈值 2 的【子序列】"
+              "（放宽只追加、不重排、不顶掉首选）",
+              [all(x in _it48 for x in _ve4)], expect_contain=[True])
+        check("48.5 首选没被顶掉：ms -> 第 1 个仍是 MsgBox（前缀优先）",
+              [_trig48("ms")[0][:1]], expect_contain=[["MsgBox"]])
+
+        # 单字符输入：与"完全不收紧"（_builtin_names 打桩成空集）逐条一致
+        _e1, _, _ = _trig48("e")
+        _obl48 = E.Completer._builtin_names
+        E.Completer._builtin_names = lambda self: set()
+        try:
+            _e2, _, _ = _trig48("e")
+        finally:
+            E.Completer._builtin_names = _obl48
+        check("48.6 单字符输入不受影响（e：%d 条，与「完全不收紧」逐条一致 ——"
+              " 这条规则只管 2~3 字符）" % len(_e1),
+              [_e1 == _e2, len(_e1) > 0], expect_contain=[True, True])
+
+        # 代价：放宽不花额外匹配，耗时毫秒级
+        _, _t2, _n2 = _trig48("ve", scatter_min=2, count_fm=True)
+        _, _t4, _n4 = _trig48("ve", scatter_min=4, count_fm=True)
+        check("48.7 代价：fuzzy_match 调用次数两次相同（%d = %d），"
+              "耗时 %.2fms / %.2fms（池子 %d 条）"
+              % (_n2, _n4, _t2, _t4, len(_POOL48)),
+              [_n2 == _n4, _t2 < 50 and _t4 < 50], expect_contain=[True, True])
+    except Exception as _e48:
+        check("第 48 节异常: %s" % _e48, [True], expect_contain=[False])
 
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))
