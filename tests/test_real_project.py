@@ -3696,6 +3696,108 @@ def main():
           recs36(blk2),
           expect_contain=[("gAfter", None, False)])
 
+    # ---- 37. v60：组件名 / 窗体控件名不该被回声防护误杀 ----
+    print("\n=== 37. v60 组件名与窗体控件名（在窗体自己的代码模块里）===")
+    try:
+        class _UI37(object):
+            def __init__(self):
+                self.shown = False
+
+            def show(self, *a, **k):
+                self.shown = True
+
+            def update_selection(self, *a, **k):
+                pass
+
+            def hide(self, *a, **k):
+                self.shown = False
+
+            def contains_point(self, *a, **k):
+                return False
+
+        class _B37(object):
+            """模拟【窗体自己的代码模块】。
+
+            三个候选都"只声明在这个模块里"，现场文本里也一个字都没出现过：
+              * UserForm1 —— 组件名。窗体代码里从来不会写 UserForm1 这个
+                词（除非要 UserForm1.Show），可它当然是合法引用；
+              * Label1 —— 刚拖上去的控件，还没写任何事件过程，代码里没有它；
+              * useGhost —— 对照用的真幽灵：既不是结构性名字，声明集合里
+                也没有它，就该照旧被回声防护剔掉。
+            """
+
+            def __init__(self, structural=True, module="UserForm1"):
+                self._structural = structural
+                self._module = module
+
+            def get_context(self):
+                return {"line_no": 1, "caret_col": 1,
+                        "line_text": "", "in_string": False,
+                        "in_comment": False, "in_type_position": False,
+                        "in_decl_position": False, "decl_names": [],
+                        "proc_name": None, "module_name": self._module}
+
+            def get_identifiers(self):
+                return [("UserForm1", "UserForm1", None, False),
+                        ("Label1", "UserForm1", None, True),
+                        ("useGhost", "UserForm1", None, True)]
+
+            def get_declared_names(self):
+                # 刻意【不】含 useghost：它代表"解析层没能归类、只剩缓存残留
+                # 的幽灵"，用来验证这次放宽没有把真幽灵一起放行。
+                return ["userform1", "label1"]
+
+            def caret_word_at_collect(self):
+                return ""
+
+            def declared_elsewhere(self, name, module_name):
+                return False        # 全部"只声明在" UserForm1
+
+            def get_structural_names(self):
+                return ["userform1", "label1"] if self._structural else []
+
+            def names_outside_caret(self, caret, scope_only=False):
+                return set()        # 现场文本里一个字都没有
+
+            def apply_completion(self, *a, **k):
+                return None
+
+        def _trig37(word, structural=True, module="UserForm1"):
+            _be = _B37(structural, module)
+            _line = "    " + word
+            _ctx = _be.get_context()
+            _ctx["line_text"] = _line
+            _ctx["caret_col"] = len(_line) + 1
+            _be.get_context = lambda: _ctx
+            _c = E.Completer(_be, _UI37())
+            _c.trigger()
+            return sorted(_c.matches or [])
+
+        # 37.1 组件名：在【窗体自己的】代码里输入 use（用户插完窗体就在这打）
+        check("37.1 窗体自己的代码里输入 use -> 提示 UserForm1（真幽灵仍剔）",
+              _trig37("use"),
+              expect_contain=["UserForm1"],
+              expect_absent=["useGhost"])
+        # 37.2 对照：去掉结构性名字证据，就是修复前的行为（不提示）
+        check("37.2 对照：无结构性名字证据时不提示 UserForm1",
+              _trig37("use", structural=False),
+              expect_absent=["UserForm1"])
+        # 37.3 控件名：刚拖上去的 Label1（代码里还没有任何 Label1 字样）
+        check("37.3 窗体里输入 la -> 提示 Label1",
+              _trig37("la"),
+              expect_contain=["Label1"])
+        # 37.4 对照：去掉结构性名字证据则不提示
+        check("37.4 对照：无结构性名字证据时不提示 Label1",
+              _trig37("la", structural=False),
+              expect_absent=["Label1"])
+        # 37.5 控件名跨模块不可见（与"不提示别模块私有成员"的约定一致）
+        check("37.5 别的模块里输入 la -> 不提示 Label1",
+              _trig37("la", module="模块2"),
+              expect_absent=["Label1"])
+
+    except Exception as _e37:
+        check("第 37 节异常: %s" % _e37, [True], expect_contain=[False])
+
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))
     if FAILURES:

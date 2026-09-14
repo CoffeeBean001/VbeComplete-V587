@@ -723,6 +723,11 @@ def _proc_of_line(cm, line_no):
 
 # VBIDE 组件类型常量（只关心"标准模块"与"其他"两类）
 VBE_CT_STDMODULE = 1      # vbext_ct_StdModule
+VBE_CT_MSFORM = 3         # vbext_ct_MSForm（UserForm 窗体）
+
+# 取窗体控件名时最多列出的控件数。正常窗体都在这个量级以内；
+# 设上限只是为了让"设计器接口异常返回天量条目"时不会把候选池撑爆。
+_FORM_CTL_LIMIT = 300
 
 
 def _is_std_module(comp_type):
@@ -732,6 +737,49 @@ def _is_std_module(comp_type):
         return int(comp_type) == VBE_CT_STDMODULE
     except Exception:
         return True   # 取不到类型时按标准模块处理（最宽松，不误伤）
+
+
+def _is_msform(comp_type):
+    """是否 UserForm 窗体组件。"""
+    try:
+        return int(comp_type) == VBE_CT_MSFORM
+    except Exception:
+        return False
+
+
+def _form_control_names(comp):
+    """窗体（UserForm）设计器里的控件名列表。
+
+    【为什么必须走 Designer】控件名只存在于【设计器数据】里，窗体代码模块
+    （CodeModule）里通常一个字都看不到 —— 除非那个控件挂过事件过程
+    （那种情况下才会以 `Label1_Click` 的形式出现在代码里）。所以用户"刚拖
+    上去一个 Label1，希望输入 la 就能提示"只能从这里拿。
+
+    【为什么不递归】实测 `Designer.Controls` 已经是【扁平全集】：容器控件
+    （Frame / Page）自身也在列表里，它们的子控件同样被列出。真机验证：一个
+    含 Frame1/Frame2 的窗体，顶层 9 条已经覆盖了 Frame 里的全部控件；若再
+    对 Frame 递归一次，Label1/TextBox1/BOMList 会被重复收集一遍（这也是
+    VBA 里控件名必须全窗体唯一的语义所决定的）。所以只取顶层，一次到位。
+
+    任何一步失败都只返回已收到的部分：窗体处于运行态、宿主不支持 Designer
+    接口时都可能取不到，绝不能因此让整个候选收集流程崩掉。
+    """
+    out = []
+    try:
+        cs = comp.Designer.Controls
+        n = int(cs.Count)
+    except Exception:
+        return out
+    if n > _FORM_CTL_LIMIT:
+        n = _FORM_CTL_LIMIT
+    for i in range(n):
+        try:
+            nm = str(cs.Item(i).Name)
+        except Exception:
+            continue
+        if nm:
+            out.append(nm)
+    return out
 
 
 def _caret_char_col(cm, cp, line_no, line_text, ec):
@@ -842,6 +890,13 @@ class VbeBackend:
         # 【声明在别的模块】（跨模块 Public，可当证据）与【只在我正在编辑的
         # 这个模块里声明过】（一律以现场文本为准，见 declared_elsewhere）。
         self._declared_by_module = {}
+        # 由【工程结构】而非代码文本决定其存在的名字（小写）：组件名
+        # （标准模块 / 窗体 / 类模块 / ThisWorkbook、Sheet1 等文档模块名）
+        # 与窗体控件名。这类名字不需要在代码里出现过才算"真实存在" ——
+        # 窗体代码里没写过 UserForm1，UserForm1 照样是合法引用；刚拖上去的
+        # Label1 一行代码都还没有，它的名字照样存在于设计器里。引擎靠它避免
+        # 把这类名字当成"回声幻影"剔掉（v60，见 engine._name_really_exists）。
+        self._structural_names = set()
 
     def release(self):
         """Excel/VBE 关闭或离开 VBE 时调用：清空标识符缓存并释放 COM 资源。
@@ -853,6 +908,7 @@ class VbeBackend:
         self._cache_time = 0
         self._caret_word = ""
         self._declared_by_module = {}
+        self._structural_names = set()
         # 丢掉缓存的 VBE 对象 —— 这是 Excel 能否真正退出的关键一步。
         # 刻意【不】调 CoFreeUnusedLibraries —— 它释放不了我们持有的引用，
         # 在 Excel 关闭期间调用反而会拖慢/惊扰 COM（详见 _co_free 的说明）。
@@ -1084,6 +1140,8 @@ class VbeBackend:
         # 供引擎层区分"真名字"与"幻影"：回退删字回退出来的未定义词（如 numA）
         # 只可能是隐式残留 / 正在敲的词本身，引擎据此剔除"提示自己"。
         declared_names = set()
+        # 结构性名字：组件名 + 窗体控件名（v60）。详见 __init__ 里的说明。
+        structural_names = set()
         try:
             for comp in _collect_components(vbe, caret_mod):
                 try:
@@ -1105,9 +1163,28 @@ class VbeBackend:
                         records.append((mod_name, mod_name, None, False))
                         type_names.add(mod_name)
                         declared_names.add(mod_name.lower())
+                        structural_names.add(mod_name.lower())
                         _decl_by_mod.setdefault(
                             mod_name.lower(), set()).add(mod_name.lower())
                     modules.append(mod_name)
+                    # 窗体控件名（v60）：只收集【光标所在的那个窗体】的。
+                    #   * 控件名只在它自己的窗体代码模块里能裸名引用（跨模块
+                    #     得写 UserForm1.Label1），所以别的窗体的控件名收进来
+                    #     也永远不会可见，白白占池子；
+                    #   * 取一次控件要过 Designer 接口（真机实测约 23ms/窗体），
+                    #     只对正在编辑的窗体取，开销小到可以忽略。
+                    # 必须在读 CodeModule【之前】收集：新建窗体一行代码都没有，
+                    # 落在 `count <= 0: continue` 之后就永远收不到了。
+                    if (_is_msform(comp.Type) and caret_mod
+                            and str(caret_mod).lower() == str(mod_name).lower()):
+                        for _cn in _form_control_names(comp):
+                            if not _RE_PLAIN_IDENT.match(_cn):
+                                continue
+                            records.append((_cn, mod_name, None, True))
+                            declared_names.add(_cn.lower())
+                            structural_names.add(_cn.lower())
+                            _decl_by_mod.setdefault(
+                                _cn.lower(), set()).add(str(mod_name).lower())
                     cm = comp.CodeModule
                     count = cm.CountOfLines
                     if count <= 0:
@@ -1186,6 +1263,7 @@ class VbeBackend:
         self._type_names = type_names
         self._declared_names = declared_names
         self._declared_by_module = _decl_by_mod
+        self._structural_names = structural_names
         # 只在数量变化时记日志，避免每 2 秒刷一行
         if len(records) != getattr(self, "_last_id_count", -1):
             self._last_id_count = len(records)
@@ -1198,6 +1276,18 @@ class VbeBackend:
         不该冒出变量与过程名。
         """
         return getattr(self, "_type_names", set())
+
+    def get_structural_names(self):
+        """返回由【工程结构】决定其存在的名字（小写集合）：组件名 + 窗体控件名。
+
+        与 get_declared_names 的区别：后者是"代码文本里真声明过什么"，前者是
+        "工程结构里本来有什么"。用户刚拖上去的 Label1、一行代码都没有的新窗体
+        UserForm1，都属于前者而不属于后者。
+
+        引擎用它来判断"回声候选是不是真名字"——这类名字不能走"只在本模块声明
+        过、现场文本又扫不到 -> 当幽灵剔掉"的规则（v60）。
+        """
+        return set(getattr(self, "_structural_names", set()) or set())
 
     # ---- 自动配对：输入 ( / " 自动补右半边 ----
     #

@@ -716,6 +716,19 @@ class Completer:
         low = str(name).lower()
         if not low:
             return False
+        # v60：组件名（模块 / 窗体 / 类 / 文档模块名）与窗体控件名，由【工程
+        # 结构】决定其存在，与代码文本无关 —— 直接判为真名字，不走下面那套
+        # "现场文本 / 声明归属" 的证据链。
+        #
+        # 不加这一条会怎样（用户报的 bug）：插入一个 UserForm1 后 VBE 会自动
+        # 打开该窗体的代码窗口，用户在【窗体自己的代码里】输入 use —— 而 use
+        # 是 userform1 的连续子串，于是 UserForm1 命中"回声候选"；接着
+        # declared_elsewhere 说它"只声明在本模块"，现场文本里又（通常）压根
+        # 没出现过 UserForm1 这个词，两条证据都不成立，候选被剔掉 ——
+        # 症状就是"窗体名死活不提示"，而同样的输入在别的模块里却一切正常
+        # （那里 declared_elsewhere 返回 True）。刚拖上去的 Label1 同理。
+        if low in self._structural_names():
+            return True
         if declared is None:
             try:
                 declared = self._declared_names()
@@ -793,6 +806,32 @@ class Completer:
         try:
             return set(str(r[0]).lower()
                        for r in _normalize_scoped(self.backend.get_identifiers()))
+        except Exception:
+            return set()
+
+    def _structural_names(self):
+        """由【工程结构】决定其存在的名字（小写集合）：组件名 + 窗体控件名。
+
+        v60。与 _declared_names 的分工：
+          * _declared_names 答的是"代码文本里真声明过什么"；
+          * 本方法答的是"工程结构里本来有什么"。
+        刚拖上去的 Label1（一个字代码都还没有）、一行代码都没有的新窗体
+        UserForm1，只在前者里出现，不在后者里。
+
+        为什么需要单独一路证据：回声防护会先假定"以当前词为连续子串的候选"
+        可能是被删剩下的旧版本，再用"它在工程里真实存在吗"来裁决。裁决依赖
+        现场文本与声明归属，而【结构性命名的存在与代码文本无关】——窗体代码里
+        从不出现 UserForm1 这个词，它照样是合法引用。少了这一路证据就会误杀
+        （用户报的"在窗体里输入 use 死活不提示 UserForm1"，详见
+        _name_really_exists）。
+
+        可选接口；后端不提供时返回空集，旧式/测试后端行为完全不变。
+        """
+        hook = getattr(self.backend, "get_structural_names", None)
+        if not callable(hook):
+            return set()
+        try:
+            return set(str(n).lower() for n in (hook() or ()))
         except Exception:
             return set()
 
