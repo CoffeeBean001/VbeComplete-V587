@@ -4351,6 +4351,188 @@ def main():
     except Exception as _e39:
         check("第 39 节异常: %s" % _e39, [True], expect_contain=[False])
 
+    # ==================================================================
+    # 40. v63 VBE 自带提示窗（参数信息）可见时让位
+    # ==================================================================
+    # 用户报：`MsgBox "已完成！",` 敲下逗号后 VBE 弹出【参数信息】，我们的候选窗
+    # 同时也冒出来，两个窗叠在同一处冲突。
+    #
+    # 根因：v55 的让位判据走【光标语法位置】（`标识符.` 之后 / `As `/`New ` 之后），
+    # 只覆盖"自动列出成员 / 类型列表"，VBE 在别处弹的提示（最典型的就是参数信息）
+    # 它一概不认 —— README 里其实把这条当"已知不拦"写着。
+    #
+    # 修法：加一路【精确】判据。真机实测：VBE 的提示窗是【预建复用】的真窗口
+    # （什么都没按时就在顶层窗口列表里、只是不可见；Ctrl+Shift+I 后立刻可见、
+    # Esc 后立刻不可见），类名是 VB IDE 专有的 NameListWndClass / PopupTipWndClass。
+    # 后端 vbe_popup_visible() 直接查这两个窗口的可见性，引擎据此让位。
+    #
+    # 注：v55 当年以"发 Ctrl+J 后全系统零新窗口"推断 VBE 列表没有独立窗口 ——
+    # 那只对"【新建】窗口"成立，被复用骗了。
+    print("\n=== 40. v63 VBE 提示窗可见时让位（参数信息）===")
+    try:
+        import vbe_bridge as VB40
+
+        # 40.1~40.3：探测函数自身（纯 Win32，不依赖 Excel）
+        check("40.1 提示窗类名清单含 VBE 那两个窗口类",
+              [set(VB40.VBE_POPUP_CLASSES)
+               >= {"NameListWndClass", "PopupTipWndClass"}],
+              expect_contain=[True])
+        check("40.2 空句柄 / 无效句柄 -> 判为不可见（不炸）",
+              [VB40._popup_showing_now([]),
+               VB40._popup_showing_now([0, 123]),
+               VB40._hwnd_alive(0)],
+              expect_contain=[False, False, False])
+        try:
+            _pv40 = VB40.vbe_popup_visible()
+        except Exception as _e40pv:
+            _pv40 = "异常: %s" % _e40pv
+        check("40.3 vbe_popup_visible() 返回布尔且不抛（此刻=%s）" % (_pv40,),
+              [isinstance(_pv40, bool)], expect_contain=[True])
+
+        # 40.4~40.11：走完整 trigger 链路（假后端，纯 Python，不碰 Excel）
+        class _UI40(object):
+            def __init__(self):
+                self.shown = False
+                self.rows = []
+
+            def show(self, rows, selection=0, completer=None):
+                self.shown = True
+                self.rows = list(rows)
+
+            def update_selection(self, *a, **k):
+                pass
+
+            def hide(self, *a, **k):
+                self.shown = False
+
+            def contains_point(self, *a, **k):
+                return False
+
+        _LINE40 = '    MsgBox "已完成！", vb'
+
+        class _B40Base(object):
+            """复刻"光标在 MsgBox 第二个参数上"的现场。
+
+            这个位置【不在】v55 的两种让位位置上（没有点号、也不是 As/New 之后），
+            所以它恰好用来隔离出"窗口判据"这一路 —— 语法判据在这里根本不生效。
+            """
+
+            def __init__(self, **kw):
+                pass
+
+            def get_context(self):
+                return {"line_no": 3, "caret_col": len(_LINE40) + 1,
+                        "line_text": _LINE40, "in_string": False,
+                        "in_comment": False, "in_type_position": False,
+                        "in_decl_position": False, "decl_names": [],
+                        "proc_name": None, "module_name": "模块2"}
+
+            def get_identifiers(self):
+                return [("MsgBox", "VBA", None, False),
+                        ("vbYes", "VBA", None, False),
+                        ("vbNo", "VBA", None, False)]
+
+            def get_declared_names(self):
+                return ["msgbox", "vbyes", "vbno"]
+
+            def declared_elsewhere(self, name, module_name):
+                return str(name).lower() in ("msgbox", "vbyes", "vbno")
+
+            def get_structural_names(self):
+                return ["msgbox", "vbyes", "vbno"]
+
+            def get_builtin_names(self):
+                return []
+
+            def get_type_names(self):
+                return []
+
+            def names_outside_caret(self, caret, scope_only=False):
+                return set()
+
+            def apply_completion(self, *a, **k):
+                return None
+
+        class _B40(_B40Base):
+            """带 vbe_popup_visible 的新式后端。"""
+
+            def __init__(self, popup=False, boom=False, **kw):
+                self._popup = popup
+                self._boom = boom
+
+            def vbe_popup_visible(self):
+                if self._boom:
+                    raise RuntimeError("boom")
+                return self._popup
+
+        class _B40Old(_B40Base):
+            """旧式 / 测试后端：没有 vbe_popup_visible 这个方法。"""
+
+        def _trig40(cls=_B40, manual=False, **kw):
+            _be = cls(**kw)
+            _ui = _UI40()
+            _c = E.Completer(_be, _ui)
+            _c.trigger(not manual)      # True = 轮询自动触发；manual = Ctrl+Space
+            return sorted(_c.matches or []), _ui.shown
+
+        _hit40 = (["vbNo", "vbYes"], True)
+        check("40.4 提示窗可见 -> 让位（不弹、候选清空）",
+              [_trig40(popup=True)],
+              expect_contain=[([], False)])
+        check("40.5 提示窗不可见 -> 照常弹（同位置同后端）",
+              [_trig40(popup=False)],
+              expect_contain=[_hit40])
+        check("40.6 现场就在参数位置：v55 的语法判据认不出（隔离验证）",
+              [E.vbe_list_expected(_LINE40, len(_LINE40) + 1)],
+              expect_contain=[False])
+
+        _saved40 = E.YIELD_TO_VBE_LIST
+        try:
+            E.YIELD_TO_VBE_LIST = False
+            check("40.7 对照：关掉让位开关（VBECOMPLETE_NO_YIELD=1）-> 照弹",
+                  [_trig40(popup=True)],
+                  expect_contain=[_hit40])
+        finally:
+            E.YIELD_TO_VBE_LIST = _saved40
+
+        check("40.8 旧式后端（无该接口）-> 行为不变，照常弹",
+              [_trig40(cls=_B40Old)],
+              expect_contain=[_hit40])
+        check("40.9 探测抛异常 -> 不让位、不炸（异常被吞）",
+              [_trig40(popup=True, boom=True)],
+              expect_contain=[_hit40])
+        check("40.10 手动 Ctrl+Space（require_ident_before_caret=False）照弹",
+              [_trig40(popup=True, manual=True)],
+              expect_contain=[_hit40])
+
+        # 40.11 判据与语法位置无关：普通赋值行上，窗口可见同样让位
+        class _B40Plain(_B40):
+            def get_context(self):
+                _line = "    userN"
+                return {"line_no": 1, "caret_col": len(_line) + 1,
+                        "line_text": _line, "in_string": False,
+                        "in_comment": False, "in_type_position": False,
+                        "in_decl_position": False, "decl_names": [],
+                        "proc_name": None, "module_name": "模块2"}
+
+        _be40p = _B40Plain(popup=True)
+        _ui40p = _UI40()
+        _c40p = E.Completer(_be40p, _ui40p)
+        _c40p.trigger(True)
+        check("40.11 普通行（非成员/类型位置）也拦得住 -> 让位",
+              [sorted(_c40p.matches or []), _ui40p.shown],
+              expect_contain=[[], False])
+
+        # 40.12 真实 VbeBackend 提供该接口，且与模块级探测一致（真机）
+        _be40r = VB40.VbeBackend()
+        _r40 = _be40r.vbe_popup_visible()
+        check("40.12 VbeBackend 的探测与模块级函数一致（此刻=%s）" % (_r40,),
+              [_r40 == VB40.vbe_popup_visible(), isinstance(_r40, bool)],
+              expect_contain=[True, True])
+
+    except Exception as _e40:
+        check("第 40 节异常: %s" % _e40, [True], expect_contain=[False])
+
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))
     if FAILURES:

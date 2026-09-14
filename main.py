@@ -32,9 +32,13 @@ VbeComplete 主入口（修复版）
 
   v55：VBE 自己弹「自动列出成员」时我们让位（写 `UserForm1.` 后输入成员名、
   `Dim x As ` 后填类型名、或按 Ctrl+J），只让位那一会儿，名字一打完就恢复。
-  VBE 那个列表是画在代码窗格上的、没有独立窗口，所以判据走光标的语法位置
-  （见 engine.vbe_list_expected）。想彻底关掉让位：设 VBECOMPLETE_NO_YIELD=1。
-  想关掉自动配对：设 VBECOMPLETE_NO_AUTOPAIR=1。
+  那套判据走光标的【语法位置】（见 engine.vbe_list_expected）。
+
+  v63：再加一路【精确】判据 —— 真机实测 VBE 的提示窗（NameListWndClass /
+  PopupTipWndClass）是预建复用的真窗口，直接查可见性就行，于是 VBE 在任何
+  位置弹的提示都拦得住（最典型的是敲逗号后弹的【参数信息】）。另外按
+  Ctrl+Shift+I（VBE 唤出参数信息）也会收起我们的。想彻底关掉让位：设
+  VBECOMPLETE_NO_YIELD=1。想关掉自动配对：设 VBECOMPLETE_NO_AUTOPAIR=1。
 """
 
 import os
@@ -672,6 +676,13 @@ def main():
                 # Ctrl+J / Ctrl+Shift+J = VBE 唤出它自己的「列出属性/方法」。
                 # 这是唯一能确定"VBE 列表马上要出现"的时刻（文本没变，轮询看
                 # 不出来），这里直接收起我们的，让它弹。
+                post(completer.hide)
+            elif state["ctrl"] and _is_vk_char(key, "i"):
+                # Ctrl+Shift+I（以及 Ctrl+I）= VBE 唤出「参数信息 / 快速信息」。
+                # 真机实测（v63）：Ctrl+Shift+I 后 VBE 的参数签名窗
+                # PopupTipWndClass 立刻可见、Esc 立刻不可见 —— 确实有效的是
+                # 带 Shift 那个。与 Ctrl+J 同理：文本没变、轮询看不出来，所以
+                # 直接收起我们的，让 VBE 那个弹（用户口径：VBE 自带弹窗优先）。
                 post(completer.hide)
             elif completer.is_visible() and not _is_ident_char(key) \
                     and key not in _VK_HANDLED_WHEN_VISIBLE:

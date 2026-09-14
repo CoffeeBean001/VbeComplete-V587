@@ -557,6 +557,122 @@ def _host_window_alive():
     return _wnd_state["miss"] < 2     # 连续 2 次才认定真的没了
 
 
+# ---------------------------------------------------------------------------
+# v63：VBE 自己弹的提示窗（参数信息 / 列出成员）此刻是否可见
+# ---------------------------------------------------------------------------
+# 让位机制的第二路判据。v55 那套走的是【光标语法位置】（`标识符.` 之后、`As ` /
+# `New ` 之后），只能覆盖"自动列出成员 / 类型列表"；VBE 在别处弹的提示它一概不
+# 认 —— 最典型的就是【参数信息】：`MsgBox "已完成！",` 敲下逗号后 VBE 弹出参数
+# 签名，我们的弹窗同时也冒出来，两个窗叠在同一处（用户 v63 报的 bug）。
+#
+# 真机实测（本机 Office VBE，2026-09-14）：
+#   * VBE 的提示窗是【预建复用】的真窗口 —— 什么都没按的时候它们就在顶层窗口
+#     列表里，只是 IsWindowVisible=False；发 Ctrl+Shift+I（参数信息）后立刻
+#     变 True、Esc 后立刻回 False。
+#   * 类名是 VB IDE 专有的两个：
+#       NameListWndClass —— 列出成员 / 列出常量
+#       PopupTipWndClass —— 参数信息（Quick Info）
+#   * 开销：全量枚举（EnumWindows + GetClassName）1.75ms/次、按进程过滤
+#     0.81ms/次；而句柄缓存之后只查 IsWindowVisible，0.0005ms/次。所以这里缓存
+#     句柄，只在"缓存为空"或"句柄失效（Excel/VBE 重启过）"时重新枚举，且限流。
+#
+# ⚠️ v55 曾以"给 VBE 发 Ctrl+J 后全系统零新窗口"推断【VBE 的列表没有独立窗口】。
+# 那个结论只对"【新建】窗口"成立 —— 实际上窗口早就建好了，只是被显示/隐藏，
+# 所以枚举"新窗口"永远看不到它。这次改成直接查已知类名的可见性，才拿到真相。
+#
+# 想追加别的类名（不同 VBE 版本类名可能不一样）：
+#   set VBECOMPLETE_VBE_POPUP_CLASS=ClassA,ClassB
+VBE_POPUP_CLASSES = ("NameListWndClass", "PopupTipWndClass")
+try:
+    _extra_popup_cls = tuple(
+        c.strip() for c in
+        os.environ.get("VBECOMPLETE_VBE_POPUP_CLASS", "").split(",")
+        if c.strip())
+    if _extra_popup_cls:
+        VBE_POPUP_CLASSES = tuple(VBE_POPUP_CLASSES) + _extra_popup_cls
+except Exception:
+    pass
+
+# 缓存：命中的窗口句柄列表 + 上次枚举时刻（找不到时限流重扫）
+_vbe_popup_state = {"hwnds": [], "at": 0.0}
+_VBE_POPUP_RESCAN_SEC = 1.0
+
+
+def _enum_vbe_popup_windows():
+    """枚举顶层窗口，返回类名命中 VBE_POPUP_CLASSES 的 [(hwnd, cls)]。"""
+    import ctypes
+    u32 = ctypes.windll.user32
+    WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool,
+                                     ctypes.c_void_p, ctypes.c_void_p)
+    buf = ctypes.create_unicode_buffer(256)
+    out = []
+
+    def _cb(hwnd, _lp):
+        try:
+            if u32.GetClassNameW(hwnd, buf, 256):
+                cls = buf.value
+                if cls in VBE_POPUP_CLASSES:
+                    out.append((hwnd, cls))
+        except Exception:
+            pass
+        return True
+
+    u32.EnumWindows(WNDENUMPROC(_cb), 0)
+    return out
+
+
+def _hwnd_alive(hwnd):
+    import ctypes
+    try:
+        return bool(ctypes.windll.user32.IsWindow(hwnd))
+    except Exception:
+        return False
+
+
+def _popup_showing_now(hwnds):
+    """这些句柄里有没有正在显示的（可见 + 尺寸正常）。"""
+    import ctypes
+    import ctypes.wintypes
+    u32 = ctypes.windll.user32
+    rect = ctypes.wintypes.RECT()
+    for hwnd in hwnds:
+        try:
+            if not u32.IsWindowVisible(hwnd):
+                continue
+            if not u32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                continue
+            if rect.right - rect.left <= 0 or rect.bottom - rect.top <= 0:
+                continue
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def vbe_popup_visible():
+    """VBE 自带的提示窗此刻是否可见（v63）。探不到一律 False（不拦）。
+
+    只读 Win32 查询，不碰 COM。Excel / VBE 没开时自然返回 False。
+    """
+    try:
+        cached = _vbe_popup_state["hwnds"]
+        hs = [h for h in cached if _hwnd_alive(h)]
+        if len(hs) != len(cached):
+            _vbe_popup_state["hwnds"] = hs     # 有句柄失效 -> 作废重找
+        if not hs:
+            now = time.time()
+            if now - _vbe_popup_state["at"] < _VBE_POPUP_RESCAN_SEC:
+                return False
+            _vbe_popup_state["at"] = now
+            hs = [h for h, _cls in _enum_vbe_popup_windows()]
+            _vbe_popup_state["hwnds"] = hs
+            if not hs:
+                return False
+        return _popup_showing_now(hs)
+    except Exception:
+        return False
+
+
 def _release_vbe_proxy(collect=False):
     """丢弃缓存的 VBE/Excel COM 代理 —— 这是让 Excel 能真正退出的关键。
 
@@ -1405,6 +1521,16 @@ class VbeBackend:
         后端不提供该接口时引擎不做任何收紧（旧式 / 测试后端行为不变）。
         """
         return set(getattr(self, "_builtin_names", set()) or set())
+
+    def vbe_popup_visible(self):
+        """VBE 自带的提示窗（参数信息 / 列出成员）此刻是否可见（v63）。
+
+        引擎据此让位：VBE 弹了提示，我们的候选窗就不再出现（用户口径：
+        VBE 自带弹窗优先级高于我们的）。判据是查 VBE 那两个预建复用提示窗口的
+        可见性，见模块级 vbe_popup_visible() 的说明。纯 Win32 查询、不碰 COM，
+        探不到一律 False（不拦）—— 旧式 / 测试后端不提供本方法时引擎行为不变。
+        """
+        return vbe_popup_visible()
 
     # ---- 自动配对：输入 ( / " 自动补右半边 ----
     #

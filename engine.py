@@ -860,6 +860,30 @@ class Completer:
         except Exception:
             return set()
 
+    def _vbe_popup_showing(self):
+        """VBE 自带的提示窗此刻是否【真的】显示着（v63）。可选接口。
+
+        与 vbe_list_expected（语法判据）的分工：
+          * vbe_list_expected 猜的是"VBE 大概会在这里弹列表"——只覆盖成员访问与
+            As/New 类型位置，VBE 弹别的东西（最典型的【参数信息】：`MsgBox "x",`
+            敲逗号后弹出的参数签名）它一概不认；
+          * 本方法看的是"VBE 的提示窗现在是不是真的画在屏幕上"——后端直接查
+            VBE 那两个预建复用窗口（NameListWndClass / PopupTipWndClass）的可见性，
+            属于精确判据，与光标在什么语法位置无关。
+
+        两者是【并集】：任一说该让位就让位。语法判据保留原样（它覆盖"列表马上
+        要出现"那一小段窗口可见之前的时序），本方法补齐它漏掉的场景。
+
+        后端不提供该接口时返回 False -> 行为与 v62 完全一致（旧式 / 测试后端）。
+        """
+        hook = getattr(self.backend, "vbe_popup_visible", None)
+        if not callable(hook):
+            return False
+        try:
+            return bool(hook())
+        except Exception:
+            return False
+
     def trigger(self, require_ident_before_caret=False):
         """尝试弹出补全列表。
 
@@ -894,6 +918,22 @@ class Completer:
                 and vbe_list_expected(ctx.get("line_text"),
                                       ctx.get("caret_col")):
             _log("trigger: VBE 自带列表位置 -> 让位")
+            self.hide()
+            return
+        # v63：VBE 的提示窗【真的显示着】时也必须让位。
+        #
+        # 上面那条走的是"语法位置"猜测，只覆盖成员访问（`标识符.`）与类型位置
+        # （`As `/`New `）。VBE 在别处弹的提示它一概不认，于是两个窗叠在一起 ——
+        # 用户报的正是【参数信息】：`MsgBox "已完成！",` 敲下逗号后 VBE 弹出参数
+        # 签名，我们的候选窗同时也冒出来。
+        #
+        # 这条是精确判据：后端直接查 VBE 那两个预建复用提示窗口
+        # （NameListWndClass / PopupTipWndClass）的可见性，与光标语法位置无关，
+        # 因此 VBE 弹任何提示（参数信息、列出成员、列出常量）都拦得住。
+        # 用户口径：VBE 自带弹窗的优先级高于我们的弹窗。
+        if require_ident_before_caret and YIELD_TO_VBE_LIST \
+                and self._vbe_popup_showing():
+            _log("trigger: VBE 自带提示窗可见 -> 让位")
             self.hide()
             return
         if require_ident_before_caret and not _ident_char_before_caret(ctx):
