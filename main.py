@@ -388,6 +388,20 @@ def in_vbe_code_area():
     return bool(st)
 
 
+def vbe_focus_class():
+    """VBE 线程里当前拥有键盘焦点的那个窗口的类名（拿不到返回 None）。
+
+    只用于诊断日志：排查"某处什么都不弹"时，靠它一眼看出焦点到底落在哪个
+    窗口上（`VbaWindow`=代码窗格 / `wndclass_pbrs`=属性窗口 / `PROJECT`=工程
+    窗口 / `NameListWndClass`、`PopupTipWndClass`=VBE 自带的提示窗）。
+    """
+    try:
+        h = vbe_bridge._focused_hwnd_in_vbe()
+        return vbe_bridge._window_class_name(h) if h else None
+    except Exception:
+        return None
+
+
 def foreground_window_closing():
     """检测当前前台窗口是否正在关闭 / 已无响应。
 
@@ -607,7 +621,14 @@ def main():
                 try:
                     fn(*args)
                 except Exception:
-                    pass
+                    # 绝不静默：一次异常就是一次"输入了却什么都没弹"。诊断模式下
+                    # 把动作名与栈记下来，省得下次又靠猜（v65 教训）。
+                    try:
+                        import traceback as _tb
+                        _log("action %r 抛异常:\n%s"
+                             % (getattr(fn, "__name__", fn), _tb.format_exc()))
+                    except Exception:
+                        pass
         except queue.Empty:
             pass
         root.after(10, drain_actions)
@@ -1000,6 +1021,25 @@ def main():
                 except Exception:
                     pass
             snap = backend.snapshot() if _com_allowed() else None
+            # 诊断心跳（只在 VBECOMPLETE_LOG=1 时产生，约每 3 秒一行）。
+            # 排查"某处输入什么都不弹"时，它一眼分清是【没读到快照】（COM 读到
+            # None：多行选区 / 退避 / 不可用）、【焦点不在代码窗格】、还是
+            # 【读了却没触发】。
+            if time.time() >= state.get("_hb_next", 0.0):
+                state["_hb_next"] = time.time() + 3.0
+                _log("poll: heartbeat snap=%r focused=%r focus_cls=%r"
+                     " popup=%r popup_cls=%r yield=%r"
+                     " backoff=%.2f visible=%r kbd=%r"
+                     % (None if snap is None else
+                        (snap[0], (snap[2] if len(snap) > 2 else None),
+                         (snap[1] or "")[-45:]),
+                        vbe_bridge.vbe_code_pane_focused(), vbe_focus_class(),
+                        vbe_bridge.vbe_popup_visible(),
+                        vbe_bridge.vbe_popup_info(),
+                        vbe_bridge.vbe_yield_visible(),
+                        com_backoff_remaining(),
+                        completer.is_visible(),
+                        state.get("kbd") is not None))
             if snap is not None:
                 last = state.get("last_snap")
                 if last is None:
@@ -1035,14 +1075,25 @@ def main():
                             post(completer.hide)
                         else:
                             # True: 校验光标前是否标识符字符（不在拼标识符则收起）
-                            if vbe_bridge.vbe_code_pane_focused() is False:
+                            _fst = vbe_bridge.vbe_code_pane_focused()
+                            if _fst is False:
                                 # v64：焦点不在代码窗格（属性窗口 / 工程窗口 /
                                 # 窗体设计器）—— 那里的"文本变化"不是用户在拼
                                 # 标识符，别在非写代码的工作区弹提示。
-                                _log("poll: 焦点不在代码窗格 -> 不触发")
+                                _log("poll: 焦点不在代码窗格 -> 不触发"
+                                     " (focused=%r focus_cls=%r popup=%r"
+                                     " popup_cls=%r)"
+                                     % (_fst, vbe_focus_class(),
+                                        vbe_bridge.vbe_popup_visible(),
+                                        vbe_bridge.vbe_popup_info()))
                                 post(completer.hide)
                             else:
-                                _log("poll: line %s changed -> trigger" % (snap[0],))
+                                _log("poll: line %s changed -> trigger"
+                                     " (focused=%r focus_cls=%r popup=%r"
+                                     " popup_cls=%r)"
+                                     % (snap[0], _fst, vbe_focus_class(),
+                                        vbe_bridge.vbe_popup_visible(),
+                                        vbe_bridge.vbe_popup_info()))
                                 post_trigger()
         except Exception:
             pass

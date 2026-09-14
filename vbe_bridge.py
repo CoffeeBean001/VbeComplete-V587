@@ -597,6 +597,33 @@ except Exception:
 _vbe_popup_state = {"hwnds": [], "at": 0.0}
 _VBE_POPUP_RESCAN_SEC = 1.0
 
+# ---------------------------------------------------------------------------
+# v65：让位只针对【成员列表】，不针对【参数信息】
+# ---------------------------------------------------------------------------
+# 用户口径（v65 澄清 v63 的原意）："只有弹成员列表的时候才让位，弹形参签名
+# 不需要让位。"
+#
+# 为什么该这么分：
+#   * NameListWndClass（列出成员 / 列出常量）本身就是一份【候选列表】—— 与我们
+#     的候选窗完全同质：同样画在光标下方、同样吃 Tab / ↑↓ / Enter 选词。两个
+#     列表叠在一起既遮挡又抢键盘，让位是对的（v55 的原意）。
+#   * PopupTipWndClass（参数信息 = 形参签名）只是一行只读提示：不给候选、不吃
+#     键盘。而它出现的位置恰恰是"正在填实参"——**最需要候选的时候**。这时候
+#     让位，就变成了"这里输入任何字符都无提醒"（v65 报的 bug）。
+#
+# 想调整（比如某版本的成员列表类名不同）：
+#   set VBECOMPLETE_VBE_YIELD_CLASS=ClassA,ClassB
+VBE_YIELD_CLASSES = ("NameListWndClass",)
+try:
+    _extra_yield_cls = tuple(
+        c.strip() for c in
+        os.environ.get("VBECOMPLETE_VBE_YIELD_CLASS", "").split(",")
+        if c.strip())
+    if _extra_yield_cls:
+        VBE_YIELD_CLASSES = tuple(VBE_YIELD_CLASSES) + _extra_yield_cls
+except Exception:
+    pass
+
 
 def _enum_vbe_popup_windows():
     """枚举顶层窗口，返回类名命中 VBE_POPUP_CLASSES 的 [(hwnd, cls)]。"""
@@ -660,8 +687,8 @@ def _window_class_name(hwnd):
     return ""
 
 
-def _popup_showing_now(hwnds):
-    """这些句柄里有没有正在显示的 VBE 提示窗。
+def _popup_details_now(hwnds):
+    """这些句柄里正在显示的 VBE 提示窗，返回 [(类名, 宽, 高), ...]。
 
     逐个复核三件事（句柄值会被 Windows 回收复用给别的窗口，只凭"还记得这个
     句柄"就相信它，一旦复用就会出现"永远以为 VBE 在弹提示、我们的窗再也不弹"
@@ -669,15 +696,21 @@ def _popup_showing_now(hwnds):
       1. 类名仍是 VBE 的提示窗类；
       2. 属于宿主 Excel/VBE 进程；
       3. 可见且尺寸正常。
+
+    返回明细而不只是 bool，是为了让诊断日志能区分【成员列表】(NameListWndClass)
+    与【参数信息】(PopupTipWndClass) —— 两者的"该不该让位"结论将来可能不同
+    （v65 排查用）。冷路径开销可忽略：缓存里最多两三个句柄。
     """
     import ctypes
     import ctypes.wintypes
     u32 = ctypes.windll.user32
     rect = ctypes.wintypes.RECT()
     host_pid = _host_process_id()
+    out = []
     for hwnd in hwnds:
         try:
-            if _window_class_name(hwnd) not in VBE_POPUP_CLASSES:
+            cls = _window_class_name(hwnd)
+            if cls not in VBE_POPUP_CLASSES:
                 continue
             if host_pid:
                 pid = ctypes.wintypes.DWORD()
@@ -688,34 +721,74 @@ def _popup_showing_now(hwnds):
                 continue
             if not u32.GetWindowRect(hwnd, ctypes.byref(rect)):
                 continue
-            if rect.right - rect.left <= 0 or rect.bottom - rect.top <= 0:
+            w = rect.right - rect.left
+            h = rect.bottom - rect.top
+            if w <= 0 or h <= 0:
                 continue
-            return True
+            out.append((cls, w, h))
         except Exception:
             continue
-    return False
+    return out
+
+
+def _vbe_popup_hwnds():
+    """取（并维护）VBE 提示窗的句柄缓存；返回当前可用的句柄列表。
+
+    只在"缓存为空"或"句柄失效（Excel/VBE 重启过）"时重新枚举，且限流 ——
+    枚举全量顶层窗口 1.75ms/次，命中缓存后只查 IsWindowVisible，快三个数量级。
+    """
+    cached = _vbe_popup_state["hwnds"]
+    hs = [h for h in cached if _hwnd_alive(h)]
+    if len(hs) != len(cached):
+        _vbe_popup_state["hwnds"] = hs         # 有句柄失效 -> 作废重找
+    if not hs:
+        now = time.time()
+        if now - _vbe_popup_state["at"] < _VBE_POPUP_RESCAN_SEC:
+            return []
+        _vbe_popup_state["at"] = now
+        hs = [h for h, _cls in _enum_vbe_popup_windows()]
+        _vbe_popup_state["hwnds"] = hs
+    return hs
+
+
+def vbe_popup_info():
+    """当前可见的 VBE 提示窗明细 [(类名, 宽, 高), ...]；探不到返回 []。
+
+    只读 Win32 查询，不碰 COM。专供诊断日志（区分成员列表 / 参数信息）。
+    """
+    try:
+        return _popup_details_now(_vbe_popup_hwnds())
+    except Exception:
+        return []
 
 
 def vbe_popup_visible():
     """VBE 自带的提示窗此刻是否可见（v63）。探不到一律 False（不拦）。
 
     只读 Win32 查询，不碰 COM。Excel / VBE 没开时自然返回 False。
+    ⚠️ 语义是"**任何**提示窗"（含参数信息），只用于诊断与兼容；
+    引擎真正据以让位的是 vbe_yield_visible()（v65 起只认成员列表）。
     """
     try:
-        cached = _vbe_popup_state["hwnds"]
-        hs = [h for h in cached if _hwnd_alive(h)]
-        if len(hs) != len(cached):
-            _vbe_popup_state["hwnds"] = hs     # 有句柄失效 -> 作废重找
-        if not hs:
-            now = time.time()
-            if now - _vbe_popup_state["at"] < _VBE_POPUP_RESCAN_SEC:
-                return False
-            _vbe_popup_state["at"] = now
-            hs = [h for h, _cls in _enum_vbe_popup_windows()]
-            _vbe_popup_state["hwnds"] = hs
-            if not hs:
-                return False
-        return _popup_showing_now(hs)
+        return bool(_popup_details_now(_vbe_popup_hwnds()))
+    except Exception:
+        return False
+
+
+def vbe_yield_visible():
+    """VBE 的【成员列表】窗此刻是否可见 —— 引擎据此让位（v65）。
+
+    只认 VBE_YIELD_CLASSES（默认只有 NameListWndClass）。参数信息
+    （PopupTipWndClass）**不算**：它不给候选、不吃键盘，而它出现时用户正在填
+    实参，正是最需要候选的时候 —— 在那里让位就成了"输入什么都不弹"（v65）。
+
+    只读 Win32，探不到一律 False（不让位）。
+    """
+    try:
+        for _cls, _w, _h in _popup_details_now(_vbe_popup_hwnds()):
+            if _cls in VBE_YIELD_CLASSES:
+                return True
+        return False
     except Exception:
         return False
 
@@ -868,6 +941,13 @@ def vbe_code_pane_focused():
         h = _focused_hwnd_in_vbe()
         if not h:
             return None
+        # v65：VBE 自己的提示窗（成员列表 NameListWndClass / 参数信息
+        # PopupTipWndClass）会短暂拿到键盘焦点。它们只可能在"正在编辑代码"时
+        # 出现，属于代码窗格的临时浮层 —— 必须算作"还在代码窗格"。否则它们一
+        # 冒出来，本判据立刻变 False，把我们的候选窗当场收掉：表现就是"在填实参
+        # 的位置输入任何字符都不提示"（v65 报的 bug，第二处根因）。
+        if _window_class_name(h) in VBE_POPUP_CLASSES:
+            return True
         for _ in range(12):
             if not h:
                 break
@@ -1745,12 +1825,33 @@ class VbeBackend:
     def vbe_popup_visible(self):
         """VBE 自带的提示窗（参数信息 / 列出成员）此刻是否可见（v63）。
 
-        引擎据此让位：VBE 弹了提示，我们的候选窗就不再出现（用户口径：
-        VBE 自带弹窗优先级高于我们的）。判据是查 VBE 那两个预建复用提示窗口的
-        可见性，见模块级 vbe_popup_visible() 的说明。纯 Win32 查询、不碰 COM，
-        探不到一律 False（不拦）—— 旧式 / 测试后端不提供本方法时引擎行为不变。
+        ⚠️ v65 起语义澄清：这是"**任何**提示窗"，含参数信息（形参签名），
+        只用于诊断；引擎真正据以让位的是 vbe_yield_visible()。保留本方法是为了
+        与旧式 / 测试后端和诊断日志兼容。纯 Win32 查询、不碰 COM。
         """
         return vbe_popup_visible()
+
+    def vbe_yield_visible(self):
+        """VBE 的【成员列表】窗此刻是否可见 —— 引擎据此让位（v65）。
+
+        用户口径（v65 澄清 v63）："只有弹成员列表的时候才让位，弹形参签名不需要
+        让位。" 成员列表（NameListWndClass）与我们同质（也是候选列表、也吃键盘），
+        让位；参数信息（PopupTipWndClass）只是只读签名，不该让我们消失。
+
+        见模块级 vbe_yield_visible()。纯 Win32、不碰 COM，探不到一律 False
+        （不让位）—— 后端不提供本方法时引擎退回 vbe_popup_visible() 的老行为。
+        """
+        return vbe_yield_visible()
+
+    def vbe_popup_info(self):
+        """当前可见的 VBE 提示窗明细 [(类名, 宽, 高), ...]（v65 诊断用）。
+
+        与 vbe_popup_visible() 同一套判据，只是把命中的窗描述出来，让日志能
+        区分【成员列表】(NameListWndClass) 与【参数信息】(PopupTipWndClass)。
+        纯 Win32 只读，探不到返回 []。引擎只在真正要"让位"那一刻记一行日志，
+        正常路径不调用，无开销。
+        """
+        return vbe_popup_info()
 
     # ---- 自动配对：输入 ( / " 自动补右半边 ----
     #

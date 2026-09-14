@@ -4378,10 +4378,18 @@ def main():
                >= {"NameListWndClass", "PopupTipWndClass"}],
               expect_contain=[True])
         check("40.2 空句柄 / 无效句柄 -> 判为不可见（不炸）",
-              [VB40._popup_showing_now([]),
-               VB40._popup_showing_now([0, 123]),
+              [VB40._popup_details_now([]),
+               VB40._popup_details_now([0, 123]),
                VB40._hwnd_alive(0)],
-              expect_contain=[False, False, False])
+              expect_contain=[[], [], False])
+        try:
+            _pinfo40 = VB40.vbe_popup_info()
+        except Exception as _e40pi:
+            _pinfo40 = "异常: %s" % _e40pi
+        check("40.2b vbe_popup_info() 返回明细列表且不抛（此刻=%r）" % (_pinfo40,),
+              [isinstance(_pinfo40, list),
+               all(isinstance(t, tuple) and len(t) == 3 for t in _pinfo40)],
+              expect_contain=[True, True])
         try:
             _pv40 = VB40.vbe_popup_visible()
         except Exception as _e40pv:
@@ -4465,6 +4473,11 @@ def main():
                     raise RuntimeError("boom")
                 return self._popup
 
+            def vbe_popup_info(self):
+                if self._boom:
+                    raise RuntimeError("boom")
+                return [("PopupTipWndClass", 200, 16)] if self._popup else []
+
         class _B40Old(_B40Base):
             """旧式 / 测试后端：没有 vbe_popup_visible 这个方法。"""
 
@@ -4538,6 +4551,24 @@ def main():
                VB40._window_class_name(0),
                VB40._window_class_name(123456) not in VB40.VBE_POPUP_CLASSES],
               expect_contain=[True, "", True])
+
+        # 40.14~40.16 v65 诊断：让位那一刻日志要能说出【是哪个窗】
+        check("40.14 引擎能取到提示窗明细（诊断日志用）",
+              [E.Completer(_B40(popup=True), _UI40())._vbe_popup_desc(),
+               E.Completer(_B40Old(), _UI40())._vbe_popup_desc()],
+              expect_contain=[[("PopupTipWndClass", 200, 16)], None])
+        check("40.15 明细探测抛异常 -> 返回 None，不炸",
+              [E.Completer(_B40(popup=True, boom=True),
+                           _UI40())._vbe_popup_desc()],
+              expect_contain=[None])
+        try:
+            _pin40 = VB40.vbe_popup_info()
+            _pvis40 = VB40.vbe_popup_visible()
+            _ok40 = (bool(_pin40) == _pvis40)
+        except Exception as _e4016:
+            _ok40 = "异常: %s" % _e4016
+        check("40.16 明细判据与可见性判据一致（真机，此刻=%r）" % (_pin40,),
+              [_ok40], expect_contain=[True])
 
     except Exception as _e40:
         check("第 40 节异常: %s" % _e40, [True], expect_contain=[False])
@@ -4714,6 +4745,141 @@ def main():
 
     except Exception as _e41:
         check("第 41 节异常: %s" % _e41, [True], expect_contain=[False])
+
+    # ==================================================================
+    # 42. v65 让位只认【成员列表】，参数信息（形参签名）不让位
+    # ==================================================================
+    # 用户报：UserForm2 第13行 `UserForm1.SelectedList.RemoveItem sellis` 处
+    # "输入任何字符都无提醒"；VBE 在那儿弹的正是【参数信息】（形参签名）。
+    # 用户澄清 v63 的原意："只有弹成员列表的时候才让位，弹形参签名不需要让位。"
+    #
+    # 只读复现（真实工程 + 合成光标，已实测）确认：该位置唯一能拦掉提示的就是
+    # v63 那条让位判据 —— 提示窗不可见时 matches=['SelectedListRow2']；可见时
+    # 让位、候选为空。故修法 = 把让位范围从"任何提示窗"收窄到"成员列表窗"，
+    # 并让焦点判据把 VBE 自己的提示窗算作"仍在代码窗格"。
+    print("\n=== 42. v65 让位只认成员列表（参数信息不让位）===")
+    try:
+        import vbe_bridge as VB42
+
+        # 42.1 让位清单：含成员列表、不含参数信息
+        check("42.1 让位清单只含成员列表窗（NameListWndClass）",
+              ["NameListWndClass" in VB42.VBE_YIELD_CLASSES,
+               "PopupTipWndClass" not in VB42.VBE_YIELD_CLASSES,
+               set(VB42.VBE_YIELD_CLASSES) <= set(VB42.VBE_POPUP_CLASSES)],
+              expect_contain=[True, True, True])
+
+        # 42.2~42.5 判据本身（打桩窗口明细，纯 Python，不碰 Excel）
+        _orig42 = (VB42._vbe_popup_hwnds, VB42._popup_details_now)
+
+        def _stub42(details):
+            VB42._vbe_popup_hwnds = lambda: [1]
+            VB42._popup_details_now = lambda hs: list(details)
+
+        _stub42([("PopupTipWndClass", 300, 18)])
+        check("42.2 只可见参数信息 -> 不让位（False）★v65 核心",
+              [VB42.vbe_yield_visible()], expect_contain=[False])
+        _stub42([("NameListWndClass", 120, 90)])
+        check("42.3 可见成员列表 -> 让位（True）",
+              [VB42.vbe_yield_visible()], expect_contain=[True])
+        _stub42([("PopupTipWndClass", 300, 18), ("NameListWndClass", 120, 90)])
+        check("42.4 两个都可见 -> 让位（成员列表说了算）",
+              [VB42.vbe_yield_visible()], expect_contain=[True])
+
+        def _boom42(hs):
+            raise RuntimeError("boom")
+        VB42._popup_details_now = _boom42
+        check("42.5 探测抛异常 -> 不让位、不炸",
+              [VB42.vbe_yield_visible()], expect_contain=[False])
+        VB42._vbe_popup_hwnds, VB42._popup_details_now = _orig42
+
+        # 42.6~42.10 引擎接线：优先 vbe_yield_visible，老后端退回 vbe_popup_visible
+        class _B42(_B40Base):
+            """v65 现场：参数信息可见，成员列表不可见。"""
+
+            def __init__(self, yld=False, pop=True, boom=False, boom2=False,
+                         **kw):
+                self._yld, self._pop = yld, pop
+                self._boom, self._boom2 = boom, boom2
+
+            def vbe_popup_visible(self):
+                if self._boom:
+                    raise RuntimeError("boom")
+                return self._pop
+
+            def vbe_yield_visible(self):
+                if self._boom2:
+                    raise RuntimeError("boom")
+                return self._yld
+
+            def vbe_popup_info(self):
+                return ([("PopupTipWndClass", 300, 18)] if self._pop else []) \
+                    + ([("NameListWndClass", 120, 90)] if self._yld else [])
+
+        def _trig42(cls=_B42, manual=False, **kw):
+            _be = cls(**kw)
+            _ui = _UI40()
+            _c = E.Completer(_be, _ui)
+            _c.trigger(not manual)      # True = 轮询自动触发；manual = Ctrl+Space
+            return sorted(_c.matches or []), _ui.shown
+
+        _hit42 = (["vbNo", "vbYes"], True)
+        check("42.6 参数信息可见（成员列表不可见）-> 照常弹 ★v65 核心",
+              [_trig42(pop=True, yld=False)], expect_contain=[_hit42])
+        check("42.7 成员列表可见 -> 让位（不弹、候选清空）",
+              [_trig42(pop=False, yld=True)], expect_contain=[([], False)])
+        check("42.8 老后端（只有 vbe_popup_visible）-> 退回旧行为：任何提示窗都让位",
+              [_trig42(cls=_B40, popup=True)], expect_contain=[([], False)])
+        check("42.8b 更老的桩后端（两个接口都没有）-> 不让位、照弹",
+              [_trig42(cls=_B40Old)], expect_contain=[_hit42])
+        check("42.9 vbe_yield_visible 抛异常 -> 不让位、不炸",
+              [_trig42(pop=True, yld=False, boom2=True)],
+              expect_contain=[_hit42])
+        check("42.10 手动 Ctrl+Space：成员列表可见也照弹（让位只管自动触发）",
+              [_trig42(manual=True, pop=False, yld=True)],
+              expect_contain=[_hit42])
+
+        # 42.11 真机：让位判据与明细一致
+        _y42 = _i42 = None
+        try:
+            _be42 = VB42.VbeBackend()
+            _y42 = _be42.vbe_yield_visible()
+            _i42 = _be42.vbe_popup_info()
+            _ok42 = (isinstance(_y42, bool)
+                     and _y42 == any(c in VB42.VBE_YIELD_CLASSES
+                                     for c, _w, _h in _i42))
+        except Exception as _e4211:
+            _ok42 = "异常: %s" % _e4211
+        check("42.11 真机：让位判据与明细一致（yield=%r info=%r）" % (_y42, _i42),
+              [_ok42], expect_contain=[True])
+
+        # 42.12~42.14 焦点判据：VBE 自己的提示窗算作"仍在代码窗格"
+        #   （否则提示窗一抢到焦点，v64 的闸门就把我们的候选窗当场收掉）
+        _orig42f = (VB42._vbe_frame_hwnd, VB42._focused_hwnd_in_vbe,
+                    VB42._parent_hwnd, VB42._window_class_name)
+
+        def _stub42f(cls, hwnd=900):
+            VB42._vbe_frame_hwnd = lambda: 100
+            VB42._focused_hwnd_in_vbe = lambda: hwnd
+            VB42._parent_hwnd = lambda h: 0
+            VB42._window_class_name = lambda h: (
+                cls if h == hwnd
+                else ("wndclass_desked_gsk" if h == 100 else ""))
+
+        _stub42f("NameListWndClass")
+        check("42.12 焦点落在成员列表窗上 -> 仍算在代码窗格（True）",
+              [VB42.vbe_code_pane_focused()], expect_contain=[True])
+        _stub42f("PopupTipWndClass")
+        check("42.13 焦点落在参数信息窗上 -> 仍算在代码窗格（True）★v65",
+              [VB42.vbe_code_pane_focused()], expect_contain=[True])
+        _stub42f("wndclass_pbrs")
+        check("42.14 属性窗口仍不算（False，v64 语义不变）",
+              [VB42.vbe_code_pane_focused()], expect_contain=[False])
+        for _f, _v in zip(("_vbe_frame_hwnd", "_focused_hwnd_in_vbe",
+                           "_parent_hwnd", "_window_class_name"), _orig42f):
+            setattr(VB42, _f, _v)
+
+    except Exception as _e42:
+        check("第 42 节异常: %s" % _e42, [True], expect_contain=[False])
 
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))
