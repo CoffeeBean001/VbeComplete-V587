@@ -530,7 +530,7 @@ HOST_ENUM_FUZZY_RUN = 4
 def _longest_run(positions):
     """命中下标（升序）里最长的那段连续长度。
 
-    `xlworkfaul` 打在 `xlWorkbookDefault` 上是 [0,1,2,3,4,9,12,13,14,15]，
+    `xlworkfaul` 打在 `xlWorkbookDefault` 上是 [0,1,2,3,4,5,12,13,14,15]，
     最长连续段是 6（`xlwork`；后面 `faul` 又是 4）—— 说明用户确实在打这个名字，
     只是中间跳过了 `book`。而 `xlce` 打在 `xlVAlignCenter` 上只有断断续续的单点，
     最长连续段 1 —— 那就只是"碰巧凑得出子序列"，不算。
