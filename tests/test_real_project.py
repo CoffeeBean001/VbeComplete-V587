@@ -4530,6 +4530,15 @@ def main():
               [_r40 == VB40.vbe_popup_visible(), isinstance(_r40, bool)],
               expect_contain=[True, True])
 
+        # 40.13 句柄复用护栏：类名 / 进程两道复核都在（句柄值可能被 Windows
+        # 回收给别的窗口，只凭"记得这个句柄"就相信它会永远屏蔽我们的弹窗）
+        _hp40 = VB40._host_process_id()
+        check("40.13 类名复核与宿主 PID 探测可用（PID=%s）" % (_hp40,),
+              [isinstance(_hp40, int) and _hp40 >= 0,
+               VB40._window_class_name(0),
+               VB40._window_class_name(123456) not in VB40.VBE_POPUP_CLASSES],
+              expect_contain=[True, "", True])
+
     except Exception as _e40:
         check("第 40 节异常: %s" % _e40, [True], expect_contain=[False])
 

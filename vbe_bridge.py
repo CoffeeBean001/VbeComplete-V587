@@ -629,14 +629,61 @@ def _hwnd_alive(hwnd):
         return False
 
 
+def _host_process_id():
+    """宿主（Excel / VBE）进程 PID；找不到返回 0。纯 Win32，不碰 COM。"""
+    import ctypes
+    import ctypes.wintypes
+    u32 = ctypes.windll.user32
+    fn = u32.FindWindowW
+    fn.restype = ctypes.c_void_p
+    fn.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
+    for cls in _HOST_WINDOW_CLASSES:
+        try:
+            hwnd = fn(cls, None)
+        except Exception:
+            hwnd = 0
+        if hwnd:
+            pid = ctypes.wintypes.DWORD()
+            u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            return int(pid.value or 0)
+    return 0
+
+
+def _window_class_name(hwnd):
+    import ctypes
+    try:
+        buf = ctypes.create_unicode_buffer(256)
+        if ctypes.windll.user32.GetClassNameW(hwnd, buf, 256):
+            return buf.value
+    except Exception:
+        pass
+    return ""
+
+
 def _popup_showing_now(hwnds):
-    """这些句柄里有没有正在显示的（可见 + 尺寸正常）。"""
+    """这些句柄里有没有正在显示的 VBE 提示窗。
+
+    逐个复核三件事（句柄值会被 Windows 回收复用给别的窗口，只凭"还记得这个
+    句柄"就相信它，一旦复用就会出现"永远以为 VBE 在弹提示、我们的窗再也不弹"
+    的灾难）：
+      1. 类名仍是 VBE 的提示窗类；
+      2. 属于宿主 Excel/VBE 进程；
+      3. 可见且尺寸正常。
+    """
     import ctypes
     import ctypes.wintypes
     u32 = ctypes.windll.user32
     rect = ctypes.wintypes.RECT()
+    host_pid = _host_process_id()
     for hwnd in hwnds:
         try:
+            if _window_class_name(hwnd) not in VBE_POPUP_CLASSES:
+                continue
+            if host_pid:
+                pid = ctypes.wintypes.DWORD()
+                u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if int(pid.value or 0) != host_pid:
+                    continue
             if not u32.IsWindowVisible(hwnd):
                 continue
             if not u32.GetWindowRect(hwnd, ctypes.byref(rect)):
