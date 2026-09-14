@@ -38,7 +38,14 @@ _IDENT = r"[^\W\d]\w*"
 # 这类名字一律有固定的库前缀 + 大写首字母，按前缀排除足够安全。
 _RE_BUILTIN_CONST = re.compile(r"^(?:vb|xl|mso|db|wd|pp|ol|ac|wpp)[A-Z]")
 
-_RE_CONTINUATION = re.compile(r"_\s*\n")  # 行继续符 _
+# 行继续符 `_`：VBA 语法要求它【前面至少有一个空格 / Tab】，且其后到行尾只有空白。
+# 必须校验"前面是空白"——只写 `_\s*\n` 会把【以 _ 结尾的标识符】一起吞掉。
+# 真实事故（v59）：用户 pub3 里 `Public Enum E` 的成员名是 A_ / B_ / ... / EZ_，
+# 每行都以 "Z_" 结尾，于是 6 行全被并进下一行，`End Enum` 被一起吞掉 —— 之后
+# 整个模块（206 行、25 个过程）都被当成 Enum 块成员解析：过程名收不全（只收
+# 每行行首那个词），假名字 Function / If / With / s 混进候选池且 priv=False
+# （全工程可见），过程内局部变量还被记成模块级，跨过程泄漏。
+_RE_CONTINUATION = re.compile(r"(?<=[ \t])_[ \t]*\r?\n")  # 行继续符 _
 _RE_DECL = re.compile(r"\b(?:Dim|Private|Public|Global|Friend|Static|ReDim)\b", re.I)
 _RE_CONST = re.compile(r"\bConst\b", re.I)
 _RE_SUB = re.compile(
@@ -51,9 +58,14 @@ _RE_PROP = re.compile(
 _RE_EVENT = re.compile(
     r"^\s*(?:(?:Public|Private|Friend|Global|Static)\s+)*Event\s+(" + _IDENT
     + r")\s*(?:\(|$)", re.I)
-# PtrSafe 是 64 位 Office 下 Declare 的修饰关键字，需一并容忍
+# PtrSafe 是 64 位 Office 下 Declare 的修饰关键字，需一并容忍。
+# 前面的访问修饰符（Public / Private / Friend / Global）也必须吃进来：本正则
+# 在 extract_records 里是用 .match() 从头匹配的，`Private Declare PtrSafe
+# Function gApi Lib "k" ...` 行首是 Private，旧写法 \bDeclare 匹配不上，会掉进
+# 下面的"变量声明"分支 —— 收录出假名字 "Declare"，真正的 gApi2 反而丢了（v59）。
 _RE_DECLARE = re.compile(
-    r"\bDeclare\s+(?:PtrSafe\s+)?(?:Sub|Function)\s+(" + _IDENT + r")\s*", re.I)
+    r"\s*(?:(?:Public|Private|Friend|Global)\s+)*\bDeclare\s+"
+    r"(?:PtrSafe\s+)?(?:Sub|Function)\s+(" + _IDENT + r")\s*", re.I)
 _RE_TYPE = re.compile(
     r"^\s*(?:(?:Public|Private|Friend|Global)\s+)*Type\s+(" + _IDENT + r")\b", re.I)
 _RE_ENUM = re.compile(
@@ -129,11 +141,19 @@ def _mask_strings_and_comments(code):
     return "".join(out)
 
 
+# 出现在【变量名之前】的修饰关键字：`Public WithEvents clk As MSForms.CommandButton`
+# 里的 WithEvents 必须跳过，否则收录到的是 "WithEvents" 这个假名字，真正的 clk
+# 反而丢了（v59 真实事故：cls 模块的 Public WithEvents clk）。
+_RE_LEAD_MODIFIER = re.compile(r"^(?:WithEvents)\s+", re.I)
+
+
 def _decl_names(rest):
     """从声明右侧（如 'x As Long, y(), z As String' 或 'a = 5, b = 6'）提取标识符名。"""
     names = []
     for seg in rest.split(","):
         seg = seg.strip()
+        # 跳过 WithEvents 这类"名字之前"的修饰符（逐段跳过，逗号后面那段不受影响）
+        seg = _RE_LEAD_MODIFIER.sub("", seg, count=1).strip()
         m = _RE_LEADING_IDENT.match(seg)
         if m:
             names.append(m.group(0))
@@ -278,14 +298,12 @@ def extract_records(code, module=None, is_std_module=True, caret=None):
             priv = _is_private(kind, has_priv_kw, has_pub_kw, is_std_module)
             body = _RE_CONST.sub("", line, count=1).strip()
             body = re.sub(r"^(?:Private|Public|Global|Friend)\b", "", body, flags=re.I).strip()
-            for seg in body.split(","):
-                m = _RE_LEADING_IDENT.match(seg.strip())
-                if m:
-                    # 过程内 Const 永远是局部
-                    if cur_proc:
-                        add(m.group(0), cur_proc, False)
-                    else:
-                        add(m.group(0), None, priv)
+            for nm in _decl_names(body):
+                # 过程内 Const 永远是局部
+                if cur_proc:
+                    add(nm, cur_proc, False)
+                else:
+                    add(nm, None, priv)
             continue
 
         # 普通变量声明 Dim/Private/...（非 Const）
@@ -293,14 +311,12 @@ def extract_records(code, module=None, is_std_module=True, caret=None):
             kind = KIND_VAR
             priv = _is_private(kind, has_priv_kw, has_pub_kw, is_std_module)
             body = _RE_DECL.sub("", line, count=1).strip()
-            for seg in body.split(","):
-                m = _RE_LEADING_IDENT.match(seg.strip())
-                if m:
-                    # 过程内 Dim/Static = 局部
-                    if cur_proc:
-                        add(m.group(0), cur_proc, False)
-                    else:
-                        add(m.group(0), None, priv)
+            for nm in _decl_names(body):
+                # 过程内 Dim/Static = 局部
+                if cur_proc:
+                    add(nm, cur_proc, False)
+                else:
+                    add(nm, None, priv)
             continue
 
     return result

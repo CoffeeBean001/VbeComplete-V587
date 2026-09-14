@@ -3612,6 +3612,67 @@ def main():
     except Exception as _e35:
         check("第 35 节异常: %s" % _e35, [True], expect_contain=[False])
 
+    # ---- 36. v59：续行符误判 / WithEvents / Declare 修饰符（解析层）----
+    #
+    # 三个都是"行首修饰符被当成名字"或"符号被判成续行符"这一类误判，共同症状：
+    # 真名字收不到、假名字混进候选池。真实工程里 pub3 的 Enum 成员名是
+    # A_/B_/.../EZ_（每行都以 Z_ 结尾），整模块因此被当成 Enum 块解析。
+    print("\n=== 36. 续行符与声明修饰符（v59）===")
+
+    def recs36(code, std=True):
+        return [(r[0], r[2], r[3]) for r in P.extract_records(
+            code, module="M1", is_std_module=std)]
+
+    # 36.1 名字以 _ 结尾且正好在行尾 —— VBA 要求续行符 _ 前面必须有空白，
+    #      所以这不是续行符，不能把下一行（End Enum …）并进来。
+    cont_junk = "\n".join([
+        "Public Enum E",
+        "    A_ = 1: B_: Z_",
+        "End Enum",
+        "Function getOneFile()",
+        "    Dim tmp As String",
+        "    With Application.FileDialog(1)",
+        "        If .Show = -1 Then",
+        "            s = .SelectedItems(1)",
+        "        End If",
+        "    End With",
+        "    getOneFile = s",
+        "End Function"])
+    got36 = recs36(cont_junk)
+    check("36.1 Enum 成员名以 _ 结尾：不算续行符，假名字消失",
+          [n for n, _, _ in got36],
+          expect_contain=["E", "A_", "getOneFile"],
+          expect_absent=["Function", "With", "If", "s"])
+    # 36.2 End Enum 必须真的闭合：之后的过程名照常收、局部变量仍归属其过程
+    #      （不闭合时全被记成模块级: proc=None）
+    check("36.2 End Enum 正确闭合：之后的过程/局部变量归属正确",
+          got36,
+          expect_contain=[("getOneFile", None, False),
+                          ("tmp", "getOneFile", False)])
+
+    # 36.3 续行符规则本身：_ 前有空白才合并
+    _merged = P._RE_CONTINUATION.sub(" ", "Dim a _\n    , b")
+    _kept = P._RE_CONTINUATION.sub(" ", "    A_ = 1: Z_\nEnd Enum")
+    check("36.3 续行符：_ 前有空白才合并，名字结尾的 _ 不合并",
+          ["\n" in _merged, "\n" in _kept],
+          expect_contain=[False, True])
+
+    # 36.4 Public WithEvents clk As ... —— 收真名 clk，不收 WithEvents
+    check("36.4 WithEvents 声明收录 clk（不收 WithEvents）",
+          recs36("Public WithEvents clk As MSForms.CommandButton", std=False),
+          expect_contain=[("clk", None, True)],
+          expect_absent=[("WithEvents", None, True)])
+
+    # 36.5 带访问修饰符的 Declare —— 收真名，不收 Declare
+    check("36.5 Private Declare 收录 gApi（不收 Declare）",
+          recs36('Private Declare PtrSafe Function gApi Lib "k" '
+                 '(ByVal x As Long) As Long'),
+          expect_contain=[("gApi", None, True), ("x", None, False)],
+          expect_absent=[("Declare", None, True)])
+    check("36.6 无修饰 Declare 仍收录",
+          recs36('Declare PtrSafe Function gApi2 Lib "k" () As Long'),
+          expect_contain=[("gApi2", None, False)])
+
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))
     if FAILURES:
