@@ -15,6 +15,7 @@ import unicodedata
 from log import log as _log
 
 import parser as vba_parser
+import vba_builtins
 from engine import replace_word
 
 _CACHE_TTL = 2.0  # 标识符缓存刷新间隔（秒）
@@ -26,6 +27,19 @@ ENABLE_IMPLICIT_IDENTIFIERS = True
 #   "module" —— 本模块任意位置都能提示（最宽松，但会跨过程泄漏同名变量）
 #   "proc"   —— 按"首次出现所在过程"限定作用域（更贴近 VBA 语义，避免跨过程泄漏）
 IMPLICIT_SCOPE = "proc"
+
+# VBA 语言自带的名字（内建函数 / 常用内建常量 / 内建数据类型）是否纳入提示。
+# 关闭后回到旧行为：只提示工程代码里出现过的名字（外加组件名、窗体控件名）。
+ENABLE_VBA_BUILTINS = True
+# 内建名字挂靠的"模块名"。
+#
+# 这是一个【虚拟模块】——VBA 运行时库。之所以要给它一个名字而不是留空：
+#   1) 这些名字在工程里任何模块都能裸名引用，按模块级 priv=False 收录即可；
+#   2) 引擎判"回声候选是不是真名字"时会问 declared_elsewhere（名字是不是
+#      在【别的模块】声明过）。把内建名字的归属记成 VBA，那一问天然为真，
+#      内建名字就不会被"只在本模块声明过 + 现场文本扫不到 -> 当幽灵剔掉"
+#      这条规则误杀（详见 engine._name_really_exists）。
+_BUILTIN_MODULE = "VBA"
 
 # 合法标识符（含中文）的模块名/窗体名/类名，用于把组件名纳入候选
 _RE_PLAIN_IDENT = re.compile(r"^[^\W\d]\w*$")
@@ -890,13 +904,18 @@ class VbeBackend:
         # 【声明在别的模块】（跨模块 Public，可当证据）与【只在我正在编辑的
         # 这个模块里声明过】（一律以现场文本为准，见 declared_elsewhere）。
         self._declared_by_module = {}
-        # 由【工程结构】而非代码文本决定其存在的名字（小写）：组件名
-        # （标准模块 / 窗体 / 类模块 / ThisWorkbook、Sheet1 等文档模块名）
-        # 与窗体控件名。这类名字不需要在代码里出现过才算"真实存在" ——
-        # 窗体代码里没写过 UserForm1，UserForm1 照样是合法引用；刚拖上去的
-        # Label1 一行代码都还没有，它的名字照样存在于设计器里。引擎靠它避免
-        # 把这类名字当成"回声幻影"剔掉（v60，见 engine._name_really_exists）。
+        # 由【工程结构 / 语言运行时】而非代码文本决定其存在的名字（小写）：
+        #   * 组件名（标准模块 / 窗体 / 类模块 / ThisWorkbook、Sheet1 等文档模块名）
+        #     与窗体控件名 —— 窗体代码里没写过 UserForm1，UserForm1 照样是合法
+        #     引用；刚拖上去的 Label1 一行代码都还没有，它的名字照样存在于设计器
+        #     里（v60）；
+        #   * VBA 语言自带的名字（内建函数 / 内建常量 / 内建数据类型）—— 它们由
+        #     语言运行时提供，用户代码里没调用过 MsgBox 也照样能写 MsgBox（v61）。
+        # 引擎靠它避免把这类名字当成"回声幻影"剔掉（见 engine._name_really_exists）。
         self._structural_names = set()
+        # 真正作为"VBA 内建名字"收录的那些（小写，v61）。引擎对这批名字的
+        # 模糊匹配收紧一档（只认连续命中，详见 engine.trigger 里的说明）。
+        self._builtin_names = set()
 
     def release(self):
         """Excel/VBE 关闭或离开 VBE 时调用：清空标识符缓存并释放 COM 资源。
@@ -909,6 +928,7 @@ class VbeBackend:
         self._caret_word = ""
         self._declared_by_module = {}
         self._structural_names = set()
+        self._builtin_names = set()
         # 丢掉缓存的 VBE 对象 —— 这是 Excel 能否真正退出的关键一步。
         # 刻意【不】调 CoFreeUnusedLibraries —— 它释放不了我们持有的引用，
         # 在 Excel 关闭期间调用反而会拖慢/惊扰 COM（详见 _co_free 的说明）。
@@ -1142,6 +1162,10 @@ class VbeBackend:
         declared_names = set()
         # 结构性名字：组件名 + 窗体控件名（v60）。详见 __init__ 里的说明。
         structural_names = set()
+        # 真正作为"VBA 内建名字"收录的那些（v61，小写）。与清单的差别：工程里
+        # 已经自己声明过同名时以用户的为准，那些名字【不】算内建 —— 于是引擎
+        # 对它们收紧匹配时不会连用户自己的定义一起收紧。
+        builtin_names = set()
         try:
             for comp in _collect_components(vbe, caret_mod):
                 try:
@@ -1260,10 +1284,51 @@ class VbeBackend:
                     continue
         except Exception:
             return []
+
+        # ---- VBA 语言自带的名字（v61）----
+        # 用户报："VBA 本身自带的函数也加入提示列表，现在不能提示"。
+        #
+        # 这些名字由【语言运行时】决定存在，与工程代码文本无关，所以三件事都要做：
+        #   1) 进候选池 —— 否则模糊匹配无从命中；
+        #   2) 进 structural_names —— 引擎判"回声候选是不是真名字"时最先看它。
+        #      打 ms 想补 MsgBox 时，ms 是 msgbox 的连续子串 -> 命中回声候选；
+        #      而代码里若从没出现过 MsgBox，现场文本扫不到、工程里也没声明过，
+        #      少了这一路证据候选必被踢掉 —— 症状正是"打 ms 死活不提示 MsgBox"；
+        #   3) 进 _decl_by_mod（挂到 VBA 这个"别的模块"下），让 declared_elsewhere
+        #      也认它们 —— 现场证据不可用（COM 读不到）时的兜底路径同样放行。
+        #
+        # 已声明过的同名不重复收录：工程里真有 Function Left(...) 时以用户的定义
+        # 为准，免得列表里出现两条同名。
+        if ENABLE_VBA_BUILTINS:
+            for _bn in vba_builtins.BUILTIN_NAMES:
+                _bl = _bn.lower()
+                if _bl in declared_names:
+                    continue
+                records.append((_bn, _BUILTIN_MODULE, None, False))
+                declared_names.add(_bl)
+                structural_names.add(_bl)
+                builtin_names.add(_bl)
+                _decl_by_mod.setdefault(_bl, set()).add(_BUILTIN_MODULE)
+            # 内建数据类型名：既进候选池（`As |` 位置的候选是从可见标识符里筛出来
+            # 的，不在池子里就永远显示不出来），也进 type_names（那一位置只该冒
+            # 类型名）。与函数清单重合的（Date / String 等）由上面的 declared_names
+            # 去重挡掉，不会再收一遍。
+            for _tn in vba_builtins.BUILTIN_TYPE_NAMES:
+                _tl = _tn.lower()
+                type_names.add(_tn)
+                if _tl in declared_names:
+                    continue
+                records.append((_tn, _BUILTIN_MODULE, None, False))
+                declared_names.add(_tl)
+                structural_names.add(_tl)
+                builtin_names.add(_tl)
+                _decl_by_mod.setdefault(_tl, set()).add(_BUILTIN_MODULE)
+
         self._type_names = type_names
         self._declared_names = declared_names
         self._declared_by_module = _decl_by_mod
         self._structural_names = structural_names
+        self._builtin_names = builtin_names
         # 只在数量变化时记日志，避免每 2 秒刷一行
         if len(records) != getattr(self, "_last_id_count", -1):
             self._last_id_count = len(records)
@@ -1278,16 +1343,31 @@ class VbeBackend:
         return getattr(self, "_type_names", set())
 
     def get_structural_names(self):
-        """返回由【工程结构】决定其存在的名字（小写集合）：组件名 + 窗体控件名。
+        """返回由【工程结构 / 语言运行时】决定其存在的名字（小写集合）。
+
+        三类：组件名（模块 / 窗体 / 类 / 文档模块名）+ 窗体控件名 + VBA 语言自带
+        的名字（内建函数 / 内建常量 / 内建数据类型）。
 
         与 get_declared_names 的区别：后者是"代码文本里真声明过什么"，前者是
-        "工程结构里本来有什么"。用户刚拖上去的 Label1、一行代码都没有的新窗体
-        UserForm1，都属于前者而不属于后者。
+        "本来就有、与代码文本无关"。用户刚拖上去的 Label1、一行代码都没有的新
+        窗体 UserForm1、代码里从没调用过的 MsgBox，都属于前者而不属于后者。
 
         引擎用它来判断"回声候选是不是真名字"——这类名字不能走"只在本模块声明
-        过、现场文本又扫不到 -> 当幽灵剔掉"的规则（v60）。
+        过、现场文本又扫不到 -> 当幽灵剔掉"的规则（v60 组件名与控件名、v61 再加
+        VBA 内建名字：打 ms 要能补出从没写过的 MsgBox）。
         """
         return set(getattr(self, "_structural_names", set()) or set())
+
+    def get_builtin_names(self):
+        """返回真正作为"VBA 内建名字"收录的那些（小写集合，v61）。
+
+        与 vba_builtins 的清单不同：工程里已经自己声明过同名时以用户的定义为准，
+        那些名字不会出现在这里 —— 引擎据此对"语言自带的公共词汇"收紧模糊匹配
+        （只认连续命中），而不会连用户自己的同名定义一起收紧。
+
+        后端不提供该接口时引擎不做任何收紧（旧式 / 测试后端行为不变）。
+        """
+        return set(getattr(self, "_builtin_names", set()) or set())
 
     # ---- 自动配对：输入 ( / " 自动补右半边 ----
     #

@@ -716,17 +716,22 @@ class Completer:
         low = str(name).lower()
         if not low:
             return False
-        # v60：组件名（模块 / 窗体 / 类 / 文档模块名）与窗体控件名，由【工程
-        # 结构】决定其存在，与代码文本无关 —— 直接判为真名字，不走下面那套
-        # "现场文本 / 声明归属" 的证据链。
+        # v60：组件名（模块 / 窗体 / 类 / 文档模块名）、窗体控件名，以及 v61 加
+        # 上的 VBA 语言自带名字（内建函数 / 常量 / 数据类型）—— 它们的共同点是
+        # 【由工程结构或语言运行时决定存在，与代码文本无关】，所以直接判为真名字，
+        # 不走下面那套"现场文本 / 声明归属"的证据链。
         #
-        # 不加这一条会怎样（用户报的 bug）：插入一个 UserForm1 后 VBE 会自动
-        # 打开该窗体的代码窗口，用户在【窗体自己的代码里】输入 use —— 而 use
-        # 是 userform1 的连续子串，于是 UserForm1 命中"回声候选"；接着
-        # declared_elsewhere 说它"只声明在本模块"，现场文本里又（通常）压根
-        # 没出现过 UserForm1 这个词，两条证据都不成立，候选被剔掉 ——
-        # 症状就是"窗体名死活不提示"，而同样的输入在别的模块里却一切正常
-        # （那里 declared_elsewhere 返回 True）。刚拖上去的 Label1 同理。
+        # 不加这一条会怎样（用户报的两个 bug）：
+        #   * 插入一个 UserForm1 后 VBE 会自动打开该窗体的代码窗口，用户在
+        #     【窗体自己的代码里】输入 use —— 而 use 是 userform1 的连续子串，
+        #     于是 UserForm1 命中"回声候选"；接着 declared_elsewhere 说它"只声明
+        #     在本模块"，现场文本里又（通常）压根没出现过 UserForm1 这个词，两条
+        #     证据都不成立，候选被剔掉 —— 症状就是"窗体名死活不提示"，而同样的
+        #     输入在别的模块里却一切正常（那里 declared_elsewhere 返回 True）。
+        #     刚拖上去的 Label1 同理。
+        #   * 输入 ms 想补 MsgBox —— ms 同样是 msgbox 的连续子串；只要这个模块里
+        #     还没写过 MsgBox，现场就扫不到它，候选照样被剔。VBA 内建名字由语言
+        #     提供，代码里没调用过也永远合法，必须走这一路。
         if low in self._structural_names():
             return True
         if declared is None:
@@ -810,13 +815,16 @@ class Completer:
             return set()
 
     def _structural_names(self):
-        """由【工程结构】决定其存在的名字（小写集合）：组件名 + 窗体控件名。
+        """由【工程结构 / 语言运行时】决定其存在的名字（小写集合）。
+
+        三类：组件名 + 窗体控件名（v60）+ VBA 语言自带的名字（v61：内建函数 /
+        内建常量 / 内建数据类型）。
 
         v60。与 _declared_names 的分工：
           * _declared_names 答的是"代码文本里真声明过什么"；
-          * 本方法答的是"工程结构里本来有什么"。
+          * 本方法答的是"本来就有、与代码文本无关的东西"。
         刚拖上去的 Label1（一个字代码都还没有）、一行代码都没有的新窗体
-        UserForm1，只在前者里出现，不在后者里。
+        UserForm1、代码里从没调用过的 MsgBox，只在前者里出现，不在后者里。
 
         为什么需要单独一路证据：回声防护会先假定"以当前词为连续子串的候选"
         可能是被删剩下的旧版本，再用"它在工程里真实存在吗"来裁决。裁决依赖
@@ -828,6 +836,23 @@ class Completer:
         可选接口；后端不提供时返回空集，旧式/测试后端行为完全不变。
         """
         hook = getattr(self.backend, "get_structural_names", None)
+        if not callable(hook):
+            return set()
+        try:
+            return set(str(n).lower() for n in (hook() or ()))
+        except Exception:
+            return set()
+
+    def _builtin_names(self):
+        """后端给出的"VBA 语言自带名字"集合（小写）。可选接口。
+
+        v61。引擎用它给这批名字单独收紧一档模糊匹配 —— 它们是语言自带的公共
+        词汇（内建函数 / 常量 / 数据类型，近 300 个），什么字母组合都能在里面
+        找到子序列。详见 trigger 里的说明。
+
+        后端不提供时返回空集 -> 不做任何收紧（旧式 / 测试后端行为完全不变）。
+        """
+        hook = getattr(self.backend, "get_builtin_names", None)
         if not callable(hook):
             return set()
         try:
@@ -900,6 +925,29 @@ class Completer:
             r = fuzzy_match(i, word)
             if r is not None:
                 scored.append((r[0], i, r[1]))
+        # v61：VBA 内建名字（内建函数 / 常量 / 数据类型）单独收紧一档匹配。
+        #
+        # 它们是【语言自带的公共词汇】，近 300 个，而且几乎任何字母组合都能在
+        # 里面凑出子序列；若与"你自己工程里的名字"一样接受跳步匹配，任何 1~3 个
+        # 字符的输入都会冒出一大串无关项 —— 真机实测（候选池 373 条）：
+        #   输入 ar  -> vbAbortRetryIgnore / VarType / Partition 全挤进列表；
+        #   输入 vbc -> 29 条，其中 22 条是这种"碰巧凑得出"的。
+        #
+        # 收紧规则：kind >= 1（连续块 / 词首缩略 / 前缀 / 精确）一律放行，纯分散
+        # 命中（kind == 0）则要求输入至少 4 个字符。效果：
+        #   ms / msg -> MsgBox           （前缀）      照常
+        #   vbc      -> vbCrLf           （前缀）      照常
+        #   spli     -> Split            （前缀）      照常
+        #   instrr   -> InStrRev         （连续块）    照常
+        #   formcur  -> FormatCurrency   （跳步，7 字符）照常
+        #   ar       -> vbAbortRetryIgnore（跳步，2 字符）被挡掉 —— 正是要滤掉的噪音
+        # 这条只作用于【内建公共词汇】；你自己工程里的名字不受限
+        # （getse3 -> getSettingTitle3 照旧）。
+        if len(word) < 4:
+            _bl = self._builtin_names()
+            if _bl:
+                scored = [t for t in scored
+                          if t[0][0] >= 1 or t[1].lower() not in _bl]
         # sorted 稳定：同分时保持后端原来的顺序
         scored.sort(key=lambda t: t[0], reverse=True)
         matches = [name for _, name, _ in scored]

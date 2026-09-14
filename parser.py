@@ -401,6 +401,42 @@ _PREV_WORD_SKIP = frozenset(
     "as new lib alias implements goto gosub then else byval byref optional paramarray".split())
 
 
+def _blank_type_enum_blocks(masked_code):
+    """把 Type / Enum 块【内部的成员行】整行抹成等长空格（v61）。
+
+    为什么需要：块成员（枚举成员 / 自定义类型字段）只能通过 `E.Member` /
+    `p.field` 限定访问，裸名根本不可引用，因此不该进候选池（v59 用户拍板）。
+    extract_records 那时起就不收它们了，但"只读用法"扫描（_usage_candidates）
+    是【整篇文本】扫标识符的、没有块的概念 —— 于是 `Public Enum E` 里每行的
+    成员名（A_ / AA_ / …）又被当成"用到了却没声明"的隐式变量收回来，v59 的
+    修复等于没落地。真机实测：工程里那个模块又冒出 A_ / AA_ / AZ_ / BA_ /
+    BZ_ / CA_ / CZ_ / DA_ / DZ_ / EA_ / EZ_ / Z_ 共 12 个。
+
+    Type / Enum 声明行与 End 行【保留】：前者由 extract_records 负责收类型名，
+    后者让 extract_implicit_records 里的 in_block 状态能正常复位（否则块之后
+    的正常代码会被整段当成"块内"跳过）；End / Enum 这类关键字本来就在
+    _IMPLICIT_STOPWORDS 里，不会被误收。
+
+    抹成【等长空格】而不是删行：_usage_candidates 返回的是字符偏移，调用方拿它
+    配 _line_proc_map 定位过程归属，删行/改长度会让后面所有偏移整体错位。
+    """
+    out = []
+    in_block = False
+    for raw in masked_code.split("\n"):
+        line = raw.strip()
+        if in_block:
+            if _RE_BLOCK_END.match(line):
+                in_block = False
+                out.append(raw)                 # End Type / End Enum：保留
+            else:
+                out.append(" " * len(raw))      # 成员行：等长空格
+            continue
+        if _RE_TYPE.match(line) or _RE_ENUM.match(line):
+            in_block = True
+        out.append(raw)
+    return "\n".join(out)
+
+
 def _usage_candidates(masked_code, excluded):
     """扫描"只被读取、没被写过"的隐式变量，返回 [(name, 字符偏移), ...]。
 
@@ -825,6 +861,9 @@ def extract_implicit_records(code, module=None, is_std_module=True,
             pass
     masked = _mask_strings_and_comments(src)
     masked = _RE_CONTINUATION.sub(" ", masked)
+    # v61：Type / Enum 块内的成员行整行抹空 —— 否则下面的"只读用法"扫描会把
+    # 枚举成员名当成隐式变量收回来（详见 _blank_type_enum_blocks）。
+    masked = _blank_type_enum_blocks(masked)
 
     # 已声明名字。支持两种传法：
     #   - 名称序列（旧式）：视为全模块可见，一律排除；

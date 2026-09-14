@@ -174,6 +174,17 @@ def check(tag, got, expect_contain=(), expect_absent=()):
 
 
 def main():
+    # v61：VBA 内建名字（内建函数 / 常量 / 数据类型）默认会进候选池
+    # （vbe_bridge.ENABLE_VBA_BUILTINS）。下面第 1~37 节的断言是"工程内名字的
+    # 候选列表精确比对"（用户要求的防噪音护栏），与内建名字无关 —— 因此统一在
+    # 【关闭】的前提下跑，护栏强度保持不变；第 38 节专门把它打开，验证内建名字
+    # 的收集 / 放行 / 降噪规则。
+    try:
+        import vbe_bridge as _vb61
+        _vb61.ENABLE_VBA_BUILTINS = False
+    except Exception:
+        pass
+
     mods = load_modules()
     print("载入 %d 个模块: %s\n" % (len(mods), ", ".join(sorted(mods))))
 
@@ -3797,6 +3808,309 @@ def main():
 
     except Exception as _e37:
         check("第 37 节异常: %s" % _e37, [True], expect_contain=[False])
+
+    # ---- 38. v61：VBA 语言自带的名字（内建函数 / 常量 / 数据类型）----
+    print("\n=== 38. v61 VBA 内建名字进候选池 ===")
+    try:
+        import re as _re38
+        import vba_builtins as VB38
+
+        # 38.1~38.5：清单自身（纯静态，不依赖 Excel）
+        _low38 = [n.lower() for n in VB38.BUILTIN_NAMES]
+        _lowT38 = [n.lower() for n in VB38.BUILTIN_TYPE_NAMES]
+        check("38.1 两个清单各自无重名（函数+常量 %d 个、类型名 %d 个）"
+              % (len(_low38), len(_lowT38)),
+              [len(set(_low38)) == len(_low38)
+               and len(set(_lowT38)) == len(_lowT38)], expect_contain=[True])
+        _all38 = _low38 + _lowT38
+        _bad38 = [n for n in _all38
+                  if not _re38.match(r"^[^\W\d]\w*$", n)]
+        check("38.2 清单全是合法标识符（异常 %s）" % (_bad38 or "无"),
+              [len(_bad38) == 0], expect_contain=[True])
+        # 语言关键字一律不许混进来（v59 修过"Function/If/With 混进候选池"）
+        _kws38 = set(("if then else elseif end for next each step do loop while "
+                      "wend until select case with sub function property dim "
+                      "redim set let const static public private friend "
+                      "global declare type enum new nothing goto on option "
+                      "exit resume is like mod and or not xor eqv imp"
+                      ).split())
+        check("38.3 清单里没有语言关键字（命中 %s）"
+              % (sorted(_kws38 & set(_low38)) or "无"),
+              [len(_kws38 & set(_low38)) == 0], expect_contain=[True])
+        _want38 = ("MsgBox", "Left", "Len", "Split", "IsArray", "CLng",
+                   "InStrRev", "DateAdd", "StrConv", "CreateObject", "Array",
+                   "Shell", "vbCrLf", "vbYes", "vbRed", "vbNullString")
+        _miss38 = [n for n in _want38 if n.lower() not in VB38.BUILTIN_LOWER]
+        check("38.4 常用内建函数/常量齐备（缺 %s）" % (_miss38 or "无"),
+              [len(_miss38) == 0], expect_contain=[True])
+        _missT38 = [n for n in ("String", "Long", "Boolean", "Variant")
+                    if n.lower() not in VB38.BUILTIN_TYPE_LOWER]
+        check("38.5 内建数据类型齐备（缺 %s）" % (_missT38 or "无"),
+              [len(_missT38) == 0], expect_contain=[True])
+
+        class _UI38(object):
+            def __init__(self):
+                self.shown = False
+
+            def show(self, *a, **k):
+                self.shown = True
+
+            def update_selection(self, *a, **k):
+                pass
+
+            def hide(self, *a, **k):
+                self.shown = False
+
+            def contains_point(self, *a, **k):
+                return False
+
+        class _B38(object):
+            """模拟"代码里从没出现过 MsgBox 的模块"。
+
+            候选池里是 VBA 内建名字（挂虚拟模块 VBA）+ 一个用户自己声明过的
+            Left（模拟真实工程"同名只留用户的"那种形态）+ 一个真幽灵 msgGhost。
+            elsewhere 控制 declared_elsewhere 的返回值 —— 真实情形下内建名字
+            归属虚拟模块 VBA，从当前模块看就是"别的模块声明过"（True）。
+            """
+
+            def __init__(self, structural=True, elsewhere=False,
+                         module="模块2", builtin=True):
+                self._structural = structural
+                self._elsewhere = elsewhere
+                self._module = module
+                self._builtin = builtin
+
+            def get_context(self):
+                return {"line_no": 1, "caret_col": 1, "line_text": "",
+                        "in_string": False, "in_comment": False,
+                        "in_type_position": False, "in_decl_position": False,
+                        "decl_names": [], "proc_name": None,
+                        "module_name": self._module}
+
+            def get_identifiers(self):
+                return [("MsgBox", "VBA", None, False),
+                        ("vbCrLf", "VBA", None, False),
+                        ("String", "VBA", None, False),
+                        ("Long", "VBA", None, False),
+                        ("Left", "模块2", None, False),
+                        ("msgGhost", "模块2", None, True)]
+
+            def get_declared_names(self):
+                return ["msgbox", "vbcrlf", "left", "string", "long"]
+
+            def caret_word_at_collect(self):
+                return ""
+
+            def declared_elsewhere(self, name, module_name):
+                if self._elsewhere:
+                    return str(name).lower() in ("msgbox", "vbcrlf",
+                                                 "string", "long")
+                return False
+
+            def get_structural_names(self):
+                if not self._structural:
+                    return []
+                return ["msgbox", "vbcrlf", "string", "long"]
+
+            def get_builtin_names(self):
+                # 这四个就是候选池里的"VBA 内建名字"，引擎据此收紧匹配。
+                if not self._builtin:
+                    return []
+                return ["msgbox", "vbcrlf", "string", "long"]
+
+            def get_type_names(self):
+                return ["String", "Long"]
+
+            def names_outside_caret(self, caret, scope_only=False):
+                return set()        # 现场文本里一个字都没有
+
+            def apply_completion(self, *a, **k):
+                return None
+
+        def _trig38(word, **kw):
+            _be = _B38(**kw)
+            _line = "    " + word
+            _ctx = _be.get_context()
+            _ctx["line_text"] = _line
+            _ctx["caret_col"] = len(_line) + 1
+            _be.get_context = lambda: _ctx
+            _c = E.Completer(_be, _UI38())
+            _c.trigger()
+            return sorted(_c.matches or [])
+
+        def _trig38_type(word):
+            _be = _B38(elsewhere=True)
+            _line = "Dim x As " + word
+            _ctx = _be.get_context()
+            _ctx["line_text"] = _line
+            _ctx["caret_col"] = len(_line) + 1
+            _ctx["in_type_position"] = True
+            _be.get_context = lambda: _ctx
+            _c = E.Completer(_be, _UI38())
+            _c.trigger()
+            return sorted(_c.matches or [])
+
+        # 38.6 主场景：代码里从没写过 MsgBox，输入 ms 应能提示出来
+        check("38.6 输入 ms -> 提示 MsgBox（现场文本里没有它；幽灵仍剔）",
+              _trig38("ms", elsewhere=True),
+              expect_contain=["MsgBox"], expect_absent=["msgGhost"])
+        # 38.7 结构性证据这一路要能单独顶住（只是"进池子"并不够）
+        check("38.7 只靠结构性证据也放行（declared_elsewhere=False）",
+              _trig38("ms", structural=True, elsewhere=False),
+              expect_contain=["MsgBox"])
+        # 38.8 对照：两条证据都没有 = 修复前行为（不提示）
+        check("38.8 对照：无结构性证据且未声明过 -> 不提示（修复前行为）",
+              _trig38("ms", structural=False, elsewhere=False),
+              expect_absent=["MsgBox"])
+        # 38.9 真幽灵照旧被回声防护剔掉（放宽是精确的）
+        check("38.9 真幽灵 msgGhost 仍被剔",
+              _trig38("msgg", structural=True, elsewhere=True),
+              expect_absent=["msgGhost"])
+        # 38.10 内建名字跨模块可见（按模块级 priv=False 收录）
+        check("38.10 内建名字在别的模块也提示",
+              _trig38("vbcr", structural=True, elsewhere=True,
+                      module="模块3"),
+              expect_contain=["vbCrLf"])
+        # 38.11 As 位置提示内建数据类型，且不冒出函数名
+        check("38.11 As 位置提示内建类型名（不冒函数名）",
+              _trig38_type("str"),
+              expect_contain=["String"], expect_absent=["MsgBox"])
+        # 38.12 同名候选只保留一条
+        _vis38 = E.filter_identifiers_by_scope(
+            [("Left", "VBA", None, False), ("Left", "模块2", None, False)],
+            None, "模块2")
+        check("38.12 同名候选只保留一条（实得 %d 条）" % len(_vis38),
+              [len(_vis38) == 1], expect_contain=[True])
+
+        # 38.13~38.15：内建名字的匹配收紧一档（防噪音）
+        check("38.13 短输入 msb（跳步，3 字符）不冒内建名",
+              _trig38("msb", elsewhere=True),
+              expect_absent=["MsgBox"])
+        check("38.14 对照：不收紧时 msb 命中 MsgBox（说明规则真在起作用）",
+              _trig38("msb", elsewhere=True, builtin=False),
+              expect_contain=["MsgBox"])
+        check("38.15 前缀命中不受收紧影响（ms -> MsgBox）",
+              _trig38("ms", elsewhere=True),
+              expect_contain=["MsgBox"])
+
+        # 38.16~38.20：真实 VbeBackend 全链路（临时把开关打开）
+        import vbe_bridge as VB38R
+        _saved38 = VB38R.ENABLE_VBA_BUILTINS
+        VB38R.ENABLE_VBA_BUILTINS = True
+        try:
+            class _CM38R(object):
+                def __init__(self, text):
+                    self.text = text
+
+                @property
+                def CountOfLines(self):
+                    return self.text.count("\n") + 1
+
+                def Lines(self, start, count):
+                    return "\r\n".join(
+                        self.text.split("\n")[start - 1:start - 1 + count])
+
+            class _Comp38R(object):
+                def __init__(self, name, text, ctype=1):
+                    self.Name = name
+                    self.Type = ctype
+                    self.CodeModule = _CM38R(text)
+
+            class _Proj38R(object):
+                def __init__(self, comps):
+                    self.Name = "VBAProject"
+                    self.VBComponents = list(comps)
+
+            class _Pane38R(object):
+                def __init__(self, comp):
+                    self._c = comp
+                    self.sel = (1, 1, 1, 1)
+
+                @property
+                def CodeModule(self):
+                    return self._c.CodeModule
+
+                def GetSelection(self):
+                    return self.sel
+
+            class _VBE38R(object):
+                def __init__(self, comps, act):
+                    self.ActiveVBProject = _Proj38R(comps)
+                    self.ActiveCodePane = _Pane38R(act)
+
+            # 模块里一个字都没提过 MsgBox —— 提示它只能靠内建名字这一路
+            _comp38 = _Comp38R(
+                "Module1", "Sub Foo()\n    x = 1\n    <in>\nEnd Sub", 1)
+            _vbe38 = _VBE38R([_comp38], _comp38)
+            _orig38 = VB38R._get_vbe_cached
+            VB38R._get_vbe_cached = lambda: _vbe38
+            try:
+                _bk38 = VB38R.VbeBackend()
+                _ids38 = _bk38.get_identifiers()
+                _nm38 = set(str(r[0]).lower() for r in _ids38)
+                _vba38 = [r for r in _ids38
+                          if str(r[1]) == VB38R._BUILTIN_MODULE]
+                _visR38 = E.filter_identifiers_by_scope(
+                    _ids38, None, "Module1")
+                _hit38 = [n for n in _visR38
+                          if E.fuzzy_match(n, "ms") is not None]
+                check("38.16 真实后端：内建名字进了候选池（挂 VBA 的 %d 条）"
+                      % len(_vba38),
+                      ["msgbox" in _nm38 and "vbcrlf" in _nm38
+                       and "split" in _nm38 and "string" in _nm38],
+                      expect_contain=[True])
+                check("38.17 真实后端：内建名字跨模块可见（priv=False）",
+                      ["msgbox" in set(n.lower() for n in _visR38)],
+                      expect_contain=[True])
+                check("38.18 真实后端：结构性证据含内建名字",
+                      ["msgbox" in _bk38.get_structural_names()
+                       and "string" in _bk38.get_structural_names()],
+                      expect_contain=[True])
+                check("38.19 真实后端：declared_elsewhere 认得内建名字",
+                      [_bk38.declared_elsewhere("MsgBox", "Module1")],
+                      expect_contain=[True])
+                check("38.20 真实后端：get_builtin_names 只含内建",
+                      ["msgbox" in _bk38.get_builtin_names()
+                       and "foo" not in _bk38.get_builtin_names()],
+                      expect_contain=[True])
+                check("38.21 真实池子里输入 ms 能命中 MsgBox",
+                      _hit38, expect_contain=["MsgBox"])
+            finally:
+                VB38R._get_vbe_cached = _orig38
+        finally:
+            VB38R.ENABLE_VBA_BUILTINS = _saved38
+
+        # 38.22~38.24：Type/Enum 块成员不该从"隐式变量"那条路溜回候选池
+        #
+        # v59 让 extract_records 不再收块成员，但"只读用法"扫描（_usage_candidates）
+        # 是整篇文本扫的、没有块的概念 —— 真机上枚举成员又从这条路溜回来了
+        # （工程里冒出 A_ / AA_ / AZ_ … 共 12 个）。这里用最小片段钉住修复。
+        _blk38 = "\n".join([
+            "Public Enum E",
+            "    A_ = 0: B_ = 1: Z_ = 25",
+            "End Enum",
+            "Public Type gRec",
+            "    gId As Long",
+            "End Type",
+            "Sub Foo()",
+            "    afterBlk = 1",
+            "End Sub"])
+        _rec38b = P.extract_records(_blk38, module="M1", is_std_module=True)
+        _imp38b = P.extract_implicit_records(
+            _blk38, module="M1", is_std_module=True,
+            declared=_rec38b, scope="proc")
+        _nm38b = sorted(str(n) for n, _m, _p, _pr in _rec38b + _imp38b)
+        check("38.22 Enum/Type 成员不进候选池（漏进来的 _ 结尾名：%s）"
+              % [n for n in _nm38b if n.endswith("_")],
+              [not any(n.endswith("_") for n in _nm38b)],
+              expect_contain=[True])
+        check("38.23 Enum/Type 名本身照常收录",
+              _nm38b, expect_contain=["E", "gRec"])
+        check("38.24 块【之后】的代码照常收隐式变量（块状态已复位）",
+              _nm38b, expect_contain=["afterBlk"])
+
+    except Exception as _e38:
+        check("第 38 节异常: %s" % _e38, [True], expect_contain=[False])
 
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))
