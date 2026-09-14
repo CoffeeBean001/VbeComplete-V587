@@ -3406,8 +3406,9 @@ def main():
 
         # --- 后端集成：真写进"编辑器"（假 VBE）并把光标摆到中间 ---
         class _Mod35(object):
-            def __init__(self, text):
+            def __init__(self, text, fmt=None):
                 self.lines = [text]
+                self.fmt = fmt          # 模拟 VBE 的「自动语法检测」改写整行
 
             def Lines(self, n, _c):
                 # 真 VBE 对"虚拟空行"（末行+1）也返回空串，不报错
@@ -3420,6 +3421,8 @@ def main():
                 return len(self.lines)
 
             def ReplaceLine(self, n, t):
+                if self.fmt is not None:
+                    t = self.fmt(t)
                 self.lines[n - 1] = t
 
             def InsertLines(self, n, t):
@@ -3441,12 +3444,13 @@ def main():
             def __init__(self, pane):
                 self.ActiveCodePane = pane
 
-        def _pair_run(text, col, ch, ec=None, line=1):
+        def _pair_run(text, col, ch, ec=None, line=1, fmt=None):
             """返回 (该行新文本, 光标列, 是否代为输入)。ec 不同即视为有选区。
 
             line 可指定光标所在行：>CountOfLines 时即 VBE 的"虚拟空行"。
+            fmt 模拟 VBE 把整行重新格式化（等号补空格等）。
             """
-            mod = _Mod35(text)
+            mod = _Mod35(text, fmt)
             pane = _Pane35(mod, line, col, line, col if ec is None else ec)
             _orig = VB35._get_vbe_cached
             VB35._get_vbe_cached = lambda: _Vbe35(pane)
@@ -3498,6 +3502,21 @@ def main():
         check("35.20 行号离谱（差 2 行以上）-> 不管，交兜底",
               [_pair_run("x = ", 1, "(", line=4)[2]],
               expect_contain=[False])
+        # --- v58：VBE 的「自动语法检测」会把整行改写，行长一变光标就偏 ---
+        check("35.23 VBE 在插入的符号前补空格后，光标仍落在引号中间",
+              list(_pair_run("    w=4", 6, '"',
+                             fmt=lambda s: s.replace('w""', 'w ""'))),
+              expect_contain=['    w ""=4', 8, True])
+        check("35.24 _locate_inserted：VBE 改写后重新定位插入的符号对",
+              [VB35._locate_inserted("    x = 1()", "    x = 1()",
+                                     "(", ")", 9),
+               VB35._locate_inserted('    w "" = 4', '    w"" = 4', '"', '"', 5),
+               VB35._locate_inserted("    Z =() 1 + 2", "    Z=() 1 + 2",
+                                     "(", ")", 6)],
+              expect_contain=[10, 7, 8])
+        check("35.25 _locate_inserted：认不出来时返回 None（调用方退回行尾）",
+              [VB35._locate_inserted("完全不相关", "另一行", "(", ")", 3)],
+              expect_contain=[None])
         # --- v57：非主线程绝不能碰 COM（否则会污染全局退避，拖慢提示）---
         # 只验证守卫判据本身：vbe_bridge._get_vbe_cached 这个模块属性被前面
         # 小节（14/15/16 节等）换成过 lambda 且没还原，这里拿不到真函数；

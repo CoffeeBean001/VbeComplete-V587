@@ -5,6 +5,7 @@ VBE 后端：通过 pywin32 与正在运行的 Excel VBE 交互。
 需要：Excel 已开启「信任对 VBA 工程对象模型的访问」。
 """
 
+import difflib
 import os
 import re
 import threading
@@ -785,6 +786,50 @@ def _pair_insertion(line_text, col0, open_ch, close_ch):
             col0 + 1)
 
 
+def _locate_inserted(after, written, open_ch, close_ch, col0):
+    """在【VBE 改写过的行】里重新找出我们插入的那对符号，返回光标该落在的
+    位置（0-based："开符号之后"）；找不到返回 None。
+
+    为什么需要：VBE 有「自动语法检测」，会把整行重新格式化 —— 等号两边补空格
+    （`x=1` -> `x = 1`）、关键字改大小写（`if a then` -> `If a Then`）、参数逗号
+    后补空格（`foo(1,2)` -> `foo(1, 2)`）、标识符与引号之间补空格
+    （`w""` -> `w ""`）。行一变长，写入前算好的光标位置就偏了，表现为「光标
+    没落在括号/引号中间」。真机实测（v58）：`    w=4` 里 `w` 之后敲 `"`，得到
+    `    w "" = 4`，光标停在 7（第一个引号之前）而不是 8（两引号之间）。
+
+    做法：把「我们写入的版本 written」与「VBE 改写后的版本 after」做序列对齐
+    （difflib），再把 written 中 open_ch 的下标 col0 **映射**到 after 里的对应
+    位置 —— 而不是去猜哪个 diff 块是"我们加的"。因为 VBE 的改写可能把我们的
+    符号卷进 equal 块（比如它只在符号前补了个空格），那时"找 insert 块"就会
+    落空。
+    """
+    want = open_ch + close_ch
+    try:
+        sm = difflib.SequenceMatcher(None, written, after, autojunk=False)
+        p = None
+        for tag, i1, i2, j1, _j2 in sm.get_opcodes():
+            if tag == "equal":
+                if i1 <= col0 < i2:
+                    p = j1 + (col0 - i1)
+                    break
+            elif i1 <= col0 <= i2:      # replace / insert / delete
+                p = j1
+                break
+        if p is None:
+            return None
+        if after[p:p + len(want)] == want:
+            return p + 1
+        if after[p:p + 1] == open_ch:
+            return p + 1
+        # 对齐点附近再找一下（VBE 把一对符号拆开或挪过位置）
+        k = after.find(want, max(0, p - 2), p + len(want) + 3)
+        if k >= 0:
+            return k + 1
+    except Exception:
+        pass
+    return None
+
+
 class VbeBackend:
     def __init__(self):
         self._cache = None
@@ -1230,9 +1275,14 @@ class VbeBackend:
                 except Exception:
                     actual = new_line
                 if actual != new_line:
-                    # VBE 做了规范化：只要插入点仍是我们要的那个符号，光标位置
-                    # 依旧成立；认不出来就退到行尾附近，绝不越界。
-                    if actual[col0:col0 + 1] != open_ch:
+                    # VBE 把整行重新格式化过了（见 _locate_inserted 的说明）：
+                    # 在改写后的行里重新定位我们插入的那对符号，把光标钉到
+                    # 它中间；实在认不出来才退到行尾附近（绝不越界）。
+                    off = _locate_inserted(actual, new_line, open_ch, close_ch,
+                                           col0)
+                    if off is not None:
+                        caret_off = off
+                    else:
                         caret_off = min(caret_off, len(actual))
             else:
                 # 右半边已经在光标右边：只把光标挪过去，一个字符都不写
