@@ -1,23 +1,32 @@
-"""VBA 语言自带的名字：内建函数、常用内建常量、内建数据类型。
+"""VBA 语言自带的名字：内建函数、内建常量、内建数据类型、语言关键字。
 
 这些名字【不在用户的 VBE 工程代码里】—— 它们由 VBA 语言运行时提供，代码文本里
 一个字都找不到（除非用户恰好调用过 MsgBox / Left 之类）。所以必须像组件名、窗体
 控件名那样，作为一路独立的来源喂给候选池（见 vbe_bridge._collect_identifiers）。
 
-收录范围（按用户口径："VBA 本身自带的函数"）：
+收录范围：
   * FUNCTIONS  —— VBA 库的内建过程与函数（类型转换 / 字符串 / 日期 / 数组 / 数学 /
                   文件 IO / 交互 / 注册表 / 财务），含 Open、Close、Print 这类以
                   语句形式出现的 VBA 内建过程；
   * CONSTANTS  —— 常用的 vb* 内建常量（换行符、MsgBox 参数与返回值、StrConv、
                   日期常量、VarType、文件属性、颜色等）；
-  * TYPE_NAMES —— VBA 内建数据类型（`Dim x As <这里>` 用得上）。
+  * TYPE_NAMES —— VBA 内建数据类型（`Dim x As <这里>` 用得上）；
+  * KEYWORDS   —— 语言关键字 / 保留字（v62，按用户要求："把 vba 里面的所有
+                  关键字都纳入到提示词里"）：过程与声明（Sub / Function / Dim /
+                  Set …）、流程控制（If / For / Select …）、字面量（True /
+                  Nothing …）、运算符（And / Mod …）。
+
+【v61 与 v62 的口径变化】v61 时关键字是刻意不收的（用户当时讨厌 If/For/Sub 这类
+名字混进候选池）；v62 用户明确要求收进来，于是单列 KEYWORDS 一组，并配独立的开关
+`vbe_bridge.ENABLE_VBA_KEYWORDS` —— 想关掉只关这一组，不影响内建函数/常量。
 
 刻意【不收】的：
-  * 语言关键字（If / For / Sub / Function / Dim / Set / New / Nothing …）——
-    用户明确讨厌这类名字混进候选池（v59 修过"Function/If/With 混进候选池"这个
-    bug），VBE 自身也不把它们当成员提示；
+  * 过时的 Def* 类型声明关键字（DefBool / DefInt / … / DefVar，11 个）—— 早在
+    VB6 时代就已废弃，实际代码里几乎不会手写；
   * 歧义过大的语句名（Name / Width / Line / Spc / Tab）—— 它们在代码里更常作为
-    变量名或属性名出现，提示出来容易误导；
+    变量名或属性名出现，提示出来容易误导（v61 起就没有收录，v62 也没放回来）；
+  * Option Base / Option Compare 的参数名（Base / Compare / Binary / Text /
+    Database）—— 不是保留字，且都是极常见的普通变量名；
   * vbKey* 键盘常量（约 70 个）—— 前缀高度集中、实际极少手写；
   * Excel / Office 对象模型（Application / Worksheets / Range …）—— 那是宿主库、
     不是 VBA 自带，且 VBE 自己会提示点号后的成员。
@@ -155,6 +164,36 @@ TYPE_NAMES = (
 )
 
 # --------------------------------------------------------------------------
+# 语言关键字 / 保留字（v62）
+# --------------------------------------------------------------------------
+# 按 VBA 官方关键字表整理，另补三个常写的（PtrSafe / Alias / Explicit）：
+#   * PtrSafe / Alias —— 64 位 Declare 的修饰关键字，写 API 声明时要用；
+#   * Explicit       —— Option Explicit（Excel 新模块默认带上这一行）。
+# 与上面几组重合的（String / Date / Error / Erase / Get / Open …）由
+# BUILTIN_KEYWORDS 的去重挡掉，不会重复进池。
+KEYWORDS = (
+    # ---- 过程、声明与可见性 ----
+    "Sub", "Function", "Property", "Declare", "PtrSafe", "Alias", "Lib",
+    "Public", "Private", "Friend", "Global", "Static", "Const", "Dim",
+    "ReDim", "Preserve", "Implements", "Event", "WithEvents", "RaiseEvent",
+    "Optional", "ParamArray", "ByVal", "ByRef", "Attribute", "Option",
+    "Explicit", "Enum", "Type", "As", "New", "Me", "Is", "Like",
+    "Set", "Let", "Call",
+
+    # ---- 流程控制 ----
+    "If", "Then", "Else", "ElseIf", "End", "Select", "Case", "For", "Each",
+    "In", "To", "Step", "Next", "Do", "Loop", "While", "Wend", "Until",
+    "Exit", "GoTo", "GoSub", "Return", "On", "Resume", "Stop", "With",
+    "TypeOf", "Rem", "Debug",
+
+    # ---- 字面量 / 空值 ----
+    "True", "False", "Nothing", "Empty", "Null",
+
+    # ---- 运算符 ----
+    "And", "Or", "Not", "Xor", "Eqv", "Imp", "Mod", "AddressOf",
+)
+
+# --------------------------------------------------------------------------
 # 对外导出
 # --------------------------------------------------------------------------
 # 进候选池的名字（函数 + 常量），保留规范大小写、顺序稳定。
@@ -163,6 +202,11 @@ BUILTIN_NAMES = tuple(dict.fromkeys(FUNCTIONS + CONSTANTS))
 # 内建数据类型名（同样进候选池，供 `As |` 位置使用）。
 BUILTIN_TYPE_NAMES = tuple(dict.fromkeys(TYPE_NAMES))
 
+# 语言关键字（单独一组：开关独立、也便于测试里单独取舍）。
+# 与 BUILTIN_NAMES 的同名项（Error / Erase / Get / Open …）由收集侧的统一去重挡掉。
+BUILTIN_KEYWORDS = tuple(dict.fromkeys(KEYWORDS))
+
 # 去重后的小写集合，供需要快速查询的调用方使用。
 BUILTIN_LOWER = frozenset(n.lower() for n in BUILTIN_NAMES)
 BUILTIN_TYPE_LOWER = frozenset(n.lower() for n in BUILTIN_TYPE_NAMES)
+BUILTIN_KEYWORD_LOWER = frozenset(n.lower() for n in BUILTIN_KEYWORDS)

@@ -29,8 +29,16 @@ ENABLE_IMPLICIT_IDENTIFIERS = True
 IMPLICIT_SCOPE = "proc"
 
 # VBA 语言自带的名字（内建函数 / 常用内建常量 / 内建数据类型）是否纳入提示。
-# 关闭后回到旧行为：只提示工程代码里出现过的名字（外加组件名、窗体控件名）。
+# 关闭后回到旧行为：只提示工程代码里出现过的名字（外加组件名、窗体控件名；
+# 关键字另见下面的 ENABLE_VBA_KEYWORDS，同样关掉才是完全旧行为）。
 ENABLE_VBA_BUILTINS = True
+
+# 语言关键字 / 保留字（Sub / Dim / If / For / Set / And …）是否纳入提示（v62）。
+#
+# 独立成一个开关（而不是并进 ENABLE_VBA_BUILTINS）：关键字与内建函数是两拨
+# 东西 —— 前者是语法骨架、后者是可调用的库成员。实测下来若觉得关键字提示偏吵，
+# 只关这一个即可，内建函数照常提示。
+ENABLE_VBA_KEYWORDS = True
 # 内建名字挂靠的"模块名"。
 #
 # 这是一个【虚拟模块】——VBA 运行时库。之所以要给它一个名字而不是留空：
@@ -909,12 +917,14 @@ class VbeBackend:
         #     与窗体控件名 —— 窗体代码里没写过 UserForm1，UserForm1 照样是合法
         #     引用；刚拖上去的 Label1 一行代码都还没有，它的名字照样存在于设计器
         #     里（v60）；
-        #   * VBA 语言自带的名字（内建函数 / 内建常量 / 内建数据类型）—— 它们由
-        #     语言运行时提供，用户代码里没调用过 MsgBox 也照样能写 MsgBox（v61）。
+        #   * VBA 语言自带的名字（内建函数 / 内建常量 / 内建数据类型 v61，语言
+        #     关键字 v62）—— 它们由语言运行时提供，用户代码里没调用过 MsgBox
+        #     也照样能写 MsgBox、新模块第一行没写过 If 也照样能补 If。
         # 引擎靠它避免把这类名字当成"回声幻影"剔掉（见 engine._name_really_exists）。
         self._structural_names = set()
-        # 真正作为"VBA 内建名字"收录的那些（小写，v61）。引擎对这批名字的
-        # 模糊匹配收紧一档（只认连续命中，详见 engine.trigger 里的说明）。
+        # 真正作为"语言自带词汇"收录的那些（小写，v61 内建函数/常量/类型 +
+        # v62 语言关键字）。引擎对这批名字的模糊匹配收紧一档（纯分散命中要求
+        # 输入至少 4 个字符，详见 engine.trigger 里的说明）。
         self._builtin_names = set()
 
     def release(self):
@@ -1160,7 +1170,8 @@ class VbeBackend:
         # 供引擎层区分"真名字"与"幻影"：回退删字回退出来的未定义词（如 numA）
         # 只可能是隐式残留 / 正在敲的词本身，引擎据此剔除"提示自己"。
         declared_names = set()
-        # 结构性名字：组件名 + 窗体控件名（v60）。详见 __init__ 里的说明。
+        # 结构性名字：组件名 + 窗体控件名（v60）+ 语言自带名字（v61/v62）。
+        # 详见 __init__ 里的说明。
         structural_names = set()
         # 真正作为"VBA 内建名字"收录的那些（v61，小写）。与清单的差别：工程里
         # 已经自己声明过同名时以用户的为准，那些名字【不】算内建 —— 于是引擎
@@ -1324,6 +1335,28 @@ class VbeBackend:
                 builtin_names.add(_tl)
                 _decl_by_mod.setdefault(_tl, set()).add(_BUILTIN_MODULE)
 
+        # ---- 语言关键字 / 保留字（v62）----
+        # 用户要求："把 vba 里面的所有关键字都纳入到提示词里"。
+        #
+        # 走的是与内建名字**完全相同**的四路承接，原因也一样：关键字同样由语言
+        # 本身决定存在，与代码文本无关。比如输入 if 想补 If —— 而此刻代码里恰好
+        # 一个 If 都还没写过（新模块的第一行），现场文本扫不到、工程里也没声明过，
+        # 少任何一路都会被回声防护当成幻影剔掉（v60 窗体名、v61 内建函数的同一个坑）。
+        #
+        # 唯一区别是开关独立（ENABLE_VBA_KEYWORDS）：关掉关键字不影响内建函数。
+        # 关键字同样进 builtin_names —— 它们是语言自带的公共词汇（数量大、什么字母
+        # 组合都凑得出子序列），要跟内建函数一样收紧模糊匹配，见 engine.trigger。
+        if ENABLE_VBA_KEYWORDS:
+            for _kn in vba_builtins.BUILTIN_KEYWORDS:
+                _kl = _kn.lower()
+                if _kl in declared_names:
+                    continue
+                records.append((_kn, _BUILTIN_MODULE, None, False))
+                declared_names.add(_kl)
+                structural_names.add(_kl)
+                builtin_names.add(_kl)
+                _decl_by_mod.setdefault(_kl, set()).add(_BUILTIN_MODULE)
+
         self._type_names = type_names
         self._declared_names = declared_names
         self._declared_by_module = _decl_by_mod
@@ -1346,24 +1379,28 @@ class VbeBackend:
         """返回由【工程结构 / 语言运行时】决定其存在的名字（小写集合）。
 
         三类：组件名（模块 / 窗体 / 类 / 文档模块名）+ 窗体控件名 + VBA 语言自带
-        的名字（内建函数 / 内建常量 / 内建数据类型）。
+        的名字（内建函数 / 内建常量 / 内建数据类型 / 关键字）。
 
         与 get_declared_names 的区别：后者是"代码文本里真声明过什么"，前者是
         "本来就有、与代码文本无关"。用户刚拖上去的 Label1、一行代码都没有的新
-        窗体 UserForm1、代码里从没调用过的 MsgBox，都属于前者而不属于后者。
+        窗体 UserForm1、代码里从没调用过的 MsgBox、新模块第一行就想补的 If，
+        都属于前者而不属于后者。
 
         引擎用它来判断"回声候选是不是真名字"——这类名字不能走"只在本模块声明
-        过、现场文本又扫不到 -> 当幽灵剔掉"的规则（v60 组件名与控件名、v61 再加
-        VBA 内建名字：打 ms 要能补出从没写过的 MsgBox）。
+        过、现场文本又扫不到 -> 当幽灵剔掉"的规则（v60 组件名与控件名、v61 VBA
+        内建名字：打 ms 要能补出从没写过的 MsgBox；v62 关键字：打 if 要能补出
+        新模块里还没写过的 If）。
         """
         return set(getattr(self, "_structural_names", set()) or set())
 
     def get_builtin_names(self):
-        """返回真正作为"VBA 内建名字"收录的那些（小写集合，v61）。
+        """返回真正作为"语言自带词汇"收录的那些（小写集合，v61 / v62）。
+
+        含：VBA 内建函数 / 内建常量 / 内建数据类型（v61）+ 语言关键字（v62）。
 
         与 vba_builtins 的清单不同：工程里已经自己声明过同名时以用户的定义为准，
         那些名字不会出现在这里 —— 引擎据此对"语言自带的公共词汇"收紧模糊匹配
-        （只认连续命中），而不会连用户自己的同名定义一起收紧。
+        （纯分散命中要求输入至少 4 个字符），而不会连用户自己的同名定义一起收紧。
 
         后端不提供该接口时引擎不做任何收紧（旧式 / 测试后端行为不变）。
         """

@@ -175,13 +175,15 @@ def check(tag, got, expect_contain=(), expect_absent=()):
 
 def main():
     # v61：VBA 内建名字（内建函数 / 常量 / 数据类型）默认会进候选池
-    # （vbe_bridge.ENABLE_VBA_BUILTINS）。下面第 1~37 节的断言是"工程内名字的
-    # 候选列表精确比对"（用户要求的防噪音护栏），与内建名字无关 —— 因此统一在
-    # 【关闭】的前提下跑，护栏强度保持不变；第 38 节专门把它打开，验证内建名字
-    # 的收集 / 放行 / 降噪规则。
+    # （vbe_bridge.ENABLE_VBA_BUILTINS）；v62 语言关键字另行一组，开关独立
+    # （vbe_bridge.ENABLE_VBA_KEYWORDS）。下面第 1~37 节的断言是"工程内名字的
+    # 候选列表精确比对"（用户要求的防噪音护栏），与它们无关 —— 因此统一在
+    # 【关闭】的前提下跑，护栏强度保持不变；第 38 节专门验内建名字，
+    # 第 39 节专门验关键字。
     try:
         import vbe_bridge as _vb61
         _vb61.ENABLE_VBA_BUILTINS = False
+        _vb61.ENABLE_VBA_KEYWORDS = False
     except Exception:
         pass
 
@@ -4111,6 +4113,243 @@ def main():
 
     except Exception as _e38:
         check("第 38 节异常: %s" % _e38, [True], expect_contain=[False])
+
+    # ---- 39. v62：语言关键字（Sub / Dim / If / For / Set …）----
+    print("\n=== 39. v62 VBA 语言关键字进候选池 ===")
+    try:
+        import re as _re39
+        import vba_builtins as VB39
+        import vbe_bridge as VB39R
+
+        # 39.1~39.5：清单自身（纯静态，不依赖 Excel）
+        _kw39 = list(VB39.BUILTIN_KEYWORDS)
+        _low39 = [n.lower() for n in _kw39]
+        check("39.1 关键字清单无重名（共 %d 个）" % len(_low39),
+              [len(set(_low39)) == len(_low39)], expect_contain=[True])
+        _bad39 = [n for n in _kw39 if not _re39.match(r"^[^\W\d]\w*$", n)]
+        check("39.2 关键字全是合法标识符（异常 %s）" % (_bad39 or "无"),
+              [len(_bad39) == 0], expect_contain=[True])
+        _ovl39 = sorted(set(_low39)
+                        & (set(VB39.BUILTIN_LOWER) | set(VB39.BUILTIN_TYPE_LOWER)))
+        check("39.3 与内建函数/类型清单无重叠（重叠 %s；重叠项由收集侧去重挡掉）"
+              % (_ovl39 or "无"),
+              [len(_ovl39) == 0], expect_contain=[True])
+        _want39 = ("Sub", "Function", "Property", "Dim", "ReDim", "Set",
+                   "Let", "If", "Then", "Else", "ElseIf", "End", "For",
+                   "Next", "Each", "Do", "Loop", "While", "Wend", "Select",
+                   "Case", "With", "Type", "Enum", "New", "Nothing", "Me",
+                   "And", "Or", "Not", "Mod", "Call", "Exit", "On",
+                   "Static", "Private", "Public", "Declare", "ByVal",
+                   "ByRef", "Optional", "ParamArray", "WithEvents")
+        _miss39 = [n for n in _want39
+                   if n.lower() not in VB39.BUILTIN_KEYWORD_LOWER]
+        check("39.4 常用关键字齐备（缺 %s）" % (_miss39 or "无"),
+              [len(_miss39) == 0], expect_contain=[True])
+        # 刻意不收的：歧义过大的语句名（更常当变量/属性名）+ 过时的 Def* 组
+        _no39 = ("name", "line", "width", "spc", "tab",
+                 "defint", "defstr", "defvar", "base", "compare")
+        _hit39 = [n for n in _no39 if n in VB39.BUILTIN_KEYWORD_LOWER]
+        check("39.5 歧义/过时关键字仍不收（命中 %s）" % (_hit39 or "无"),
+              [len(_hit39) == 0], expect_contain=[True])
+
+        # 39.6~39.12：走完整 trigger 链路（假后端，纯 Python，不碰 Excel）
+        class _UI39(object):
+            def show(self, *a, **k):
+                pass
+
+            def update_selection(self, *a, **k):
+                pass
+
+            def hide(self, *a, **k):
+                pass
+
+            def contains_point(self, *a, **k):
+                return False
+
+        class _B39(object):
+            """模拟"新模块第一行，代码里一个关键字都还没写过"。
+
+            候选池：三个语言关键字（挂虚拟模块 VBA）+ 一个真幽灵 kwGhost。
+            structural / elsewhere 分别控制两路"真实存在"的证据 —— 真实情形下
+            关键字归属虚拟模块 VBA，从当前模块看就是"别的模块声明过"（True）。
+            """
+
+            def __init__(self, structural=True, elsewhere=False,
+                         module="模块2", builtin=True):
+                self._structural = structural
+                self._elsewhere = elsewhere
+                self._module = module
+                self._builtin = builtin
+
+            def get_context(self):
+                return {"line_no": 1, "caret_col": 1, "line_text": "",
+                        "in_string": False, "in_comment": False,
+                        "in_type_position": False, "in_decl_position": False,
+                        "decl_names": [], "proc_name": None,
+                        "module_name": self._module}
+
+            def get_identifiers(self):
+                return [("If", "VBA", None, False),
+                        ("Dim", "VBA", None, False),
+                        ("Sub", "VBA", None, False),
+                        ("Get", "VBA", None, False),
+                        ("kwGhost", "模块2", None, True)]
+
+            def get_declared_names(self):
+                return ["if", "dim", "sub", "get"]
+
+            def caret_word_at_collect(self):
+                return ""
+
+            def declared_elsewhere(self, name, module_name):
+                if self._elsewhere:
+                    return str(name).lower() in ("if", "dim", "sub", "get")
+                return False
+
+            def get_structural_names(self):
+                if not self._structural:
+                    return []
+                return ["if", "dim", "sub", "get"]
+
+            def get_builtin_names(self):
+                # 关键字与内建名字共用这一档收紧（见 engine.trigger）
+                if not self._builtin:
+                    return []
+                return ["if", "dim", "sub", "get"]
+
+            def get_type_names(self):
+                return []
+
+            def names_outside_caret(self, caret, scope_only=False):
+                return set()        # 现场文本里一个字都没有
+
+            def apply_completion(self, *a, **k):
+                return None
+
+        def _trig39(word, **kw):
+            _be = _B39(**kw)
+            _line = "    " + word
+            _ctx = _be.get_context()
+            _ctx["line_text"] = _line
+            _ctx["caret_col"] = len(_line) + 1
+            _be.get_context = lambda: _ctx
+            _c = E.Completer(_be, _UI39())
+            _c.trigger()
+            return sorted(_c.matches or [])
+
+        check("39.6 新模块里打 if -> 提示 If（现场没有它；幽灵仍剔）",
+              _trig39("if", elsewhere=True),
+              expect_contain=["If"], expect_absent=["kwGhost"])
+        check("39.7 只靠结构性证据也放行（declared_elsewhere=False）",
+              _trig39("if", structural=True, elsewhere=False),
+              expect_contain=["If"])
+        check("39.8 对照：无结构性证据且未声明过 -> 不提示（修复前行为）",
+              _trig39("if", structural=False, elsewhere=False),
+              expect_absent=["If"])
+        check("39.9 真幽灵 kwGhost 仍被回声防护剔掉",
+              _trig39("kwghost", structural=True, elsewhere=True),
+              expect_absent=["kwGhost"])
+        check("39.10 关键字在别的模块也提示（按模块级 priv=False 收录）",
+              _trig39("di", structural=True, elsewhere=True, module="模块3"),
+              expect_contain=["Dim"])
+        check("39.11 短输入 dm（跳步，2 字符）不冒关键字（收紧规则同内建名）",
+              _trig39("dm", elsewhere=True),
+              expect_absent=["Dim"])
+        check("39.12 对照：不收紧时 dm 命中 Dim（说明规则真在起作用）",
+              _trig39("dm", elsewhere=True, builtin=False),
+              expect_contain=["Dim"])
+
+        # 39.13~39.16：真实 VbeBackend 全链路（临时把两个开关都打开）
+        _saved39 = (VB39R.ENABLE_VBA_BUILTINS, VB39R.ENABLE_VBA_KEYWORDS)
+        VB39R.ENABLE_VBA_BUILTINS = True
+        VB39R.ENABLE_VBA_KEYWORDS = True
+        try:
+            class _CM39(object):
+                def __init__(self, text):
+                    self.text = text
+
+                @property
+                def CountOfLines(self):
+                    return self.text.count("\n") + 1
+
+                def Lines(self, start, count):
+                    return "\r\n".join(
+                        self.text.split("\n")[start - 1:start - 1 + count])
+
+            class _Comp39(object):
+                def __init__(self, name, text, ctype=1):
+                    self.Name = name
+                    self.Type = ctype
+                    self.CodeModule = _CM39(text)
+
+            class _Proj39(object):
+                def __init__(self, comps):
+                    self.Name = "VBAProject"
+                    self.VBComponents = list(comps)
+
+            class _Pane39(object):
+                def __init__(self, comp):
+                    self._c = comp
+
+                @property
+                def CodeModule(self):
+                    return self._c.CodeModule
+
+                def GetSelection(self):
+                    return (1, 1, 1, 1)
+
+            class _VBE39(object):
+                def __init__(self, comps, act):
+                    self.ActiveVBProject = _Proj39(comps)
+                    self.ActiveCodePane = _Pane39(act)
+
+            # 模块里一个字都没提过 If —— 提示它只能靠关键字这一路
+            _comp39 = _Comp39("Module1", "Sub Foo()\n    x = 1\nEnd Sub", 1)
+            _vbe39 = _VBE39([_comp39], _comp39)
+            _orig39 = VB39R._get_vbe_cached
+            VB39R._get_vbe_cached = lambda: _vbe39
+            try:
+                _bk39 = VB39R.VbeBackend()
+                _ids39 = _bk39.get_identifiers()
+                _nm39 = set(str(r[0]).lower() for r in _ids39)
+                _vba39 = [r for r in _ids39
+                          if str(r[1]) == VB39R._BUILTIN_MODULE]
+                _visR39 = E.filter_identifiers_by_scope(_ids39, None, "Module1")
+                _hit39b = [n for n in _visR39
+                           if E.fuzzy_match(n, "if") is not None]
+                check("39.13 真实后端：关键字进了候选池（挂 VBA 的共 %d 条）"
+                      % len(_vba39),
+                      ["if" in _nm39 and "dim" in _nm39 and "sub" in _nm39],
+                      expect_contain=[True])
+                check("39.14 真实后端：关键字跨模块可见（priv=False）",
+                      ["if" in set(n.lower() for n in _visR39)],
+                      expect_contain=[True])
+                check("39.15 真实后端：结构性证据与 declared_elsewhere 都认关键字",
+                      ["if" in _bk39.get_structural_names()
+                       and bool(_bk39.declared_elsewhere("If", "Module1"))],
+                      expect_contain=[True])
+                check("39.16 真实池子里打 if 能命中 If",
+                      _hit39b, expect_contain=["If"])
+
+                # 开关独立：关掉关键字，内建函数照常
+                VB39R.ENABLE_VBA_KEYWORDS = False
+                try:
+                    _bk39b = VB39R.VbeBackend()
+                    _nm39b = set(str(r[0]).lower()
+                                 for r in _bk39b.get_identifiers())
+                    check("39.17 关掉关键字开关：关键字不进池、内建函数照常",
+                          ["if" not in _nm39b and "msgbox" in _nm39b],
+                          expect_contain=[True])
+                finally:
+                    VB39R.ENABLE_VBA_KEYWORDS = True
+            finally:
+                VB39R._get_vbe_cached = _orig39
+        finally:
+            (VB39R.ENABLE_VBA_BUILTINS,
+             VB39R.ENABLE_VBA_KEYWORDS) = _saved39
+
+    except Exception as _e39:
+        check("第 39 节异常: %s" % _e39, [True], expect_contain=[False])
 
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))

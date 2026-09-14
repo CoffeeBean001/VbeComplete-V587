@@ -925,9 +925,10 @@ class Completer:
             r = fuzzy_match(i, word)
             if r is not None:
                 scored.append((r[0], i, r[1]))
-        # v61：VBA 内建名字（内建函数 / 常量 / 数据类型）单独收紧一档匹配。
+        # v61：VBA 内建名字（内建函数 / 常量 / 数据类型）+ v62 语言关键字，
+        # 单独收紧一档匹配。
         #
-        # 它们是【语言自带的公共词汇】，近 300 个，而且几乎任何字母组合都能在
+        # 它们是【语言自带的公共词汇】，近 400 个，而且几乎任何字母组合都能在
         # 里面凑出子序列；若与"你自己工程里的名字"一样接受跳步匹配，任何 1~3 个
         # 字符的输入都会冒出一大串无关项 —— 真机实测（候选池 373 条）：
         #   输入 ar  -> vbAbortRetryIgnore / VarType / Partition 全挤进列表；
@@ -940,9 +941,13 @@ class Completer:
         #   spli     -> Split            （前缀）      照常
         #   instrr   -> InStrRev         （连续块）    照常
         #   formcur  -> FormatCurrency   （跳步，7 字符）照常
+        #   slct     -> Select           （跳步，4 字符）照常
         #   ar       -> vbAbortRetryIgnore（跳步，2 字符）被挡掉 —— 正是要滤掉的噪音
         # 这条只作用于【内建公共词汇】；你自己工程里的名字不受限
         # （getse3 -> getSettingTitle3 照旧）。
+        #
+        # v62 起语言关键字与内建名字【共用这一档】（后端 get_builtin_names 把两者
+        # 一并给出）：关键字同样是"打前缀就能补全"的用法，没有理由区别对待。
         if len(word) < 4:
             _bl = self._builtin_names()
             if _bl:
