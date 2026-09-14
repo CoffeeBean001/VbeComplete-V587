@@ -414,13 +414,35 @@ def _greedy_positions(low, query, bounds):
       1 落在词边界（首字母缩略型：ds -> dataSheet）
       2 紧接上一个命中（尽量连成块）
       3 其它
+
+    【v59 修复】纯贪心会【漏判】：挑位置时只看"这一档更优"，不管后面还凑不凑
+    得齐，于是 query 明明是子序列也会被判成不匹配。真实案例（用户报的）：
+      getSettingTitle3 里输入 getse3 —— 第 3 个字符 t 贪心跳到词边界 T(10)
+      （档 1 优于接着用的 t(2) 档 2），再往后就没有 s 了，直接 return None；
+      可 [0,1,2,3,4,15]（g-e-t-s-e-…-3）本来就成立，理应提示。
+    修法：先反向算出每个字符【最靠右能放的下标】maxpos[t]，它保证 query[t+1:]
+    在其后仍能匹配完；正向挑位置时把候选限制在 i..maxpos[t] 之内。
+    这样既保住"优先词边界"的观感，又不可能再漏判（只要 query 真的是子序列，
+    区间一定非空，因为 low[maxpos[t]+1:] 是 low[i:] 的后缀）。
     """
+    n = len(low)
+    k = len(query)
+    # 反向可行性上界：maxpos[t] = query[t] 的最靠右合法位置
+    maxpos = [0] * k
+    limit = n - 1
+    for t in range(k - 1, -1, -1):
+        j = low.rfind(query[t], 0, limit + 1)
+        if j < 0:
+            return None                      # 连子序列都不是
+        maxpos[t] = j
+        limit = j - 1
     pos = []
     i = 0
-    for ch in query:
+    for t, ch in enumerate(query):
+        hi = maxpos[t]
         best = None
         best_key = None
-        for j in range(i, len(low)):
+        for j in range(i, hi + 1):
             if low[j] != ch:
                 continue
             if j == i and j in bounds:

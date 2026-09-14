@@ -1614,6 +1614,45 @@ def main():
         check("20.9 打全名：命中位置覆盖全部字符",
               [h9.get("dataSheet")], expect_contain=[[0, 1, 2, 3, 4, 5, 6, 7, 8]])
 
+        # 20.11 v59：纯贪心会【漏判】—— 字符要"跳步"时仍必须能匹配
+        #
+        # 用户原话：定义了 getSettingTitle3，输入 get3 能提示，输入 getse3 不提示。
+        # 根因在 _greedy_positions：挑位置时只看"这一档更优"，不管后面还凑不凑得
+        # 齐 —— 第 3 个字符 t 贪心跳到词边界 T(10)（档 1 优于接着用的 t(2) 档 2），
+        # 后面再没有 s，于是整个 query 被判成不匹配。可 g-e-t-s-e-…-3 =
+        # [0,1,2,3,4,15] 本来就成立。修法：先反向算可行性上界 maxpos，再把正向
+        # 候选限制在 i..maxpos[t] 之内（见 engine._greedy_positions）。
+        m_v59 = [("Module1",
+                  "Option Explicit\n"
+                  "Private Function getSettingTitle3(ws, col)\n"
+                  "    <in>\n"
+                  "End Function", 1)]
+
+        s11, m11, h11 = probe(m_v59, "Module1", 3, "    ", "getse3")
+        check("20.11 输入 getse3：提示 getSettingTitle3", m11,
+              expect_contain=["getSettingTitle3"])
+        check("20.11 getse3 命中位置 [0,1,2,3,4,15]",
+              [h11.get("getSettingTitle3")],
+              expect_contain=[[0, 1, 2, 3, 4, 15]])
+
+        # 20.12 反向把关：query 真的【不是】子序列时仍要判不匹配
+        # （不能为了"不漏判"就乱放行 —— 名字里只有一个 s，getss3 不该中）
+        s12, m12, _h12 = probe(m_v59, "Module1", 3, "    ", "getss3")
+        check("20.12 输入 getss3：不提示（名字里只有一个 s）", m12,
+              expect_absent=["getSettingTitle3"])
+
+        # 20.13 不回归：原本就能中的 get3 行为不变
+        s13, m13, h13 = probe(m_v59, "Module1", 3, "    ", "get3")
+        check("20.13 输入 get3：仍提示 getSettingTitle3", m13,
+              expect_contain=["getSettingTitle3"])
+        check("20.13 get3 命中位置仍为 [0,1,10,15]",
+              [h13.get("getSettingTitle3")], expect_contain=[[0, 1, 10, 15]])
+
+        # 20.14 不能为了修漏判把"优先词边界"的观感改坏：ds -> dataSheet 仍是 [0,4]
+        _s14, _m14, h14 = probe(m_two, "Module1", 5, "    ", "ds")
+        check("20.14 输入 ds：命中位置仍为词首 [0,4]",
+              [h14.get("dataSheet")], expect_contain=[[0, 4]])
+
         # ---- 21. v37：函数名打全名要提示 + 回退删除后不漏（真实后端全链路）----
         #
         # 用户报的两个 bug，根因是同一条老规则：in_decl_position 时【无条件】
