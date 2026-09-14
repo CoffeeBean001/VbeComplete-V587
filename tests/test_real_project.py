@@ -467,9 +467,12 @@ def main():
     check("Type 声明行名字被收录",
           decl_case(c_type, (1, len("Public Type gRe") + 1), prefix="g"),
           expect_contain=["gRec"])
-    check("Type 成员行名字被收录",
+    # v59：块成员（Type 字段 / Enum 成员）不再收录成裸名候选 —— Type 字段只能
+    # 通过变量限定访问（p.field），Enum 成员虽可裸名引用但枚举名已限定（E.Member），
+    # 提示出来只会把候选池搞吵。类型/枚举名本身照常收录（上面那条）。
+    check("Type 成员行不再收录成员名",
           decl_case(c_type, (2, len("    gI") + 1), prefix="g"),
-          expect_contain=["gId"])
+          expect_absent=["gId"])
 
     # ---- 10. v23：跨工程隔离 ----
     print("\n=== 10. 跨工程隔离（v23）===")
@@ -3641,8 +3644,8 @@ def main():
     got36 = recs36(cont_junk)
     check("36.1 Enum 成员名以 _ 结尾：不算续行符，假名字消失",
           [n for n, _, _ in got36],
-          expect_contain=["E", "A_", "getOneFile"],
-          expect_absent=["Function", "With", "If", "s"])
+          expect_contain=["E", "getOneFile"],
+          expect_absent=["Function", "With", "If", "s", "A_"])
     # 36.2 End Enum 必须真的闭合：之后的过程名照常收、局部变量仍归属其过程
     #      （不闭合时全被记成模块级: proc=None）
     check("36.2 End Enum 正确闭合：之后的过程/局部变量归属正确",
@@ -3672,6 +3675,26 @@ def main():
     check("36.6 无修饰 Declare 仍收录",
           recs36('Declare PtrSafe Function gApi2 Lib "k" () As Long'),
           expect_contain=[("gApi2", None, False)])
+
+    # 36.7 块成员（Type 字段 / Enum 成员）不收录成裸名候选；类型名本身照常收录
+    #      （用户要求：枚举成员前面有枚举名限定，不该直接提示）
+    blk = "\n".join([
+        "Public Enum E",
+        "    Red = 1: Green = 2: Zz_",
+        "End Enum",
+        "Public Type T",
+        "    fx As Long",
+        "End Type"])
+    check("36.7 Type/Enum 成员不收录（类型/枚举名收录）",
+          recs36(blk),
+          expect_contain=[("E", None, False), ("T", None, False)],
+          expect_absent=[("Red", None, False), ("Green", None, False),
+                         ("Zz_", None, False), ("fx", None, False)])
+    # 块结束后，后面的模块级声明仍要正常收录（continue 不能把状态搞乱）
+    blk2 = blk + "\nPublic gAfter As Long"
+    check("36.8 Enc/Type 块之后的声明照常收录",
+          recs36(blk2),
+          expect_contain=[("gAfter", None, False)])
 
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))

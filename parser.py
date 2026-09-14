@@ -7,7 +7,8 @@ VBA 标识符提取器。
   - 过程：Sub / Function（含参数名）
   - 属性：Property Get / Let / Set（含参数名）
   - API 声明：Declare Sub / Function（含参数名）
-  - 自定义类型与枚举：Type / Enum（含成员名）
+  - 自定义类型与枚举：Type / Enum（**只收类型名**；块成员只能限定访问
+    —— p.field / E.Member，不收录成裸名候选，见 in_block 分支）
 
 纯文本解析，不依赖 Office，可在任何环境单测。
 
@@ -88,7 +89,7 @@ KIND_PROC = "proc"      # Sub/Function/Property/Declare：标准模块默认 Pub
 KIND_VAR = "var"        # 模块级 Dim/Static 变量：默认 Private
 KIND_CONST = "const"    # Const：默认 Private
 KIND_TYPE = "type"      # Type / Enum：默认 Public（两种模块都是）
-KIND_MEMBER = "member"  # Type/Enum 成员：跟随所属块的可见性
+KIND_MEMBER = "member"  # Type/Enum 成员：只用于分类，当前不收录（见 in_block）
 KIND_LOCAL = "local"    # 过程内局部变量/参数：仅本过程可见
 
 
@@ -208,7 +209,6 @@ def extract_records(code, module=None, is_std_module=True, caret=None):
     seen = set()
     cur_proc = None      # 当前所在过程名（None = 模块声明区）
     in_block = None      # 'Type' / 'Enum'
-    block_priv = False   # 当前 Type/Enum 块的可见性（成员继承）
 
     def add(name, proc, priv):
         if not name:
@@ -237,7 +237,6 @@ def extract_records(code, module=None, is_std_module=True, caret=None):
             in_block = "Type" if m_type else "Enum"
             priv = _is_private(kind, bool(_RE_LEAD_PRIVATE.match(line)),
                                bool(_RE_LEAD_PUBLIC.match(line)), is_std_module)
-            block_priv = priv
             name = m_type.group(1) if m_type else m_enum.group(1)
             add(name, None, priv)          # 类型/枚举名
             continue
@@ -246,10 +245,14 @@ def extract_records(code, module=None, is_std_module=True, caret=None):
             continue
 
         if in_block:
-            # 成员行：member As Type  或  member = value（枚举）
-            m = _RE_LEADING_IDENT.match(line)
-            if m and m.group(0).lower() not in ("type", "enum", "end"):
-                add(m.group(0), None, block_priv)   # 成员继承块可见性
+            # 块成员（Type 字段 / Enum 成员）【不收录】——v59 按用户要求改：
+            #   * Type 字段只能通过变量限定访问（p.field），裸名根本不可引用，
+            #     提示出来毫无意义；
+            #   * Enum 成员虽然 VBA 允许裸名引用，但既然枚举名本身已经限定了
+            #     （E.A_），列表里再倒出一堆成员名只会把候选池搞吵。
+            # 点号之后的成员列表交给 VBE 自带的「自动列出成员」（v55 我们让位）。
+            # 注意这里仍然要 continue：块内的行不能被当成模块级变量声明。
+            # （extract_implicit_records 早就是这么做的，两条路径现在一致。）
             continue
 
         has_priv_kw = bool(_RE_LEAD_PRIVATE.match(line))
