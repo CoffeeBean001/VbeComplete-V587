@@ -687,8 +687,8 @@ def _window_class_name(hwnd):
     return ""
 
 
-def _popup_details_now(hwnds):
-    """这些句柄里正在显示的 VBE 提示窗，返回 [(类名, 宽, 高), ...]。
+def _popup_rects_now(hwnds):
+    """这些句柄里正在显示的 VBE 提示窗，返回 [(类名, 左, 上, 右, 下), ...]。
 
     逐个复核三件事（句柄值会被 Windows 回收复用给别的窗口，只凭"还记得这个
     句柄"就相信它，一旦复用就会出现"永远以为 VBE 在弹提示、我们的窗再也不弹"
@@ -697,9 +697,9 @@ def _popup_details_now(hwnds):
       2. 属于宿主 Excel/VBE 进程；
       3. 可见且尺寸正常。
 
-    返回明细而不只是 bool，是为了让诊断日志能区分【成员列表】(NameListWndClass)
-    与【参数信息】(PopupTipWndClass) —— 两者的"该不该让位"结论将来可能不同
-    （v65 排查用）。冷路径开销可忽略：缓存里最多两三个句柄。
+    返回【位置】而不只是 bool/尺寸：v66 起 UI 要拿它做避让（把候选窗挪到
+    参数信息窗下方），所以必须知道屏幕坐标。冷路径开销可忽略：缓存里最多
+    两三个句柄，逐句柄 GetWindowRect。
     """
     import ctypes
     import ctypes.wintypes
@@ -721,14 +721,24 @@ def _popup_details_now(hwnds):
                 continue
             if not u32.GetWindowRect(hwnd, ctypes.byref(rect)):
                 continue
-            w = rect.right - rect.left
-            h = rect.bottom - rect.top
-            if w <= 0 or h <= 0:
+            l, t = int(rect.left), int(rect.top)
+            r, b = int(rect.right), int(rect.bottom)
+            if r - l <= 0 or b - t <= 0:
                 continue
-            out.append((cls, w, h))
+            out.append((cls, l, t, r, b))
         except Exception:
             continue
     return out
+
+
+def _popup_details_now(hwnds):
+    """这些句柄里正在显示的 VBE 提示窗，返回 [(类名, 宽, 高), ...]。
+
+    与 _popup_rects_now 是同一套判据（这里只是把矩形投影成"宽高"），供诊断
+    日志与让位判据使用 —— 明细能区分【成员列表】(NameListWndClass) 与
+    【参数信息】(PopupTipWndClass)，两者的结论不同（v65）。
+    """
+    return [(c, r - l, b - t) for (c, l, t, r, b) in _popup_rects_now(hwnds)]
 
 
 def _vbe_popup_hwnds():
@@ -791,6 +801,27 @@ def vbe_yield_visible():
         return False
     except Exception:
         return False
+
+
+def vbe_popup_rects():
+    """当前可见的 VBE 提示窗的屏幕矩形 [(类名, 左, 上, 右, 下), ...]（v66）。
+
+    UI 拿它做【避让】：VBE 的参数信息窗（形参签名）就画在光标正下方，而我们的
+    候选窗默认也在那儿（光标底边 +2px）—— 两窗一重叠就互相遮挡。知道它画在哪，
+    就能把候选窗下移到它下面。
+
+    用户口径（v66）："把所有这种我们候选窗和参数信息重叠的情况，都改成把候选窗
+    下移到签名提示的下方"；并明确【自定义函数】的参数信息也要一并处理。
+    VBE 对自己工程里的过程同样会弹这个窗（它认识过程签名），所以这里**不区分
+    "内建还是自定义"** —— 一律按"可见的提示窗"避让即可，天然覆盖自定义函数。
+
+    只读 Win32、不碰 COM；探不到返回 []（UI 就按原位置显示，绝不让"拿不准"
+    影响显示 —— v54 的教训）。
+    """
+    try:
+        return _popup_rects_now(_vbe_popup_hwnds())
+    except Exception:
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -1852,6 +1883,14 @@ class VbeBackend:
         正常路径不调用，无开销。
         """
         return vbe_popup_info()
+
+    def vbe_popup_rects(self):
+        """当前可见的 VBE 提示窗矩形 [(类名, 左, 上, 右, 下), ...]（v66，UI 避让用）。
+
+        UI 用它把候选窗挪到参数信息窗（形参签名）下方，两个窗不再重叠。
+        自定义过程的参数信息用的是同一个窗，一并覆盖。见模块级同名函数。
+        """
+        return vbe_popup_rects()
 
     # ---- 自动配对：输入 ( / " 自动补右半边 ----
     #

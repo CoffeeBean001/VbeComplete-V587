@@ -527,6 +527,7 @@ def main():
         "raw_focused": None,  # 最近一次原始焦点读数，用于去抖
         "focus_streak": 0,    # 同一读数连续出现的次数
         "last_snap": None,    # 上次轮询到的 (行号, 行文本, 模块名)，用于检测内容变化
+        "_popup_sig": None,   # 上次看到的 VBE 提示窗矩形（v66：变了就重摆候选窗）
         "ctrl": False,
         "alt": False,
         "swallowed": set(),   # 被吞掉的 keydown 的 vk，用于吞掉配对 keyup
@@ -1018,6 +1019,22 @@ def main():
                     if vbe_bridge.vbe_code_pane_focused() is False:
                         _log("poll: 焦点不在代码窗格 -> 收起候选窗")
                         post(completer.hide)
+                except Exception:
+                    pass
+                # v66：候选窗挂着的时候，VBE 随时可能弹出/收起【参数信息】窗
+                # （形参签名）—— 它就在光标正下方，与我们默认的位置重叠。这里
+                # 盯着提示窗的矩形变化：一变就让候选窗重新摆放（下移到签名下方、
+                # 或签名收起后回到原位）。
+                #   只在候选窗可见时探测（正常打字路径零开销），且矩形没变就
+                #   什么都不做 —— 不会周期性重设 geometry 造成闪烁。
+                try:
+                    _sig = tuple(vbe_bridge.vbe_popup_rects())
+                    if _sig != state.get("_popup_sig"):
+                        state["_popup_sig"] = _sig
+                        _log("poll: 提示窗矩形变化 %r -> 重摆候选窗" % (_sig,))
+                        # 注意调的是 UI（popup）而不是 completer：重摆是画布的
+                        # 事，引擎那层没有这个方法。
+                        post(popup.reposition)
                 except Exception:
                     pass
             snap = backend.snapshot() if _com_allowed() else None

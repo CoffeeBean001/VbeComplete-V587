@@ -4881,6 +4881,155 @@ def main():
     except Exception as _e42:
         check("第 42 节异常: %s" % _e42, [True], expect_contain=[False])
 
+    # ------------------------------------------------------------------
+    print("\n=== 43. v66 候选窗避让 VBE 参数信息窗（形参签名）===")
+    try:
+        import ui as UI43
+        import vbe_bridge as VB43
+
+        # 43.1 避让与让位是两码事：参数信息仍然【不让位】（v65 语义不动）
+        check("43.1 避让不改让位清单（参数信息仍不让位）",
+              ["PopupTipWndClass" in VB43.VBE_POPUP_CLASSES,
+               "PopupTipWndClass" not in VB43.VBE_YIELD_CLASSES],
+              expect_contain=[True, True])
+
+        # 43.2~43.3 矩形判据（明细=矩形投影，一处逻辑两处消费）
+        _orig43 = (VB43._vbe_popup_hwnds, VB43._popup_rects_now)
+        VB43._vbe_popup_hwnds = lambda: [1]
+        VB43._popup_rects_now = lambda hs: [("PopupTipWndClass", 10, 20, 310, 38)]
+        check("43.2 明细由矩形投影而来（300x18）",
+              [VB43._popup_details_now([1]), VB43.vbe_popup_rects()],
+              expect_contain=[[("PopupTipWndClass", 300, 18)],
+                              [("PopupTipWndClass", 10, 20, 310, 38)]])
+
+        def _boom43(hs):
+            raise RuntimeError("boom")
+        VB43._popup_rects_now = _boom43
+        check("43.3 探测抛异常 -> 返回空列表、不炸（拿不到就不动窗）",
+              [VB43.vbe_popup_rects()], expect_contain=[[]])
+        VB43._vbe_popup_hwnds, VB43._popup_rects_now = _orig43
+
+        # 43.4~43.11 纯函数 avoid_popup_rects：把候选窗挪出提示窗
+        _R43 = UI43.avoid_popup_rects
+        _pop43 = (0, 220, 400, 240)      # 光标下方的一条形参签名
+        check("43.4 无提示窗 -> 位置原样不动",
+              [_R43(100, 220, 200, 90, 200, 1080, [])], expect_contain=[220])
+        check("43.5 签名窗就在正下方且重叠 -> 下移到它下面（240+2）★核心",
+              [_R43(100, 220, 200, 90, 200, 1080, [_pop43])], expect_contain=[242])
+        check("43.6 提示窗在屏幕另一侧（水平不相交）-> 不动",
+              [_R43(600, 220, 200, 90, 200, 1080, [(0, 220, 400, 240)])],
+              expect_contain=[220])
+        check("43.7 提示窗在上方（垂直不相交）-> 不动",
+              [_R43(100, 220, 200, 90, 200, 1080, [(0, 100, 400, 200)])],
+              expect_contain=[220])
+        check("43.8 两个窗叠着 -> 落到最下面那个的下方（260+2）",
+              [_R43(100, 220, 200, 90, 200, 1080,
+                    [(0, 220, 400, 240), (0, 239, 400, 260)])],
+              expect_contain=[262])
+        check("43.9 下移会出屏 -> 翻到光标上方（990-90-2）",
+              [_R43(100, 1000, 200, 90, 990, 1080, [(0, 1020, 400, 1060)])],
+              expect_contain=[898])
+        check("43.10 上下都放不下 -> 贴屏幕底部（1080-90）",
+              [_R43(100, 900, 200, 90, 60, 1080, [(0, 900, 400, 1000)])],
+              expect_contain=[990])
+        check("43.11 只压住候选窗一部分 -> 照样躲（水平相交就避）",
+              [_R43(500, 220, 200, 90, 200, 1080, [(600, 220, 900, 240)])],
+              expect_contain=[242])
+
+        # 43.12~43.14 _position 接线：默认贴光标下方、有签名窗就下移、同位置不重设
+        class _FR43(object):
+            def winfo_screenwidth(self):
+                return 1920
+
+            def winfo_screenheight(self):
+                return 1080
+
+        class _FC43(object):
+            def cget(self, k):
+                return 200 if k == "width" else 90
+
+        class _FW43(object):
+            def __init__(self):
+                self.geoms = []
+
+            def geometry(self, s):
+                self.geoms.append(s)
+
+        def _mk43():
+            p = UI43.Popup.__new__(UI43.Popup)
+            p.root, p.canvas, p.win = _FR43(), _FC43(), _FW43()
+            p._last_geom = None
+            return p
+
+        _o43caret = UI43.caret_screen_rect
+        _o43rects = UI43.screen_popup_rects
+        try:
+            UI43.caret_screen_rect = lambda: (100, 200, 218)
+            UI43.screen_popup_rects = lambda: []
+            _p43 = _mk43()
+            _p43._position()
+            _g1 = list(_p43.win.geoms)
+            _p43._position()                  # 位置没变：不该重复设 geometry
+            _g2 = list(_p43.win.geoms)
+            UI43.screen_popup_rects = lambda: [(0, 218, 400, 240)]
+            _p43._position()                  # 签名窗出现 -> 下移到 240+2
+            _g3 = list(_p43.win.geoms)
+        finally:
+            UI43.caret_screen_rect = _o43caret
+            UI43.screen_popup_rects = _o43rects
+        check("43.12 _position 默认贴光标下方 → %s" % (_g1[-1:] or [None],),
+              [_g1], expect_contain=[["200x90+100+220"]])
+        check("43.13 同位置重复调用不重设 geometry（防闪烁）→ %s" % (_g2[-1:] or [None],),
+              [_g2], expect_contain=[["200x90+100+220"]])
+        check("43.14 签名窗出现 -> 候选窗下移到其下方 → %s" % (_g3[-1:] or [None],),
+              [_g3], expect_contain=[["200x90+100+220", "200x90+100+242"]])
+
+        # 43.15 拿不到提示窗矩形时 screen_popup_rects 不得抛（vbe_bridge 打桩成异常）
+        _o43vbr = VB43.vbe_popup_rects
+        VB43.vbe_popup_rects = _boom43
+        try:
+            _sr43 = UI43.screen_popup_rects()
+        finally:
+            VB43.vbe_popup_rects = _o43vbr
+        check("43.15 探测异常时 screen_popup_rects() 返回 []（不抛）",
+              [_sr43], expect_contain=[[]])
+
+        # 43.16 收起状态下 reposition 是安全的空操作（没有窗、没有 root 也不炸）
+        _p43r = UI43.Popup.__new__(UI43.Popup)
+        _p43r.win = None
+        _p43r.reposition()
+        check("43.16 收起状态 reposition 空操作、不抛", [True], expect_contain=[True])
+
+        # 43.17 真机：提示窗矩形可读、格式正确
+        _rr43 = None
+        try:
+            _rr43 = VB43.VbeBackend().vbe_popup_rects()
+            _ok43 = (isinstance(_rr43, list)
+                     and len(_rr43) == len(VB43.vbe_popup_rects())
+                     and all(len(t) == 5 for t in _rr43))
+        except Exception as _e4317:
+            _ok43 = "异常: %s" % _e4317
+        check("43.17 真机：提示窗矩形可读且格式正确（%r）" % (_rr43,),
+              [_ok43], expect_contain=[True])
+
+        # 43.18 main 接线护栏：轮询里要有"提示窗矩形变化 -> 重摆候选窗"
+        try:
+            import inspect as _inspect43
+            import main as _M43
+            _src43 = _inspect43.getsource(_M43)
+            _cnt43 = _src43.count("vbe_popup_rects()")
+        except Exception as _e4318:
+            _src43, _cnt43 = "", "异常: %s" % _e4318
+        check("43.18 轮询已接上「矩形变化 -> reposition」（出现 %s 次）" % (_cnt43,),
+              [_cnt43 >= 1, "post(popup.reposition)" in _src43,
+               "_popup_sig" in _src43],
+              expect_contain=[True, True, True])
+        check("43.19 reposition 挂在 UI 上（引擎层没有这个方法，故 main 调 popup.*）",
+              [callable(getattr(UI43.Popup, "reposition", None))],
+              expect_contain=[True])
+    except Exception as _e43:
+        check("第 43 节异常: %s" % _e43, [True], expect_contain=[False])
+
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))
     if FAILURES:

@@ -155,6 +155,69 @@ def caret_screen_rect():
         return None
 
 
+# ---------------------------------------------------------------------------
+# v66：避让 VBE 的参数信息窗（形参签名）
+# ---------------------------------------------------------------------------
+# VBE 的【参数信息】窗（PopupTipWndClass）画在光标正下方；我们的候选窗默认也在
+# 那儿（光标底边 +2px）。两窗一重叠，签名和候选互相遮挡 —— 用户口径（v66）：
+# "把所有这种我们候选窗和参数信息重叠的情况，都改成把候选窗下移到签名提示的
+# 下方"，并明确"参数信息也可能来自我们自定义函数的，这种也一并处理"。
+#
+# 判据走 vbe_bridge.vbe_popup_rects()：只读 Win32 查 VBE 那两个预建复用提示窗的
+# 矩形。VBE 对自己工程里的过程同样弹这个窗，所以不区分内建/自定义，天然覆盖。
+#
+# 关键取向：**拿不到就什么都不做**。宁可重叠（可接受），也不要因为探测失败把窗
+# 挪到奇怪的角落（v54 的教训：拿不准别乱动）。
+POPUP_GAP = 2          # 避让后与提示窗之间的留白（px）
+POPUP_TRY_MAX = 4      # 最多迭代几次（防多个提示窗叠着，正常 1 次就够）
+
+
+def screen_popup_rects():
+    """当前可见的 VBE 提示窗矩形 [(左, 上, 右, 下), ...]；拿不到返回 []。
+
+    延迟导入 vbe_bridge：ui 不反向依赖它（避免循环导入），且测试里把模块打桩、
+    或根本不存在时，弹窗逻辑完全不受影响。
+    """
+    try:
+        import vbe_bridge
+        return [(l, t, r, b) for (_cls, l, t, r, b) in vbe_bridge.vbe_popup_rects()]
+    except Exception:
+        return []
+
+
+def avoid_popup_rects(x, y, w, h, caret_top, screen_h, rects):
+    """把候选窗的 y 往下挪到不与任何提示窗重叠；返回新的 y。
+
+    纯函数（便于单测）：只做矩形运算，不碰窗口系统。
+      x, y, w, h —— 候选窗矩形（y 是初始/期望位置）
+      caret_top  —— 光标上沿（下移放不下时翻到光标上方用）
+      screen_h   —— 屏幕高度（不许挪出屏幕）
+      rects      —— 要避开的矩形列表 [(左, 上, 右, 下), ...]
+
+    只有【水平也相交】的窗才需要躲 —— 提示窗在屏幕另一侧时，两者根本不相干。
+    """
+    for _ in range(POPUP_TRY_MAX):
+        moved = False
+        for (l, t, r, b) in rects:
+            if r <= x or l >= x + w:
+                continue                    # 水平不相交
+            if b <= y or t >= y + h:
+                continue                    # 垂直不相交
+            y = b + POPUP_GAP               # 挪到它下面
+            moved = True
+        if not moved:
+            break
+    if y + h > screen_h:
+        # 下移后超出屏幕底边 -> 翻到光标上方（提示窗在光标下方，上方一般不冲突）
+        alt = caret_top - h - POPUP_GAP
+        clash = any(r > x and l < x + w and b > alt and t < alt + h
+                    for (l, t, r, b) in rects)
+        if alt >= 0 and not clash:
+            return alt
+        return max(0, screen_h - h)          # 实在放不下：贴屏幕底部
+    return y
+
+
 class Popup:
     """用 Canvas 自绘的候选列表。
 
@@ -190,6 +253,7 @@ class Popup:
         self._hover = None       # 鼠标悬停的本屏行号（0-based）或 None
         self._row_h = 18
         self._last_size = None   # 上次画出的 (宽,高)，用于判断是否需要重新定位
+        self._last_geom = None   # 上次设置的 "宽x高+x+y"（v66：避免重复 geometry 闪烁）
         # 纵向滚动条几何与拖拽状态（_draw 时填充，供鼠标命中测试使用）
         self._v_track = None      # (x0, y0, x1, y1) 纵向轨道
         self._v_thumb_y0 = 0      # 纵向滑块顶 y
@@ -662,7 +726,31 @@ class Popup:
             y = bottom + 2
         else:
             y = max(0, top - h - 2)
-        self.win.geometry("%dx%d+%d+%d" % (w, h, x, y))
+        # v66：别跟 VBE 的参数信息窗（形参签名）叠在一起 —— 下移到它下方。
+        # 探测失败时 screen_popup_rects() 返回 []，avoid_popup_rects 原样返回 y，
+        # 位置与从前完全一致（绝不让"拿不准"影响显示）。
+        y = avoid_popup_rects(x, y, w, h, top, sh, screen_popup_rects())
+        geom = "%dx%d+%d+%d" % (w, h, x, y)
+        # 同尺寸同位置就不重复设置 —— 轮询会周期性调用本方法，重复 geometry
+        # 既没必要也可能引起重绘闪烁。
+        if geom == self._last_geom:
+            return
+        self._last_geom = geom
+        self.win.geometry(geom)
+
+    def reposition(self):
+        """按当前光标与 VBE 提示窗的位置重新摆放已挂出的候选窗（主线程调用）。
+
+        轮询发现 VBE 的参数信息窗【出现 / 收起 / 换行】时用它 —— 那时我们的窗
+        已经画在屏幕上了，不能只靠 _show 里的那一次 _position（否则签名窗在
+        候选窗之后才弹出来的情况下，两个窗会一直叠着直到下次按键）。
+        """
+        try:
+            if self.win is None or self.win.state() == "withdrawn":
+                return
+            self._position()
+        except Exception:
+            pass
 
     def update_selection(self, selected):
         self.root.after(0, self._update_selection, selected)
@@ -747,6 +835,7 @@ class Popup:
         self._pressed = False
         self._drag = None
         self._last_size = None
+        self._last_geom = None   # 收起后位置记忆作废，下次弹出必定重新摆放
         if self.win:
             try:
                 self.win.withdraw()
