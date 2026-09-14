@@ -72,9 +72,14 @@
   - 内建名字 + 关键字（约 400 个）：**纯跳步命中要求输入至少 4 个字符** ——
     `ms`→`MsgBox`、`vbc`→`vbCrLf`、`slct`→`Select` 照常，`ar` 不会冒出
     `vbAbortRetryIgnore`；
-  - 宿主常量（约 4500 条）：**只认从头开始的前缀**，且输入长度不低于家族前缀 ——
-    `xl`→`xl*`、`xlu`→`xlUp`、`mso`→`mso*` 照常，而 `ms` 只出 `MsgBox`（绝不带出
-    `mso*`）、`count` / `cell` / `range` 一条 `xl*` 都不会多出来。
+  - 宿主常量（约 4500 条）：**必须从家族前缀开头**（`xl` / `mso` —— 这条不能松，
+    正是它把 `ms` 带出 2365 条 `mso*`、`count` 带出上百条这类噪音整片挡掉的），
+    再要求你**打进去过一段连续的名字片段（≥ 4 个字符）**：
+    `xl`→`xl*`、`xlu`→`xlUp`、`mso`→`mso*` 照常，`ms` 只出 `MsgBox`（绝不带出
+    `mso*`）、`count` / `cell` / `range` 一条 `xl*` 都不会多出来；
+    而**跳着打**也能命中（v68）—— `xlworkfaul` → `xlWorkbookDefault`、
+    `xlcell` → `xlCellTypeVisible`（前缀）`+ xlLastCell`（跳步，永远排在前缀之后）。
+    输入不足 4 个字符时退化成纯前缀，与只认前缀时**一模一样**，不会平白多出噪音。
   只想留某个家族：`set VBECOMPLETE_HOST_ENUM_FAMILIES=xl`；整批关掉：
   `set VBECOMPLETE_NO_HOST_ENUMS=1`。
 - **打全名照样提示**：名字打全了列表不会消失（`Sub tes` → `Sub test` 始终提示 `test`），
@@ -259,7 +264,9 @@
   4. 日志里搜 `host-enums:` —— 会写明每个库"推导出的家族前缀 + 保留多少条"，
      以及哪几个库因为"无家族前缀"被跳过。
 - **提示里冒出一堆 `xl*` / `mso*`，觉得吵**：它们只在你**敲出家族前缀**时才出现
-  （`xl` / `xlu` / `mso`），输 `count` / `cell` / `range` 这类词**一条都不会多出来**。
+  （`xl` / `xlu` / `mso`），输 `count` / `cell` / `range` 这类词**一条都不会多出来**；
+  敲了前缀之后也要打满 **4 个连续字符**才开始接受跳着命中（`xlworkfaul` →
+  `xlWorkbookDefault`），所以 `xlm` / `xlc` 这种三两个字符的输入不会炸出几百条。
   若连 `mso*` 都不想要（Excel VBA 里用得比 `xl*` 少），
   用 `set VBECOMPLETE_HOST_ENUM_FAMILIES=xl` 只留 Excel 那一族；
   想整批不要：`set VBECOMPLETE_NO_HOST_ENUMS=1`。

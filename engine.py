@@ -521,6 +521,30 @@ def fuzzy_match(name, query):
     return score, positions
 
 
+# v68：宿主类型库枚举常量放行"跳步模糊"的门槛 —— 输入里必须出现过一段
+# 【连续】的名字片段，且长度不小于这个值。见 Completer.trigger 里那段说明。
+# 取 4 与 v61 内建名字"纯分散命中要 >= 4 个字符"那档保持一致。
+HOST_ENUM_FUZZY_RUN = 4
+
+
+def _longest_run(positions):
+    """命中下标（升序）里最长的那段连续长度。
+
+    `xlworkfaul` 打在 `xlWorkbookDefault` 上是 [0,1,2,3,4,9,12,13,14,15]，
+    最长连续段是 6（`xlwork`；后面 `faul` 又是 4）—— 说明用户确实在打这个名字，
+    只是中间跳过了 `book`。而 `xlce` 打在 `xlVAlignCenter` 上只有断断续续的单点，
+    最长连续段 1 —— 那就只是"碰巧凑得出子序列"，不算。
+    """
+    if not positions:
+        return 0
+    best = cur = 1
+    for a, b in zip(positions, positions[1:]):
+        cur = cur + 1 if b == a + 1 else 1
+        if cur > best:
+            best = cur
+    return best
+
+
 def _name_exists_outside_caret(backend, word, line_no, caret_col):
     """把光标处的词抹掉之后，这个 name 在工程里还存不存在。
 
@@ -1049,6 +1073,27 @@ class Completer:
         #
         # 顺带一个性能好处：前缀命中不必跑 _word_boundaries（正则），4500 个名字
         # 各跑一遍会把每次按键拖到 ~10ms，走快捷路径实测 ~2.8ms。
+        #
+        # 【v68】只认前缀又太死：用户报"输入 xlworkfaul，不提示 xlWorkbookDefault"。
+        # 那不是前缀（xl work f aul，中间跳过了 book），但除了它整个 4538 条里
+        # 一条都不匹配 —— 命中是唯一的，谈不上噪音，纯粹是被这条规则一刀切掉了。
+        #
+        # 放宽的口径：**输入必须从家族前缀开始**（xl / mso，这条不能松：正是它
+        # 把 ms -> 2365 条 mso*、count -> 130 条、open -> 492 条这些噪音整片挡掉的，
+        # 实测放开后 ms / count / open / cell / ar / vb 依旧是 0 条），
+        # 然后再要求输入里【出现过一段连续的名字片段】（长度 >= HOST_ENUM_FUZZY_RUN）。
+        # 意思是"你真的打过这个名字里的一段"，而不是拿三两个字母去凑子序列：
+        #   xlworkfaul -> xlWorkbookDefault   连续块 6（xlwork / faul）  ✓ 用户要的
+        #   xlms       -> xlMSDOS             连续块 4                    ✓
+        #   xlco / xlce / xla / xlms / xlm    输入不够 4 个字符，
+        #                                     退化成纯前缀，与 v67 完全一致（无新增噪音）
+        #   xlcell     -> 仍以 xlCellType* 前缀命中排在最前，多出来的几条跳步命中
+        #                 （xlLastCell 之类）排在 kind 0 档，不会顶掉首选
+        #
+        # 为什么是"连续块"而不是"输入够长就行"：实测放行纯跳步后，xlcell 会从
+        # 15 条涨到 89 条、xlcount 从 4 条涨到 59 条 —— 全是"碰巧凑得出子序列"的
+        # 长复合词。"连续块 >= 4"这条把短输入的噪音压回前缀水平，同时保住了
+        # "用户确实在打这个名字"的那批（阈值 4 与 v61 内建名字那档一致）。
         host_min = self._host_enum_names()
         if not host_min:
             for i in visible_ids:
@@ -1063,11 +1108,22 @@ class Completer:
                 _low = i.lower()
                 _need = host_min.get(_low, 0)
                 if _need:
-                    if _lw < _need or not _low.startswith(_qlow):
+                    if _lw < _need:
                         continue
-                    # 前缀命中：kind 3（前缀）/ 4（完全相同），命中位置从 0 起
-                    _kind = 4 if _lw == len(_low) else 3
-                    scored.append(((_kind, 0, -_lw, -len(_low)), i, _hits))
+                    if _low.startswith(_qlow):
+                        # 前缀命中：kind 3（前缀）/ 4（完全相同），命中位置从 0 起
+                        _kind = 4 if _lw == len(_low) else 3
+                        scored.append(((_kind, 0, -_lw, -len(_low)), i, _hits))
+                        continue
+                    # v68：非前缀。先要求输入本身就从家族前缀开始（`xl...`）。
+                    if not _qlow.startswith(_low[:_need]):
+                        continue
+                    r = fuzzy_match(i, word)
+                    if r is None or _longest_run(r[1]) < HOST_ENUM_FUZZY_RUN:
+                        continue
+                    # 跳步命中的评分照 fuzzy_match 的来（通常是 kind 0 分散），
+                    # 于是它天然排在所有前缀命中之后，不会顶掉首选。
+                    scored.append((r[0], i, r[1]))
                     continue
                 r = fuzzy_match(i, word)
                 if r is not None:

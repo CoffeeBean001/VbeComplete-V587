@@ -5269,6 +5269,204 @@ def main():
     except Exception as _e44x:
         check("第 44 节异常: %s" % _e44x, [True], expect_contain=[False])
 
+    # ==================================================================
+    # 45. v68：宿主枚举常量的模糊匹配（★用户报的 xlworkfaul）
+    #
+    # 用户报："我输入 xlworkfaul，不会提示 xlWorkbookDefault，这个模糊匹配有问题。"
+    #
+    # 复现结论：不是漏收（xlWorkbookDefault 在 v67 就已经在池子里），是 v67 的
+    # "只认从头开始的连续前缀"太死 —— xlworkfaul 跳过了中间的 book，不算前缀，
+    # 可它是整个 4538 条里【唯一】能匹配上的候选。命中唯一，纯属被规则一刀切掉。
+    #
+    # v68 放宽成两条【都要满足】：
+    #   1) 输入本身从家族前缀开始（xl / mso）。这条不能松 —— 正是它整片挡掉了
+    #      ms -> 2365 条 mso*、count -> 130 条、open -> 492 条这些噪音；
+    #   2) 输入里出现过一段【连续】的名字片段，长度 >= HOST_ENUM_FUZZY_RUN(=4)，
+    #      即"你真的打过这个名字里的一段"，而不是拿几个字母去凑子序列。
+    #
+    # 为什么不是"输入够长就放行"：实测放行纯跳步后 xlcell 会从 15 条涨到 89 条、
+    # xlcount 从 4 条涨到 59 条。加"连续块 >= 4"后，长度 < 4 的输入退化成纯前缀
+    # （与 v67 一字不差），而 xlworkfaul（连续块 6）照常命中。
+    # ==================================================================
+    print("\n=== 45. 宿主枚举常量的模糊匹配（v68）===")
+    try:
+        import engine as E45
+
+        # ---- 45.1~45.3 纯函数：连续块闸门 ----
+        check("45.1 连续块闸门常量 = 4（与 v61 内建名字那档一致）",
+              [E45.HOST_ENUM_FUZZY_RUN], expect_contain=[4])
+        check("45.2 _longest_run：xlworkfaul 在 xlWorkbookDefault 上的命中下标"
+              "最长连续段 = 6（xlwork 一段 + faul 一段）",
+              [E45._longest_run([0, 1, 2, 3, 4, 5, 12, 13, 14, 15]),
+               E45._longest_run(E45.fuzzy_match("xlWorkbookDefault",
+                                                "xlworkfaul")[1])],
+              expect_contain=[6, 6])
+        check("45.3 _longest_run 边界：空 -> 0，单点 -> 1，全散 -> 1",
+              [E45._longest_run([]), E45._longest_run([7]),
+               E45._longest_run([0, 2, 4, 6])],
+              expect_contain=[0, 1, 1])
+
+        # ---- 45.4~45.9 桩池：确定性验证各条规则 ----
+        _POOL45 = [("xlWorkbookDefault", "宿主库", None, False),
+                   ("xlWorkbookNormal", "宿主库", None, False),
+                   ("xlMSDOS", "宿主库", None, False),
+                   ("xlCenter", "宿主库", None, False),
+                   ("xlCellTypeVisible", "宿主库", None, False),
+                   ("xlVAlignCenter", "宿主库", None, False),
+                   ("xlLastCell", "宿主库", None, False),
+                   ("msoTrue", "宿主库", None, False),
+                   ("MyWorkOrder", "M1", None, False),
+                   ("MyWorkOrderCount", "M1", None, False)]
+        # ⚠️ 只把【宿主库】那批当宿主常量。工程内名字（MyWork*）必须留在
+        # host_min 之外 —— 否则它们会连带被套上"必须从家族前缀开始"的闸门，
+        # 输入 count 就再也补不出 MyWorkOrderCount 了（这个坑自己踩过一次）。
+        _HOST45 = dict((r[0].lower(),
+                        3 if r[0].lower().startswith("mso") else 2)
+                       for r in _POOL45 if r[1] == "宿主库")
+
+        class _UI45(object):
+            def __init__(self):
+                self.shown = False
+                self.rows = []
+
+            def show(self, rows, selection=0, completer=None):
+                self.shown = True
+                self.rows = list(rows)
+
+            def update_selection(self, *a, **k):
+                pass
+
+            def hide(self, *a, **k):
+                self.shown = False
+
+            def contains_point(self, *a, **k):
+                return False
+
+        class _B45(object):
+            """桩后端：池子 / 宿主清单都能替换（真实那一路由 45.10 起接手）。"""
+
+            def __init__(self, word, pool=None, host=None):
+                self._word = str(word)
+                self._pool = list(pool if pool is not None else _POOL45)
+                self._host = dict(host if host is not None else _HOST45)
+
+            def get_context(self):
+                _ln = "    x = " + self._word
+                return {"line_no": 3, "caret_col": len(_ln) + 1,
+                        "line_text": _ln, "in_string": False,
+                        "in_comment": False, "in_type_position": False,
+                        "in_decl_position": False, "decl_names": [],
+                        "proc_name": None, "module_name": "M1"}
+
+            def get_identifiers(self):
+                return list(self._pool)
+
+            def get_declared_names(self):
+                return [r[0].lower() for r in self._pool]
+
+            def declared_elsewhere(self, name, module_name):
+                return str(name).lower() in [r[0].lower() for r in self._pool]
+
+            def get_structural_names(self):
+                return [r[0].lower() for r in self._pool]
+
+            def get_builtin_names(self):
+                return []
+
+            def get_type_names(self):
+                return []
+
+            def names_outside_caret(self, caret, scope_only=False):
+                return set()
+
+            def get_host_enum_names(self):
+                return dict(self._host)
+
+        def _trig45(word, pool=None, host=None):
+            _ui = _UI45()
+            _c = E45.Completer(_B45(word, pool, host), _ui)
+            _c.trigger(True)
+            return list(_c.matches or []), _ui
+
+        # ★用户报的场景：跳步输入要能补出 xlWorkbookDefault
+        check("45.4 ★输入 xlworkfaul -> 提示 xlWorkbookDefault（用户报的场景）",
+              [_trig45("xlworkfaul")[0]], expect_contain=[["xlWorkbookDefault"]])
+        check("45.5 再少一个字符 xlworkfau 同样命中（连续块 6 未变）",
+              [_trig45("xlworkfau")[0]], expect_contain=[["xlWorkbookDefault"]])
+        check("45.6 前缀照旧：xlworkbookn -> xlWorkbookNormal",
+              [_trig45("xlworkbookn")[0]], expect_contain=[["xlWorkbookNormal"]])
+        check("45.7 输入不够 4 个字符 -> 退化成纯前缀，与 v67 一致："
+              "xlms -> 只 xlMSDOS",
+              [_trig45("xlms")[0]], expect_contain=[["xlMSDOS"]])
+        check("45.8 跳步候选没有 4 连块 -> 被闸门挡掉："
+              "xlce -> 只前缀的 xlCenter / xlCellTypeVisible，"
+              "跳步的 xlVAlignCenter 不出",
+              [_trig45("xlce")[0]],
+              expect_contain=[["xlCenter", "xlCellTypeVisible"]])
+        check("45.9 跳步命中排在所有前缀命中之后（kind 0 < kind 3）："
+              "xlcell -> xlCellTypeVisible 在前，xlLastCell 在后",
+              [_trig45("xlcell")[0]],
+              expect_contain=[["xlCellTypeVisible", "xlLastCell"]])
+        check("45.10 没从家族前缀开始的输入，一条宿主常量都不出："
+              "ms / open 全空，count 只剩工程内名字",
+              [_trig45("ms")[0], _trig45("count")[0], _trig45("open")[0]],
+              expect_contain=[[], ["MyWorkOrderCount"], []])
+        check("45.11 工程内名字不受这套闸门约束（走普通通道）：myworkc -> "
+              "MyWorkOrderCount（跳步照旧）",
+              [_trig45("myworkc")[0]], expect_contain=[["MyWorkOrderCount"]])
+
+        # ---- 45.11~45.13 真机：真实 4538 条清单 + 真引擎，端到端 ----
+        # 与第 44 节同样的理由：前面小节把 VB._get_vbe_cached 打桩成了假 VBE，
+        # 必须另加载一份干净的 vbe_bridge 才能读到真实引用。
+        _fresh45 = None
+        try:
+            import importlib.util as _iu45
+            _spec45 = _iu45.spec_from_file_location(
+                "vbe_bridge_fresh45",
+                os.path.join(os.path.dirname(os.path.dirname(
+                    os.path.abspath(__file__))), "vbe_bridge.py"))
+            _fresh45 = _iu45.module_from_spec(_spec45)
+            _spec45.loader.exec_module(_fresh45)
+        except Exception:
+            _fresh45 = None
+        _items45 = []
+        try:
+            _items45 = (_fresh45 or VB44).host_enum_constants()
+        except Exception:
+            _items45 = []
+        _real45 = [(n, "宿主库", None, False) for n, _m in _items45]
+        _rhost45 = dict((n.lower(), m) for n, m in _items45)
+
+        if not _items45:
+            check("45.12 真机：拿不到宿主枚举清单（Excel 未开？）"
+                  "—— 跳过 45.12~45.14",
+                  [True], expect_contain=[True])
+        else:
+            _m45 = _trig45("xlworkfaul", pool=_real45, host=_rhost45)[0]
+            check("45.12 ★真机 %d 条：xlworkfaul 唯一命中 xlWorkbookDefault"
+                  "（命中唯一 = 无噪音）" % (len(_items45),),
+                  [_m45], expect_contain=[["xlWorkbookDefault"]])
+            _m45b = [_trig45(w, pool=_real45, host=_rhost45)[0]
+                     for w in ("ms", "count", "open", "cell", "ar", "vb")]
+            check("45.13 真机：ms / count / open / cell / ar / vb 一条 xl*/mso* "
+                  "都不出（v67 的防噪音不退化）",
+                  [_m45b], expect_contain=[[[], [], [], [], [], []]])
+            # 3 字符输入不可能凑出 4 连块 -> 行为必须与 v67 的"纯前缀"一字不差
+            _pre45 = sorted(n for n, _m in _items45
+                            if n.lower().startswith("xla"))
+            _gate45 = sorted(n for n, _m in _items45
+                             if n.lower().startswith("xla")
+                             or (E45.fuzzy_match(n, "xla") is not None
+                                 and E45._longest_run(
+                                     E45.fuzzy_match(n, "xla")[1])
+                                 >= E45.HOST_ENUM_FUZZY_RUN))
+            check("45.14 真机：3 字符输入 xla 的命中与「纯前缀」完全一致"
+                  "（%d 条；连续块不可能够 4）" % (len(_pre45),),
+                  [_gate45 == _pre45, len(_pre45) > 0],
+                  expect_contain=[True, True])
+    except Exception as _e45:
+        check("第 45 节异常: %s" % _e45, [True], expect_contain=[False])
+
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))
     if FAILURES:
