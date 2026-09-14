@@ -3996,9 +3996,13 @@ def main():
               expect_contain=["MsgBox"])
 
         # 38.16~38.20：真实 VbeBackend 全链路（临时把开关打开）
+        # v70 起"内建枚举常量（vb*）"默认不收（用户口径：不用它、嫌干扰）。这一节
+        # 验的是"完整名单都接上了（含常量）"，所以【两个开关都临时打开】——
+        # 断言强度不变，只是把默认值这件事挪到第 47 节单独把关。
         import vbe_bridge as VB38R
-        _saved38 = VB38R.ENABLE_VBA_BUILTINS
+        _saved38 = (VB38R.ENABLE_VBA_BUILTINS, VB38R.ENABLE_VBA_CONSTANTS)
         VB38R.ENABLE_VBA_BUILTINS = True
+        VB38R.ENABLE_VBA_CONSTANTS = True
         try:
             class _CM38R(object):
                 def __init__(self, text):
@@ -4080,7 +4084,8 @@ def main():
             finally:
                 VB38R._get_vbe_cached = _orig38
         finally:
-            VB38R.ENABLE_VBA_BUILTINS = _saved38
+            (VB38R.ENABLE_VBA_BUILTINS,
+             VB38R.ENABLE_VBA_CONSTANTS) = _saved38
 
         # 38.22~38.24：Type/Enum 块成员不该从"隐式变量"那条路溜回候选池
         #
@@ -5098,6 +5103,10 @@ def main():
         except Exception:
             _fresh44 = None
         _VB44R = _fresh44 or VB44
+        # v70 起宿主枚举默认不收（用户口径）。这一节验的是"枚举链路本身能跑通"，
+        # 所以把开关临时打开 —— 断言强度不变；"默认关"由第 47 节单独把关。
+        _saved_he44 = _VB44R.ENABLE_HOST_ENUMS
+        _VB44R.ENABLE_HOST_ENUMS = True
         try:
             _items44 = _VB44R.host_enum_constants()
             _mins44 = sorted({m for _n, m in _items44})
@@ -5123,6 +5132,8 @@ def main():
             _okhm44 = "异常: %s" % _e44b
         check("44.9 后端 get_host_enum_names() -> 小写名到最短长度的字典",
               [_okhm44], expect_contain=[True])
+        # 复原（后面 44.10+ 走桩后端，与这个开关无关）
+        _VB44R.ENABLE_HOST_ENUMS = _saved_he44
 
         # ---- 44.10~44.15 引擎接线：前缀专用通道 ----
         _HOST44 = {"xlup": 2, "xlcellvalue": 2, "xldown": 2, "xltoright": 2,
@@ -5431,6 +5442,9 @@ def main():
             _fresh45 = None
         _items45 = []
         try:
+            # v70 起宿主枚举默认不收；这一节要真实 4538 条清单，故临时打开开关。
+            if _fresh45 is not None:
+                _fresh45.ENABLE_HOST_ENUMS = True
             _items45 = (_fresh45 or VB44).host_enum_constants()
         except Exception:
             _items45 = []
@@ -5625,6 +5639,234 @@ def main():
                   expect_contain=[["xlWorkbookDefault"]])
     except Exception as _e46:
         check("第 46 节异常: %s" % _e46, [True], expect_contain=[False])
+
+    # ==================================================================
+    # 47. v70：内置枚举默认不提示（用户口径），内建函数照常
+    #
+    # 用户要求："我不怎么使用 VBA 内置枚举，提示出来对我有干扰 —— vb 开头、
+    # xl 开头这些枚举都关掉不提示，函数那些要保留。"
+    #
+    # 于是 vba_builtins 的 CONSTANTS / FUNCTIONS 拆成两组导出，收不收由
+    # `vbe_bridge.ENABLE_VBA_CONSTANTS`（默认 False）决定；宿主类型库枚举
+    # （xl*/mso*）由 `vbe_bridge.ENABLE_HOST_ENUMS`（v70 起默认 False）决定。
+    # 两个开关都能用环境变量翻回来（VBECOMPLETE_VBA_CONSTANTS / _HOST_ENUMS）。
+    #
+    # 这一节守【默认口径 + 开关真的在起作用】：每条"关着没有"都配一条
+    # "打开就有"的反向对照 —— 否则"碰巧没有"（比如桩 VBE 解析失败）也能蒙过去。
+    # ==================================================================
+    print("\n=== 47. 内置枚举默认不提示（v70）===")
+    try:
+        import vbe_bridge as VB47
+        import vba_builtins as VB47B
+        import engine as E47
+        import os as _os47
+
+        # ---- 47.1 _env_flag 三态（纯函数）----
+        _KEY47 = "VBECOMPLETE_TEST47_FLAG"
+        _old47 = _os47.environ.get(_KEY47)
+        _r47 = {}
+        try:
+            _os47.environ.pop(_KEY47, None)
+            _r47["unset"] = (VB47._env_flag(_KEY47, True),
+                             VB47._env_flag(_KEY47, False))
+            for _v in ("1", "true", "YES", "on", "0", "false", "No", "OFF", "??"):
+                _os47.environ[_KEY47] = _v
+                _r47[_v] = VB47._env_flag(_KEY47, True)
+        finally:
+            if _old47 is None:
+                _os47.environ.pop(_KEY47, None)
+            else:
+                _os47.environ[_KEY47] = _old47
+        check("47.1 _env_flag：未设置/认不出 -> 默认值；1,true,yes,on -> True；"
+              "0,false,no,off -> False",
+              [_r47["unset"], _r47["1"], _r47["true"], _r47["YES"], _r47["on"],
+               _r47["0"], _r47["false"], _r47["No"], _r47["OFF"], _r47["??"]],
+              expect_contain=[(True, False), True, True, True, True,
+                              False, False, False, False, True])
+
+        # ---- 47.2 出厂默认值 ----
+        # ⚠️ 必须单独加载一份干净模块：main() 的前导段会把"内建/关键字"这两个开关
+        # 【临时关掉】来跑第 1~37 节的防噪音护栏，现场读到的是被改过的值。
+        _fresh47 = None
+        try:
+            import importlib.util as _iu47
+            _spec47 = _iu47.spec_from_file_location(
+                "vbe_bridge_fresh47",
+                os.path.join(os.path.dirname(os.path.dirname(
+                    os.path.abspath(__file__))), "vbe_bridge.py"))
+            _fresh47 = _iu47.module_from_spec(_spec47)
+            _spec47.loader.exec_module(_fresh47)
+        except Exception:
+            _fresh47 = None
+        check("47.2 ★出厂默认：内建函数/关键字开，内置枚举常量（vb*）与"
+              "宿主枚举（xl*/mso*）关",
+              [((_fresh47.ENABLE_VBA_BUILTINS,
+                 _fresh47.ENABLE_VBA_KEYWORDS,
+                 _fresh47.ENABLE_VBA_CONSTANTS,
+                 _fresh47.ENABLE_HOST_ENUMS) if _fresh47 else "干净模块加载失败")],
+              expect_contain=[(True, True, False, False)])
+
+        # ---- 47.3 清单拆成两组（清单本身不裁剪）----
+        _inter47 = set(VB47B.BUILTIN_FUNCTIONS) & set(VB47B.BUILTIN_CONSTANTS)
+        check("47.3 清单拆组：函数 %d / 常量 %d，交集 %s，并集 == BUILTIN_NAMES(%d)"
+              % (len(VB47B.BUILTIN_FUNCTIONS), len(VB47B.BUILTIN_CONSTANTS),
+                 sorted(_inter47) or "空", len(VB47B.BUILTIN_NAMES)),
+              [_inter47,
+               set(VB47B.BUILTIN_NAMES) == (set(VB47B.BUILTIN_FUNCTIONS)
+                                            | set(VB47B.BUILTIN_CONSTANTS)),
+               "MsgBox" in VB47B.BUILTIN_FUNCTIONS,
+               "vbCrLf" in VB47B.BUILTIN_CONSTANTS,
+               "vbCrLf" not in VB47B.BUILTIN_FUNCTIONS,
+               len(VB47B.BUILTIN_CONSTANTS) > 0],
+              expect_contain=[set(), True, True, True, True, True])
+
+        # ---- 47.4 默认：宿主枚举一条都不去枚举 ----
+        check("47.4 默认：host_enum_constants() 返回空清单（连类型库都不加载）",
+              [len(VB47.host_enum_constants())], expect_contain=[0])
+
+        # ---- 47.5~47.8 真实后端全链路（桩 VBE）----
+        class _CM47(object):
+            def __init__(self, text):
+                self.text = text
+
+            @property
+            def CountOfLines(self):
+                return self.text.count("\n") + 1
+
+            def Lines(self, start, count):
+                return "\r\n".join(
+                    self.text.split("\n")[start - 1:start - 1 + count])
+
+        class _Comp47(object):
+            def __init__(self, name, text, ctype=1):
+                self.Name = name
+                self.Type = ctype
+                self.CodeModule = _CM47(text)
+
+        class _Proj47(object):
+            def __init__(self, comps):
+                self.Name = "VBAProject"
+                self.VBComponents = list(comps)
+
+        class _Pane47(object):
+            def __init__(self, comp):
+                self._c = comp
+
+            @property
+            def CodeModule(self):
+                return self._c.CodeModule
+
+            def GetSelection(self):
+                return (1, 1, 1, 1)
+
+        class _VBE47(object):
+            def __init__(self, comps, act):
+                self.ActiveVBProject = _Proj47(comps)
+                self.ActiveCodePane = _Pane47(act)
+
+        class _UI47(object):
+            def __init__(self):
+                self.rows = []
+
+            def show(self, rows, sel, c):
+                self.rows = list(rows)
+
+            def hide(self):
+                pass
+
+            def update_selection(self, sel):
+                pass
+
+            def contains_point(self, x, y):
+                return False
+
+        _comp47 = _Comp47("Module1", "Sub Foo()\n    x = 1\nEnd Sub", 1)
+        _vbe47 = _VBE47([_comp47], _comp47)
+        _orig47 = VB47._get_vbe_cached
+        # ⚠️ main() 前导段把"内建/关键字"开关临时关掉了（第 1~37 节护栏的前提）。
+        # 这一节要验的是"枚举关、函数开"，所以显式打开函数/关键字再验。
+        _saved47 = (VB47.ENABLE_VBA_BUILTINS, VB47.ENABLE_VBA_KEYWORDS,
+                    VB47.ENABLE_VBA_CONSTANTS, VB47.ENABLE_HOST_ENUMS)
+        VB47.ENABLE_VBA_BUILTINS = True
+        VB47.ENABLE_VBA_KEYWORDS = True
+        VB47._get_vbe_cached = lambda: _vbe47
+        try:
+            _bk47 = VB47.VbeBackend()
+            _nm47 = set(str(r[0]).lower() for r in _bk47.get_identifiers())
+            _bl47 = _bk47.get_builtin_names()
+            check("47.5 ★默认口径：vb* 一条都不进池，而 MsgBox / Split / "
+                  "String / If 照常在",
+                  ["vbcrlf" not in _nm47, "vbok" not in _nm47,
+                   "msgbox" in _nm47, "split" in _nm47,
+                   "string" in _nm47, "if" in _nm47],
+                  expect_contain=[True] * 6)
+            check("47.6 ★默认口径：宿主枚举一条都不收（xlUp / msoTrue 进不了池，"
+                  "引擎也拿不到清单）",
+                  ["xlup" not in _nm47, "msotrue" not in _nm47,
+                   _bk47.get_host_enum_names() == {}],
+                  expect_contain=[True, True, True])
+            check("47.7 收紧匹配用的 builtin_names 集合里同样没有常量",
+                  ["vbcrlf" not in _bl47, "msgbox" in _bl47],
+                  expect_contain=[True, True])
+
+            # 反向对照：把开关打开，常量必须回来（证明 47.5 是"开关起作用"，
+            # 而不是桩 VBE / 解析环节碰巧什么都没收到）
+            VB47.ENABLE_VBA_CONSTANTS = True
+            try:
+                _nm47b = set(str(r[0]).lower()
+                             for r in VB47.VbeBackend().get_identifiers())
+                check("47.8 对照：ENABLE_VBA_CONSTANTS=True -> vbCrLf / vbOK 回来",
+                      ["vbcrlf" in _nm47b, "vbok" in _nm47b],
+                      expect_contain=[True, True])
+            finally:
+                VB47.ENABLE_VBA_CONSTANTS = False
+
+            # ---- 47.9~47.10 引擎端到端（默认口径）----
+            _ctx47 = {"line_no": 1, "line_text": "    ", "caret_col": 5,
+                      "in_string": False, "in_comment": False,
+                      "in_type_position": False, "in_decl_position": False,
+                      "decl_names": [], "proc_name": None,
+                      "module_name": "Module1"}
+
+            def _trig47(word):
+                _ln = "    " + word
+                _ctx47["line_text"] = _ln
+                _ctx47["caret_col"] = len(_ln) + 1
+                _b = VB47.VbeBackend()
+                _b.get_context = lambda: dict(_ctx47)
+                _c = E47.Completer(_b, _UI47())
+                _c.trigger(False)
+                return list(_c.matches or [])
+
+            check("47.9 ★引擎端到端：打 vb / xl / xlu 一个候选都不出"
+                  "（用户要的就是这个）",
+                  [_trig47("vb"), _trig47("xl"), _trig47("xlu")],
+                  expect_contain=[[], [], []])
+            check("47.10 引擎端到端：打 ms 仍出 MsgBox（函数那批没被牵连）",
+                  [_trig47("ms")], expect_contain=[["MsgBox"]])
+        finally:
+            VB47._get_vbe_cached = _orig47
+            (VB47.ENABLE_VBA_BUILTINS, VB47.ENABLE_VBA_KEYWORDS,
+             VB47.ENABLE_VBA_CONSTANTS, VB47.ENABLE_HOST_ENUMS) = _saved47
+
+        # ---- 47.11 接线护栏：别把开关或拆组改没了 ----
+        try:
+            import inspect as _inspect47
+            _src47 = _inspect47.getsource(VB47)
+            _src47b = _inspect47.getsource(VB47B)
+            _okwire47 = all(k in _src47 for k in (
+                "ENABLE_VBA_CONSTANTS", "VBECOMPLETE_VBA_CONSTANTS",
+                "VBECOMPLETE_HOST_ENUMS", "def _env_flag",
+                "vba_builtins.BUILTIN_FUNCTIONS",
+                "vba_builtins.BUILTIN_CONSTANTS")) and (
+                "BUILTIN_FUNCTIONS" in _src47b
+                and "BUILTIN_CONSTANTS" in _src47b)
+        except Exception as _e47w:
+            _okwire47 = "异常: %s" % _e47w
+        check("47.11 接线护栏：两个开关 + 环境变量 + 函数/常量拆组都在",
+              [_okwire47], expect_contain=[True])
+    except Exception as _e47:
+        check("第 47 节异常: %s" % _e47, [True], expect_contain=[False])
 
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))

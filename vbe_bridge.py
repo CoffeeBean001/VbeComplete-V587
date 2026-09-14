@@ -20,6 +20,26 @@ from engine import replace_word
 
 _CACHE_TTL = 2.0  # 标识符缓存刷新间隔（秒）
 
+
+def _env_flag(name, default):
+    """三态环境变量开关：`1/true/yes/on` -> True，`0/false/no/off` -> False，
+    未设置 / 认不出来 -> default。
+
+    用意：下面那些"收不收某类名字"的开关，默认值写死在代码里（跟着用户口径走），
+    但要能不改源码就翻过来 —— 双击 run.bat 之前先 `set XXX=1` 即可。
+    认不出的值一律回落到 default（绝不因为写错一个环境变量就把功能关掉）。
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    v = raw.strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
 # 未声明即使用的"隐式变量"（不写 Option Explicit 时的用法）是否纳入提示。
 # 关闭后行为回到旧版：只提示 Dim/Const/Sub 等显式声明出来的名字。
 ENABLE_IMPLICIT_IDENTIFIERS = True
@@ -31,14 +51,22 @@ IMPLICIT_SCOPE = "proc"
 # VBA 语言自带的名字（内建函数 / 常用内建常量 / 内建数据类型）是否纳入提示。
 # 关闭后回到旧行为：只提示工程代码里出现过的名字（外加组件名、窗体控件名；
 # 关键字另见下面的 ENABLE_VBA_KEYWORDS，同样关掉才是完全旧行为）。
-ENABLE_VBA_BUILTINS = True
+ENABLE_VBA_BUILTINS = _env_flag("VBECOMPLETE_VBA_BUILTINS", True)
+
+# ★v70：VBA 内建的 **枚举常量**（`vbOK` / `vbCrLf` / `vbYes` … 共 102 条）是否纳入提示。
+#
+# 用户口径（v70）："我不怎么使用 VBA 内置枚举，提示出来对我有干扰 —— 把枚举关掉，
+# 函数那些要保留。" 所以它与"内建函数"【分家】：函数（MsgBox / Left / Split …）
+# 与内建数据类型（Long / String …）照常提示，只把这一批枚举常量摘出去。
+# 想开回来：`set VBECOMPLETE_VBA_CONSTANTS=1`。
+ENABLE_VBA_CONSTANTS = _env_flag("VBECOMPLETE_VBA_CONSTANTS", False)
 
 # 语言关键字 / 保留字（Sub / Dim / If / For / Set / And …）是否纳入提示（v62）。
 #
 # 独立成一个开关（而不是并进 ENABLE_VBA_BUILTINS）：关键字与内建函数是两拨
 # 东西 —— 前者是语法骨架、后者是可调用的库成员。实测下来若觉得关键字提示偏吵，
 # 只关这一个即可，内建函数照常提示。
-ENABLE_VBA_KEYWORDS = True
+ENABLE_VBA_KEYWORDS = _env_flag("VBECOMPLETE_VBA_KEYWORDS", True)
 # 内建名字挂靠的"模块名"。
 #
 # 这是一个【虚拟模块】——VBA 运行时库。之所以要给它一个名字而不是留空：
@@ -65,7 +93,11 @@ _BUILTIN_MODULE = "VBA"
 #     没有家族前缀的库（stdole 的 Checked / Gray / Color 这种通用词）一概不收；
 #   * 只认【从头开始的连续前缀】命中，且输入长度不低于家族前缀长度 ——
 #     于是 xl -> xl*、xlu -> xlUp；而 ms 只出 MsgBox，绝不带出 mso*。
-ENABLE_HOST_ENUMS = True
+#
+# ★v70：**默认关闭**（用户口径："xl 开头这些枚举也不要提示，我不怎么用"）。
+# 想开回来：`set VBECOMPLETE_HOST_ENUMS=1`。关着的时候收集段整段不跑
+# （连类型库都不会去加载，零开销），引擎那边也拿不到宿主清单。
+ENABLE_HOST_ENUMS = _env_flag("VBECOMPLETE_HOST_ENUMS", False)
 # 家族前缀的覆盖率门槛：某前缀能盖住该库这么多比例的枚举成员，才算"家族前缀"。
 _HOST_ENUM_FAMILY_PCT = 0.5
 # 允许的家族前缀白名单（小写，逗号分隔）。留空 = 自动推导（推荐）。
@@ -1995,8 +2027,18 @@ class VbeBackend:
         #
         # 已声明过的同名不重复收录：工程里真有 Function Left(...) 时以用户的定义
         # 为准，免得列表里出现两条同名。
+        #
+        # 【v70】这一批里 **枚举常量（vb*）默认不收** —— 用户口径："我不怎么使用
+        # VBA 内置枚举，提示出来对我有干扰；函数那些要保留。" 于是函数（MsgBox /
+        # Left / Split …）与内建数据类型照常收，只有 vb* 那一组由
+        # ENABLE_VBA_CONSTANTS 裁掉（默认 False；`set VBECOMPLETE_VBA_CONSTANTS=1`
+        # 开回来）。注意裁剪放在【收集侧】而不是改清单本身：清单保持完整，
+        # 测试与诊断仍能看到全貌，开关一开立刻生效。
         if ENABLE_VBA_BUILTINS:
-            for _bn in vba_builtins.BUILTIN_NAMES:
+            _bn_src = vba_builtins.BUILTIN_FUNCTIONS
+            if ENABLE_VBA_CONSTANTS:
+                _bn_src = _bn_src + vba_builtins.BUILTIN_CONSTANTS
+            for _bn in _bn_src:
                 _bl = _bn.lower()
                 if _bl in declared_names:
                     continue

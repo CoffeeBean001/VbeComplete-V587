@@ -20,6 +20,14 @@
 名字混进候选池）；v62 用户明确要求收进来，于是单列 KEYWORDS 一组，并配独立的开关
 `vbe_bridge.ENABLE_VBA_KEYWORDS` —— 想关掉只关这一组，不影响内建函数/常量。
 
+【v70 的口径变化】用户要求"**内置枚举（vb*）不要提示，内建函数保留**"——
+理由是内置枚举他基本不用，提示出来只是干扰。于是 CONSTANTS 与 FUNCTIONS 拆成两组
+独立导出（BUILTIN_CONSTANTS / BUILTIN_FUNCTIONS），收不收由
+`vbe_bridge.ENABLE_VBA_CONSTANTS`（**默认 False**）决定；同一口径下宿主类型库的
+枚举常量（xl* / mso*）也默认不收（`vbe_bridge.ENABLE_HOST_ENUMS` 默认 False）。
+⚠️ 本模块的清单本身【不裁剪】，开关只在 vbe_bridge 的收集段生效 ——
+这样测试 / 诊断仍能看到完整名单，也方便用户随时把开关打开。
+
 刻意【不收】的：
   * 过时的 Def* 类型声明关键字（DefBool / DefInt / … / DefVar，11 个）—— 早在
     VB6 时代就已废弃，实际代码里几乎不会手写；
@@ -196,7 +204,13 @@ KEYWORDS = (
 # --------------------------------------------------------------------------
 # 对外导出
 # --------------------------------------------------------------------------
-# 进候选池的名字（函数 + 常量），保留规范大小写、顺序稳定。
+# v70：函数与常量【分开】导出 —— 用户口径是"内置枚举常量不收，内建函数照常收"。
+# 只拆导出、不动清单本身（见文件头 v70 说明）。
+BUILTIN_FUNCTIONS = tuple(dict.fromkeys(FUNCTIONS))
+BUILTIN_CONSTANTS = tuple(dict.fromkeys(CONSTANTS))
+
+# 两组并集（静态全量清单）：保留给"想知道完整名单"的调用方（测试 / 诊断）。
+# ⚠️ 收集侧**不要**直接用它 —— 走 vbe_bridge 的 ENABLE_VBA_CONSTANTS 裁剪。
 BUILTIN_NAMES = tuple(dict.fromkeys(FUNCTIONS + CONSTANTS))
 
 # 内建数据类型名（同样进候选池，供 `As |` 位置使用）。
