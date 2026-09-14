@@ -39,6 +39,14 @@ VbeComplete 主入口（修复版）
   位置弹的提示都拦得住（最典型的是敲逗号后弹的【参数信息】）。另外按
   Ctrl+Shift+I（VBE 唤出参数信息）也会收起我们的。想彻底关掉让位：设
   VBECOMPLETE_NO_YIELD=1。想关掉自动配对：设 VBECOMPLETE_NO_AUTOPAIR=1。
+
+  v64：提示只在【代码窗格】里有。以前判断"在不在 VBE"只看前台窗口标题，而
+  属性窗口 / 工程窗口 / 窗体设计器都是 VBE 主窗口的子窗口 —— 于是那些非写代码
+  的工作区里也会弹提示（用户报的：在属性窗口里改属性值时冒出候选）。现在改用
+  精确判据：查 VBE 线程里"当前拥有键盘焦点"的窗口，看它父链上有没有代码窗格
+  （窗口类 VbaWindow，见 vbe_bridge.vbe_code_pane_focused）。焦点不在代码窗格
+  时：不弹候选、并收起已挂着的候选窗；自动配对 / Shift+Enter / Ctrl+Space
+  一律不接管（免得把字符写进代码窗格）。判不出来时退回老判据，绝不"拿不准就拦"。
 """
 
 import os
@@ -268,6 +276,19 @@ POLL_INTERVAL_IDLE_MS = 2000
 # 刻意取得比 VSCode 收尾略长（2.5 秒），宁可多等半秒也不要再拖慢一次关闭。
 HOOK_SUPPRESS_SEC = 2.5
 
+# v64：「提示只在【代码窗格】里出现」这道闸门的开关。
+#
+# 判据是"VBE 线程里当前拥有键盘焦点的窗口，父链上有没有代码窗格（类名
+# VbaWindow）"，见 in_vbe_code_area。若你的宿主编译器窗口类名与实测不同、
+# 或这道闸门在你机器上误判（该弹的时候不弹），用这个开关退回旧行为
+# （前台窗口标题里有 "Microsoft Visual Basic" 就算数）：
+#   set VBECOMPLETE_NO_CODE_AREA_GATE=1
+try:
+    CODE_AREA_GATE = (
+        os.environ.get("VBECOMPLETE_NO_CODE_AREA_GATE", "0").strip() != "1")
+except Exception:
+    CODE_AREA_GATE = True
+
 # 自动配对：敲 `(` 补 `)`、敲 `"` 补另一个 `"`，光标落在中间。
 #
 # VBE 原生【不会】自动闭合括号 / 引号（VBE_Extras、Rubberduck 都把它当增强功能
@@ -319,7 +340,12 @@ def acquire_single_instance():
 
 
 def in_vbe_code_pane():
-    """判断当前前台窗口是否是 VBE 代码窗。"""
+    """判断当前前台窗口是否是 VBE（粗判据：只看前台窗口标题）。
+
+    只用于「要不要挂系统级钩子」这个粗粒度决定：属性窗口 / 工程窗口 / 设计器
+    也都是 VBE 主窗口的子窗口，它们在这里一律返回 True（挂上钩子是安全的，
+    因为真正会动代码的动作另有 in_vbe_code_area 把关）。
+    """
     if _gui is None:
         return False
     try:
@@ -328,6 +354,38 @@ def in_vbe_code_pane():
         return "Microsoft Visual Basic" in title
     except Exception:
         return False
+
+
+def in_vbe_code_area():
+    """焦点是否真的在 VBE 的【代码窗格】上（v64，精确判据）。
+
+    与 in_vbe_code_pane（前台窗口标题）的分工：标题判据分不出"VBE 里的哪个
+    子窗口"—— 属性窗口、工程窗口、窗体设计器全都满足它。而用户明确要求：
+    **非写代码的工作区里不要出现提示**（也不用代他写代码）。
+
+    所以凡是"会弹候选窗"或"会往代码里写字符"的动作，一律改用本判据：
+      * 轮询发现代码窗格文本变化 -> 该不该弹候选窗；
+      * Shift+Enter 新起一行、敲 `(`/`"` 自动配对；
+      * Ctrl+Space 手动唤出候选。
+
+    实现走 vbe_bridge.vbe_code_pane_focused()：查【VBE 线程】里当前拥有键盘
+    焦点的窗口，看它的父链上有没有代码窗格（类名 VbaWindow）。用线程内部焦点
+    而不是前台窗口，是因为中文输入法的候选窗会短暂抢走前台窗口。
+    拿不准时返回 None -> 退回标题判据（绝不在拿不准时一刀拦死）。
+
+    想退回旧行为（前台是 VBE 就认）：set VBECOMPLETE_NO_CODE_AREA_GATE=1。
+    若你的宿主代码窗格类名不同（不是 VbaWindow）：
+    set VBECOMPLETE_VBE_FRAME_CLASS=... 或直接用上面那个开关关掉本判据。
+    """
+    if not CODE_AREA_GATE:
+        return in_vbe_code_pane()
+    try:
+        st = vbe_bridge.vbe_code_pane_focused()
+    except Exception:
+        st = None
+    if st is None:
+        return in_vbe_code_pane()
+    return bool(st)
 
 
 def foreground_window_closing():
@@ -396,6 +454,26 @@ def _reconcile_resources(focused, released, backoff, last_focus_time, now, grace
     return mount_hooks, release_com
 
 
+def _poll_mod_switch(last, snap):
+    """两次快照之间是不是【换了模块】——而不是用户敲了字。
+
+    快照 = (行号, 行文本, 模块名)（v64 起多了模块名）。换模块 —— Ctrl+Tab 切
+    代码窗、点工程树换模块、属性改动导致 VBE 改写别的模块 —— 会让"同一行 +
+    文本不同"看起来像一次编辑，其实用户一个字都没敲，不该据此弹候选。
+
+    模块名只要有任一侧拿不到（宿主不返回 / 旧式后端只给二元组）就【不否决】：
+    宁可照旧触发，也绝不因为拿不到模块名把补全整个哑掉。
+    """
+    try:
+        if len(last) < 3 or len(snap) < 3:
+            return False
+        a = str(last[2] or "")
+        b = str(snap[2] or "")
+        return bool(a) and bool(b) and a.lower() != b.lower()
+    except Exception:
+        return False
+
+
 def _poll_action(typed_sep):
     """纯函数：本轮轮询该做什么 —— 'hide' 还是 'trigger'。
 
@@ -434,7 +512,7 @@ def main():
         "vbe_focused": False, # 上次（去抖后）的焦点状态，用于“切换时”做一次资源清理
         "raw_focused": None,  # 最近一次原始焦点读数，用于去抖
         "focus_streak": 0,    # 同一读数连续出现的次数
-        "last_snap": None,    # 上次轮询到的 (行号, 行文本)，用于检测内容变化
+        "last_snap": None,    # 上次轮询到的 (行号, 行文本, 模块名)，用于检测内容变化
         "ctrl": False,
         "alt": False,
         "swallowed": set(),   # 被吞掉的 keydown 的 vk，用于吞掉配对 keyup
@@ -560,20 +638,22 @@ def main():
             if msg in (WM_KEYDOWN, WM_SYSKEYDOWN):
                 # Shift+Enter = 在当前行下方新起一行（缩进对齐上一行）。
                 # 与"弹窗是否可见"无关：弹窗开着也照样接管（顺带收起弹窗）。
-                # 只在【焦点在 VBE 代码窗】且【COM 没在失败退避】时才吞键；
+                # 只在【焦点真在代码窗格】且【COM 没在失败退避】时才吞键；
                 # 否则放行，让 VBE 按原生行为处理（原生 Shift+Enter == 回车），
                 # 绝不"吞了按键却什么都没发生"。
+                # v64：判据从"前台是 VBE"收紧成"焦点在代码窗格"—— 在属性窗口 /
+                # 工程窗口 / 窗体设计器里打字时不能把内容写进代码窗格。
                 _pair_ch = (_pair_char_for_key(vk, _shift_down())
                             if AUTO_PAIR else None)
                 if (_is_newline_shortcut(vk, _shift_down())
                         and com_backoff_remaining() <= 0
-                        and in_vbe_code_pane()):
+                        and in_vbe_code_area()):
                     action = (_new_line_here, ())
                     suppress = True
                 elif (_pair_ch
                         and not _mod_down()
                         and com_backoff_remaining() <= 0
-                        and in_vbe_code_pane()):
+                        and in_vbe_code_area()):
                     # 自动配对 —— v57 改【主线程执行】（见 _auto_pair_here）。
                     #
                     # v56 这里曾是同步调用 backend.insert_pair() 才吞键，理由是
@@ -670,7 +750,8 @@ def main():
                 # 手动触发：用户点名要我们的列表。即便光标停在 VBE 也会弹列表
                 # 的位置（`标识符.` 之后）也照弹 —— 引擎只对【轮询自动触发】
                 # 让位，手动唤出永远有效。
-                if in_vbe_code_pane():
+                # v64：但焦点得真在代码窗格上（属性窗口里按 Ctrl+Space 不弹）。
+                if in_vbe_code_area():
                     post(completer.trigger)
             elif state["ctrl"] and not state["alt"] and _is_vk_char(key, "j"):
                 # Ctrl+J / Ctrl+Shift+J = VBE 唤出它自己的「列出属性/方法」。
@@ -907,6 +988,17 @@ def main():
         VBE 不可用时 snapshot() 返回 None，自然退化为空转。
         """
         try:
+            # v64：候选窗只允许活在"焦点真在代码窗格"的时候。焦点一旦落到属性
+            # 窗口 / 工程窗口 / 窗体设计器（都不是写代码的地方），立刻收起 ——
+            # 否则它会继续挂在那些工作区里，而且 Tab / ↑ / ↓ 还会被我们吞掉、
+            # 作用到代码窗格上。判据拿不准（None）时不动手，保持旧行为。
+            if completer.is_visible():
+                try:
+                    if vbe_bridge.vbe_code_pane_focused() is False:
+                        _log("poll: 焦点不在代码窗格 -> 收起候选窗")
+                        post(completer.hide)
+                except Exception:
+                    pass
             snap = backend.snapshot() if _com_allowed() else None
             if snap is not None:
                 last = state.get("last_snap")
@@ -914,10 +1006,16 @@ def main():
                     state["last_snap"] = snap      # 首次只记录，不触发
                 elif last != snap:
                     state["last_snap"] = snap
+                    # v64：换模块（Ctrl+Tab 切代码窗、点工程树换模块）会让
+                    # "同一行 + 文本不同"看起来像一次编辑，其实一个字都没敲
+                    # —— 那不是输入的上下文，收起挂着的候选窗、也别弹新的。
+                    if _poll_mod_switch(last, snap):
+                        _log("poll: 换了模块 -> 收起（不是输入）")
+                        post(completer.hide)
                     # 必须是「同一行内的文本变化」才算真的输入了内容。
                     # 单纯换到别的行（鼠标点击、方向键换行）不应弹列表，
                     # 否则在代码里点来点去会被弹窗打扰。
-                    if last[0] == snap[0]:
+                    elif last[0] == snap[0]:
                         # 文本变了 -> 让标识符缓存尽快失效，保证"刚声明的
                         # 变量"也能进候选。限流：最快 ID_REFRESH_MIN_SEC
                         # 重解析一次，避免每敲一个键都全量解析所有模块。
@@ -937,8 +1035,15 @@ def main():
                             post(completer.hide)
                         else:
                             # True: 校验光标前是否标识符字符（不在拼标识符则收起）
-                            _log("poll: line %s changed -> trigger" % (snap[0],))
-                            post_trigger()
+                            if vbe_bridge.vbe_code_pane_focused() is False:
+                                # v64：焦点不在代码窗格（属性窗口 / 工程窗口 /
+                                # 窗体设计器）—— 那里的"文本变化"不是用户在拼
+                                # 标识符，别在非写代码的工作区弹提示。
+                                _log("poll: 焦点不在代码窗格 -> 不触发")
+                                post(completer.hide)
+                            else:
+                                _log("poll: line %s changed -> trigger" % (snap[0],))
+                                post_trigger()
         except Exception:
             pass
         # 已离开 VBE（超过宽限期）、或 COM 正处于失败退避（宿主多半在关闭）

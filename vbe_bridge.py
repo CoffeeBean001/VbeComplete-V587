@@ -720,6 +720,170 @@ def vbe_popup_visible():
         return False
 
 
+# ---------------------------------------------------------------------------
+# v64：焦点是不是真的在【代码窗格】上
+# ---------------------------------------------------------------------------
+# 症状（用户报）：在【属性窗口】里改属性值时，候选窗偶尔会冒出来 —— 那里根本
+# 不是写代码的地方，用户不希望在这些非代码工作区出现提示。
+#
+# 根因：判断"是否在 VBE 里"一直是【前台窗口标题里有没有 "Microsoft Visual
+# Basic"】（main.in_vbe_code_pane）。而属性窗口 / 工程窗口 / 窗体设计器全都是
+# VBE 主窗口（wndclass_desked_gsk）里的子窗口，标题判据对它们一律返回 True。
+# 于是两件事都会发生：
+#   * 轮询发现代码窗格那行的文本变了（切代码窗格、属性改动导致 VBE 改写代码…）
+#     就照样弹候选窗；
+#   * 自动配对（敲 `(` / `"`）与 Shift+Enter 也会把内容写进【代码窗格】，
+#     而用户此刻其实在属性窗口里打字。
+#
+# 精确判据（真机实测 2026-09-14，本机 Office VBE）：
+#   * 代码窗格的窗口类是 **VbaWindow**，标题形如
+#     `下单填写模板.xlsm - UserForm1 (代码)`；它挂在 MDIClient 之下：
+#       VbaWindow < MDIClient < wndclass_desked_gsk
+#   * 属性窗口的窗口类是 **wndclass_pbrs**（标题 `属性 - CommandButton2`），
+#     里面的编辑框 / 列表是 Edit / ListBox / ComboBox / SysTabControl32；
+#   * 工程窗口是 **PROJECT**（标题 `工程 - VBAProject`）；
+#   * 窗体设计器是 **DesignerWindow**，里面装着被设计的窗体（ThunderDFrame）。
+#   所以"焦点窗口的父链上有没有 VbaWindow"是一个干净、与语言无关的判据。
+#
+# 为什么用 GetGUIThreadInfo【VBE 线程】而不是 GetForegroundWindow：
+#   中文输入法的候选/组字窗口会短暂抢走【前台窗口】，但 VBE 线程内部的焦点
+#   窗口不受影响 —— 用它就不会在中文输入时把代码窗格误判成"没焦点"。
+#
+# 探不到（VBE 主窗口找不到 / API 失败 / 焦点窗口为 0）一律返回 None（拿不准），
+# 由调用方退回老判据 —— 绝不"拿不准就拦"（v54 就是这么把工具搞成什么都不弹的）。
+VBE_FRAME_CLASSES = ("wndclass_desked_gsk",)
+try:
+    _extra_frame_cls = tuple(
+        c.strip() for c in
+        os.environ.get("VBECOMPLETE_VBE_FRAME_CLASS", "").split(",")
+        if c.strip())
+    if _extra_frame_cls:
+        VBE_FRAME_CLASSES = tuple(VBE_FRAME_CLASSES) + _extra_frame_cls
+except Exception:
+    pass
+
+CODE_PANE_CLASSES = ("VbaWindow",)
+
+_focus_state = {"frame": 0}
+_GUI_CACHE = {"cls": None, "ready": False}
+
+
+def _focus_protos():
+    """给这几个 Win32 调用设好原型并缓存（句柄是 64 位，restype 不设会被截断）。"""
+    import ctypes
+    import ctypes.wintypes as wt
+    if _GUI_CACHE["ready"]:
+        return ctypes.windll.user32
+    u32 = ctypes.windll.user32
+    u32.FindWindowW.restype = ctypes.c_void_p
+    u32.FindWindowW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
+    u32.GetParent.restype = ctypes.c_void_p
+    u32.GetParent.argtypes = [ctypes.c_void_p]
+    u32.GetWindowThreadProcessId.restype = wt.DWORD
+    u32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p,
+                                             ctypes.POINTER(wt.DWORD)]
+    u32.GetGUIThreadInfo.restype = wt.BOOL
+    u32.GetGUIThreadInfo.argtypes = [wt.DWORD, ctypes.c_void_p]
+    u32.IsWindow.argtypes = [ctypes.c_void_p]
+
+    class _GUITHREADINFO(ctypes.Structure):
+        _fields_ = [("cbSize", wt.DWORD),
+                    ("flags", wt.DWORD),
+                    ("hwndActive", wt.HWND),
+                    ("hwndFocus", wt.HWND),
+                    ("hwndCapture", wt.HWND),
+                    ("hwndMenuOwner", wt.HWND),
+                    ("hwndMoveSize", wt.HWND),
+                    ("hwndCaret", wt.HWND),
+                    ("rcCaret", wt.RECT)]
+
+    _GUI_CACHE["cls"] = _GUITHREADINFO
+    _GUI_CACHE["ready"] = True
+    return u32
+
+
+def _vbe_frame_hwnd():
+    """VBE 主窗口句柄（缓存 + 失效重找）；找不到返回 0。纯 Win32。"""
+    u32 = _focus_protos()
+    h = int(_focus_state.get("frame") or 0)
+    if h and u32.IsWindow(h):
+        return h
+    h = 0
+    for cls in VBE_FRAME_CLASSES:
+        try:
+            got = u32.FindWindowW(cls, None)
+        except Exception:
+            got = 0
+        if got:
+            h = int(got)
+            break
+    _focus_state["frame"] = h
+    return h
+
+
+def _focused_hwnd_in_vbe():
+    """VBE 线程里"当前拥有键盘焦点的窗口"；取不到返回 0。"""
+    u32 = _focus_protos()
+    frame = _vbe_frame_hwnd()
+    if not frame:
+        return 0
+    tid = int(u32.GetWindowThreadProcessId(frame, None) or 0)
+    if not tid:
+        return 0
+    import ctypes
+    import ctypes.wintypes as wt
+    gti = _GUI_CACHE["cls"]()
+    gti.cbSize = ctypes.sizeof(gti)
+    if not u32.GetGUIThreadInfo(tid, ctypes.byref(gti)):
+        return 0
+    return int(gti.hwndFocus or 0)
+
+
+def _parent_hwnd(h):
+    """父窗口句柄（取不到 / 没有父窗口返回 0）。单独一层，便于单测打桩。"""
+    try:
+        u32 = _focus_protos()
+        return int(u32.GetParent(h) or 0)
+    except Exception:
+        return 0
+
+
+def vbe_code_pane_focused():
+    """焦点此刻是否落在 VBE 的【代码窗格】上。
+
+    返回：
+      True  —— 焦点窗口的父链上有代码窗格（类名 VbaWindow）；
+      False —— 焦点在 VBE 里，但不在代码窗格（属性窗口 / 工程窗口 / 设计器…）；
+      None  —— 拿不准（VBE 主窗口找不到、API 失败、焦点窗口为空）。
+
+    调用方约定：None 必须退回老判据（前台窗口标题），绝不当成 False 去拦 ——
+    否则在类名不符的宿主上会把工具整个哑掉。
+
+    只读 Win32 查询，不碰 COM；每次约 0.02ms（FindWindow 有缓存）。
+    """
+    try:
+        frame = _vbe_frame_hwnd()
+        if not frame:
+            return None
+        h = _focused_hwnd_in_vbe()
+        if not h:
+            return None
+        for _ in range(12):
+            if not h:
+                break
+            if _window_class_name(h) in CODE_PANE_CLASSES:
+                return True
+            if h == frame:
+                break
+            p = _parent_hwnd(h)
+            if not p or p == h:
+                break
+            h = p
+        return False
+    except Exception:
+        return None
+
+
 def _release_vbe_proxy(collect=False):
     """丢弃缓存的 VBE/Excel COM 代理 —— 这是让 Excel 能真正退出的关键。
 
@@ -1109,10 +1273,15 @@ class VbeBackend:
         _release_vbe_proxy(collect=True)
 
     def snapshot(self):
-        """轻量读取「当前行号 + 行文本」，用于轮询检测内容变化。
+        """轻量读取「模块名 + 当前行号 + 行文本」，用于轮询检测内容变化。
 
         刻意不做列语义探测（那会临时移动光标），因此足够廉价，可高频调用。
-        返回 (line_no, line_text)；不在代码窗/有选区/取不到时返回 None。
+        返回 (line_no, line_text, module_name)；不在代码窗/有选区/取不到时返回 None。
+
+        v64：多带一个【模块名】。主线程靠它区分"用户真在敲字"和"换了个代码
+        窗格/模块"—— 后者会让"同一行 + 文本不同"看起来像一次编辑（Ctrl+Tab
+        切代码窗、点工程树换模块都会），其实一个字都没敲，不该弹候选。
+        模块名取不到就带空串，调用方据此不做否决（绝不让工具整个哑掉）。
         """
         try:
             vbe = _get_vbe_cached()
@@ -1125,7 +1294,11 @@ class VbeBackend:
             if sl != el:      # 多行选择：不参与补全
                 return None
             cm = cp.CodeModule
-            snap = (sl, cm.Lines(sl, 1))
+            try:
+                mod = str(cm.Name or "")
+            except Exception:
+                mod = ""
+            snap = (sl, cm.Lines(sl, 1), mod)
             _com_ok()
             return snap
         except Exception:

@@ -4542,6 +4542,179 @@ def main():
     except Exception as _e40:
         check("第 40 节异常: %s" % _e40, [True], expect_contain=[False])
 
+    # ==================================================================
+    # 41. v64 提示只在【代码窗格】里出现（属性窗口等非代码工作区不弹）
+    # ==================================================================
+    # 用户报：在【属性窗口】里改属性值时，候选窗偶尔会冒出来 —— 那里不是写代码
+    # 的地方，不该有提示（"我不希望在这些非写代码的工作区出来提示"）。
+    #
+    # 根因：判断"在不在 VBE"只看【前台窗口标题】有没有 "Microsoft Visual Basic"；
+    # 而属性窗口 / 工程窗口 / 窗体设计器都是 VBE 主窗口（wndclass_desked_gsk）的
+    # 子窗口，标题判据对它们一律返回 True。
+    #
+    # 修法：vbe_bridge.vbe_code_pane_focused() 看【VBE 线程】里当前拥有键盘焦点
+    # 的窗口，父链上有没有代码窗格（窗口类 VbaWindow）。本节 41.1~41.9 用打桩的
+    # 窗口树验这条判据本身（不依赖真机有没有开 Excel），41.10 起验真实调用与
+    # main.in_vbe_code_area 的接线 / 兜底语义。
+    print("\n=== 41. v64 提示只在代码窗格出现（非代码工作区不弹）===")
+    try:
+        import vbe_bridge as VB41
+
+        check("41.1 窗口类名清单（VBE 主窗口 / 代码窗格）",
+              ["wndclass_desked_gsk" in VB41.VBE_FRAME_CLASSES,
+               "VbaWindow" in VB41.CODE_PANE_CLASSES],
+              expect_contain=[True, True])
+
+        _orig41 = (VB41._vbe_frame_hwnd, VB41._focused_hwnd_in_vbe,
+                   VB41._parent_hwnd, VB41._window_class_name)
+
+        def _stub41(classes, tree, focus=None, frame=100):
+            """把窗口树打桩：classes={hwnd:类名}，tree={hwnd:父hwnd}。"""
+            VB41._vbe_frame_hwnd = lambda: frame
+            VB41._focused_hwnd_in_vbe = (
+                lambda: (focus if focus is not None else 0))
+            VB41._parent_hwnd = lambda h: int(tree.get(h, 0))
+            VB41._window_class_name = lambda h: classes.get(h, "")
+
+        # 41.2 焦点在代码窗格里（含"焦点在代码窗格的子控件上"）-> 允许
+        _stub41(
+            classes={301: "ComboBox", 300: "VbaWindow",
+                     201: "MDIClient", 100: "wndclass_desked_gsk"},
+            tree={301: 300, 300: 201, 201: 100},
+            focus=301)
+        check("41.2 焦点在代码窗格（或其子控件）-> True",
+              [VB41.vbe_code_pane_focused()], expect_contain=[True])
+        _stub41(
+            classes={300: "VbaWindow", 201: "MDIClient",
+                     100: "wndclass_desked_gsk"},
+            tree={300: 201, 201: 100}, focus=300)
+        check("41.3 焦点就是代码窗格本身 -> True",
+              [VB41.vbe_code_pane_focused()], expect_contain=[True])
+
+        # 41.4~41.6 三类"非写代码的工作区"都必须判 False
+        #   属性窗口：真机实测类名 wndclass_pbrs，里面的编辑框/列表是
+        #   Edit / ListBox / ComboBox / SysTabControl32
+        _stub41(
+            classes={401: "ListBox", 400: "wndclass_pbrs",
+                     100: "wndclass_desked_gsk"},
+            tree={401: 400, 400: 100}, focus=401)
+        check("41.4 焦点在属性窗口里 -> False（用户报的场景）",
+              [VB41.vbe_code_pane_focused()], expect_contain=[False])
+        _stub41(
+            classes={501: "SysTreeView32", 500: "PROJECT",
+                     100: "wndclass_desked_gsk"},
+            tree={501: 500, 500: 100}, focus=501)
+        check("41.5 焦点在工程窗口里 -> False",
+              [VB41.vbe_code_pane_focused()], expect_contain=[False])
+        _stub41(
+            classes={601: "ThunderDFrame", 600: "DesignerWindow",
+                     100: "wndclass_desked_gsk"},
+            tree={601: 600, 600: 100}, focus=601)
+        check("41.6 焦点在窗体设计器里 -> False",
+              [VB41.vbe_code_pane_focused()], expect_contain=[False])
+
+        # 41.7~41.9 拿不准时返回 None（调用方据此退回老判据，绝不能"拿不准就拦"）
+        _stub41(classes={}, tree={}, focus=0)
+        check("41.7 拿不到焦点窗口 -> None（不拦）",
+              [VB41.vbe_code_pane_focused()], expect_contain=[None])
+        _stub41(classes={}, tree={}, focus=1, frame=0)
+        check("41.8 找不到 VBE 主窗口 -> None（不拦）",
+              [VB41.vbe_code_pane_focused()], expect_contain=[None])
+        # 链上既没有代码窗格、也走不到 frame（父链异常）-> False，且不能死循环
+        _stub41(classes={i: "Edit" for i in range(700, 720)},
+                tree={i: i + 1 for i in range(700, 719)}, focus=700)
+        check("41.9 父链异常（走不到 frame）-> False 且不死循环",
+              [VB41.vbe_code_pane_focused()], expect_contain=[False])
+
+        for _f, _v in zip(("_vbe_frame_hwnd", "_focused_hwnd_in_vbe",
+                           "_parent_hwnd", "_window_class_name"), _orig41):
+            setattr(VB41, _f, _v)
+
+        try:
+            _real41 = VB41.vbe_code_pane_focused()
+        except Exception as _e41r:
+            _real41 = "异常: %s" % _e41r
+        check("41.10 真实机器上返回 True/False/None 且不抛（此刻=%r）" % (_real41,),
+              [isinstance(_real41, bool) or _real41 is None],
+              expect_contain=[True])
+
+        # 41.11~41.15 main.in_vbe_code_area：接线 + 兜底语义
+        if M is None:
+            check("main 模块不可用（缺 pynput），跳过 41.11~41.15", [True],
+                  expect_contain=[True])
+        else:
+            _orig_area41 = VB41.vbe_code_pane_focused
+            _orig_title41 = M.in_vbe_code_pane
+            try:
+                M.in_vbe_code_pane = lambda: True          # 前台标题像 VBE
+                VB41.vbe_code_pane_focused = lambda: False  # 但焦点不在代码窗格
+                check("41.11 标题像 VBE 但焦点在属性窗口 -> 不认（False）",
+                      [M.in_vbe_code_area()], expect_contain=[False])
+                VB41.vbe_code_pane_focused = lambda: True
+                check("41.12 焦点在代码窗格 -> True",
+                      [M.in_vbe_code_area()], expect_contain=[True])
+                VB41.vbe_code_pane_focused = lambda: None
+                check("41.13 判不出来 -> 退回标题判据（True，保持旧行为）",
+                      [M.in_vbe_code_area()], expect_contain=[True])
+                M.in_vbe_code_pane = lambda: False
+                check("41.14 判不出来且标题也不是 VBE -> False",
+                      [M.in_vbe_code_area()], expect_contain=[False])
+
+                def _boom41():
+                    raise RuntimeError("boom")
+                VB41.vbe_code_pane_focused = _boom41
+                M.in_vbe_code_pane = lambda: True
+                check("41.15 探测抛异常 -> 退回标题判据、不炸",
+                      [M.in_vbe_code_area()], expect_contain=[True])
+
+                # 41.16 接线护栏：三处"会弹窗 / 会写代码"的动作都改用精确判据
+                #   （轮询触发、Shift+Enter 与自动配对、Ctrl+Space）
+                import inspect as _inspect41
+                _src41 = _inspect41.getsource(M)
+                _cnt41 = _src41.count("in_vbe_code_area()")
+                check("41.16 精确判据已接进 4 处动作（实际 %d 处）" % _cnt41,
+                      [_cnt41 >= 4,
+                       "vbe_code_pane_focused" in _src41,
+                       "in_vbe_code_pane()" in _src41,
+                       "_poll_mod_switch" in _src41],
+                      expect_contain=[True, True, True, True])
+
+                # 41.18~41.21 换模块否决（同一个坑的另一半：没敲字也不该弹）
+                #   快照 = (行号, 行文本, 模块名)；模块名拿不到就不否决。
+                check("41.18 同一模块内的文本变化 -> 不否决",
+                      [M._poll_mod_switch((3, "    us", "Sheet1"),
+                                          (3, "    use", "Sheet1"))],
+                      expect_contain=[False])
+                check("41.19 换模块（同行号、文本不同）-> 否决",
+                      [M._poll_mod_switch((3, "    us", "Sheet1"),
+                                          (3, "    End Sub", "Module7"))],
+                      expect_contain=[True])
+                check("41.20 模块名大小写不同 -> 不算换模块",
+                      [M._poll_mod_switch((3, "a", "Sheet1"),
+                                          (3, "ab", "SHEET1"))],
+                      expect_contain=[False])
+                check("41.21 模块名缺失 / 旧式二元组 -> 不否决（不能把工具哑掉）",
+                      [M._poll_mod_switch((3, "a", ""), (3, "ab", "Sheet1")),
+                       M._poll_mod_switch((3, "a", "Sheet1"), (3, "ab", "")),
+                       M._poll_mod_switch((3, "a"), (3, "ab"))],
+                      expect_contain=[False, False, False])
+
+                # 41.17 逃生开关：VBECOMPLETE_NO_CODE_AREA_GATE=1 退回旧判据
+                _saved_gate41 = M.CODE_AREA_GATE
+                try:
+                    M.CODE_AREA_GATE = False
+                    M.in_vbe_code_pane = lambda: True
+                    check("41.17 关掉闸门 -> 退回「前台是 VBE 就算数」（True）",
+                          [M.in_vbe_code_area()], expect_contain=[True])
+                finally:
+                    M.CODE_AREA_GATE = _saved_gate41
+            finally:
+                VB41.vbe_code_pane_focused = _orig_area41
+                M.in_vbe_code_pane = _orig_title41
+
+    except Exception as _e41:
+        check("第 41 节异常: %s" % _e41, [True], expect_contain=[False])
+
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))
     if FAILURES:
