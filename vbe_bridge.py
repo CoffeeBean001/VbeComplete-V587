@@ -64,10 +64,22 @@ IMPLICIT_SCOPE = "proc"
 IMPLICIT_HONOR_OPTION_EXPLICIT = _env_flag(
     "VBECOMPLETE_IMPLICIT_HONOR_EXPLICIT", True)
 
-# VBA 语言自带的名字（内建函数 / 常用内建常量 / 内建数据类型）是否纳入提示。
-# 关闭后回到旧行为：只提示工程代码里出现过的名字（外加组件名、窗体控件名；
-# 关键字另见下面的 ENABLE_VBA_KEYWORDS，同样关掉才是完全旧行为）。
-ENABLE_VBA_BUILTINS = _env_flag("VBECOMPLETE_VBA_BUILTINS", True)
+# VBA 语言自带的名字（内建函数 / 内建数据类型）是否纳入提示。
+#
+# ★v77：**默认关闭**（用户口径）。原话："我觉得提示词太多了……你把提示 vba 本身带的
+# 关键字、函数这块都删掉吧。保留能提示变量名、自定义的函数/过程名、窗体/控件名、
+# 模块名。其他的那些个提示词我也不怎么用到，提示一大堆看起来也不舒服。"
+#
+# 于是默认口径收敛成一句话：**只提示"你这个工程里存在的东西"** ——
+#   变量名（含没写 Option Explicit 时用过的名字）、自定义 Sub/Function/Property、
+#   组件名（模块 / 窗体 / 类模块）、窗体控件名；
+#   VBA 自带的四批（内建函数 + 数据类型、语言关键字、vb* 枚举、宿主 xl*/mso* 枚举）
+#   一律不进候选池。
+#
+# ⚠️ 只改【收集侧开关】，四份清单本身一个字都没裁（见 vba_builtins.py）——
+# 清单保持完整，测试/诊断仍能看到全貌，需要时一行环境变量立刻收回来。
+# 想开回来：`set VBECOMPLETE_VBA_BUILTINS=1`（内建函数与 `Dim x As <类型>` 一起回来）。
+ENABLE_VBA_BUILTINS = _env_flag("VBECOMPLETE_VBA_BUILTINS", False)
 
 # ★v70：VBA 内建的 **枚举常量**（`vbOK` / `vbCrLf` / `vbYes` … 共 102 条）是否纳入提示。
 #
@@ -80,9 +92,12 @@ ENABLE_VBA_CONSTANTS = _env_flag("VBECOMPLETE_VBA_CONSTANTS", False)
 # 语言关键字 / 保留字（Sub / Dim / If / For / Set / And …）是否纳入提示（v62）。
 #
 # 独立成一个开关（而不是并进 ENABLE_VBA_BUILTINS）：关键字与内建函数是两拨
-# 东西 —— 前者是语法骨架、后者是可调用的库成员。实测下来若觉得关键字提示偏吵，
-# 只关这一个即可，内建函数照常提示。
-ENABLE_VBA_KEYWORDS = _env_flag("VBECOMPLETE_VBA_KEYWORDS", True)
+# 东西 —— 前者是语法骨架、后者是可调用的库成员。你想单收一批时用得上。
+#
+# ★v77：**默认关闭**（用户口径："vba 本身带的关键字、函数这块都删掉"）。
+# 想开回来：`set VBECOMPLETE_VBA_KEYWORDS=1`。
+# 与 ENABLE_VBA_BUILTINS 是两个独立开关，所以"只收关键字、不收内建函数"也做得到。
+ENABLE_VBA_KEYWORDS = _env_flag("VBECOMPLETE_VBA_KEYWORDS", False)
 # 内建名字挂靠的"模块名"。
 #
 # 这是一个【虚拟模块】——VBA 运行时库。之所以要给它一个名字而不是留空：
@@ -2076,6 +2091,17 @@ class VbeBackend:
         # ENABLE_VBA_CONSTANTS 裁掉（默认 False；`set VBECOMPLETE_VBA_CONSTANTS=1`
         # 开回来）。注意裁剪放在【收集侧】而不是改清单本身：清单保持完整，
         # 测试与诊断仍能看到全貌，开关一开立刻生效。
+        #
+        # 【v77】连**内建函数与内建数据类型**也默认不收了（ENABLE_VBA_BUILTINS
+        # 默认 False）—— 用户口径："vba 本身带的关键字、函数这块都删掉；保留变量名、
+        # 自定义函数/过程名、窗体/控件名、模块名。" 于是默认口径下候选池里
+        # 只剩"这个工程里真实存在的东西"。
+        #
+        # ⚠️ 连带的**唯一**后果（其余一个字没动）：`Dim x As <这里>` 的候选里不再
+        # 出现 Long / String / Integer 这类内建类型名 —— 因为 `As` 位置的候选是
+        # "先出候选、再按 type_names 过滤"，不在池子里就永远显示不出来。
+        # 那一位置现在只剩你自己的类型：窗体 / 类模块 / 模块名 + Type / Enum 名。
+        # 想要回内建类型（含 MsgBox 那批函数）：`set VBECOMPLETE_VBA_BUILTINS=1`。
         if ENABLE_VBA_BUILTINS:
             _bn_src = vba_builtins.BUILTIN_FUNCTIONS
             if ENABLE_VBA_CONSTANTS:
@@ -2115,6 +2141,10 @@ class VbeBackend:
         # 唯一区别是开关独立（ENABLE_VBA_KEYWORDS）：关掉关键字不影响内建函数。
         # 关键字同样进 builtin_names —— 它们是语言自带的公共词汇（数量大、什么字母
         # 组合都凑得出子序列），要跟内建函数一样收紧模糊匹配，见 engine.trigger。
+        #
+        # 【v77】**默认关闭**（用户口径："vba 本身带的关键字也删掉"）—— 于是默认
+        # 口径下打 `su` 不会冒出 `Sub`、打 `if` 不会冒出 `If`，候选池里只剩你这个
+        # 工程里真实存在的名字。想开回来：`set VBECOMPLETE_VBA_KEYWORDS=1`。
         if ENABLE_VBA_KEYWORDS:
             for _kn in vba_builtins.BUILTIN_KEYWORDS:
                 _kl = _kn.lower()
@@ -2174,6 +2204,8 @@ class VbeBackend:
 
         三类：组件名（模块 / 窗体 / 类 / 文档模块名）+ 窗体控件名 + VBA 语言自带
         的名字（内建函数 / 内建常量 / 内建数据类型 / 关键字）。
+        ⚠️ v77：第三类默认是空的（那几个开关都默认关）⇒ 默认口径下只有
+        **组件名 + 窗体控件名**。这一路证据本身一个字没删，开关打开就回来。
 
         与 get_declared_names 的区别：后者是"代码文本里真声明过什么"，前者是
         "本来就有、与代码文本无关"。用户刚拖上去的 Label1、一行代码都没有的新

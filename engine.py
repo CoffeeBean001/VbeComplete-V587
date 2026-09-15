@@ -1340,6 +1340,12 @@ class Completer:
         #
         # 这条只作用于【内建公共词汇】；你自己工程里的名字一直不受限
         # （getse3 -> getSettingTitle3 照旧）。
+        #
+        # ⚠️ v77：内建函数/数据类型/关键字/枚举四批**默认全部不收**（只剩工程内名字
+        # 与组件名、控件名）⇒ `_builtin_names()` 默认是空集，**这一整段默认不会
+        # 生效**（对任何名字都不收紧）。规则本身留着、不许退化：把
+        # `set VBECOMPLETE_VBA_BUILTINS=1` 或 `_VBA_KEYWORDS=1` 打开后它立刻恢复
+        # 作用（第 48 节那批"公共词汇收紧"断言钉的就是它）。
         if len(word) < 4:
             _bl = self._builtin_names()
             if _bl:

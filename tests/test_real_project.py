@@ -5712,6 +5712,11 @@ def main():
     #
     # 这一节守【默认口径 + 开关真的在起作用】：每条"关着没有"都配一条
     # "打开就有"的反向对照 —— 否则"碰巧没有"（比如桩 VBE 解析失败）也能蒙过去。
+    #
+    # ⚠️ v77：用户接着说"vba 本身带的关键字、函数这块也都删掉"，于是
+    # ENABLE_VBA_BUILTINS / ENABLE_VBA_KEYWORDS 也改成默认 False（本节 47.2 跟着
+    # 改成"四批全关"）。**下面 47.5~47.11 先把这两个开关临时打开再断言** ——
+    # 那一半验的是"机制仍在、开关真有效"，与默认值无关；默认口径由第 54 节专门守。
     # ==================================================================
     print("\n=== 47. 内置枚举默认不提示（v70）===")
     try:
@@ -5757,13 +5762,13 @@ def main():
             _spec47.loader.exec_module(_fresh47)
         except Exception:
             _fresh47 = None
-        check("47.2 ★出厂默认：内建函数/关键字开，内置枚举常量（vb*）与"
-              "宿主枚举（xl*/mso*）关",
+        check("47.2 ★出厂默认（v77）：内建函数/数据类型、关键字、内置枚举、"
+              "宿主枚举 —— 四批一律【关】",
               [((_fresh47.ENABLE_VBA_BUILTINS,
                  _fresh47.ENABLE_VBA_KEYWORDS,
                  _fresh47.ENABLE_VBA_CONSTANTS,
                  _fresh47.ENABLE_HOST_ENUMS) if _fresh47 else "干净模块加载失败")],
-              expect_contain=[(True, True, False, False)])
+              expect_contain=[(False, False, False, False)])
 
         # ---- 47.3 清单拆成两组（清单本身不裁剪）----
         _inter47 = set(VB47B.BUILTIN_FUNCTIONS) & set(VB47B.BUILTIN_CONSTANTS)
@@ -7117,6 +7122,293 @@ def main():
               expect_contain=[True, True, True])
     except Exception as _e53:
         check("第 53 节异常: %s" % _e53, [True], expect_contain=[False])
+
+    # ==================================================================
+    # 54. v77：默认只提示「这个工程里真实存在的东西」
+    #
+    # 用户口径（原话）："我觉得提示词太多了……你把提示 vba 本身带的关键字、函数这块
+    # 都删掉吧。保留能提示变量名，自定义的函数/过程名，窗体/控件名，模块名。
+    # 其他的那些个提示词，我也不怎么用到，提示一大堆看起来也不舒服。"
+    #
+    # ⇒ 四个开关**全部默认 False**（vbe_bridge.ENABLE_VBA_BUILTINS /
+    #   ENABLE_VBA_KEYWORDS / ENABLE_VBA_CONSTANTS / ENABLE_HOST_ENUMS）。
+    #   默认口径下候选池 = 变量名 + 自定义 Sub/Function/Property + 组件名（模块 /
+    #   窗体 / 类模块）+ 窗体控件名，一条语言自带的名字都没有。
+    #
+    # 本节守三件事：
+    #   1) 默认池子里**一条**语言自带的名字都没有，而工程内那四种名字一个不少；
+    #   2) ★反向对照：把开关打开，那些名字立刻回来 —— 证明"没有"是开关造成的，
+    #      不是桩后端/解析碰巧失效（否则"碰巧没有"也能蒙过去）；再验一次
+    #      "开关逐批独立"（只开关键字不开内建函数也做得到）；
+    #   3) ★四份清单**一个字都没裁**，三个收集门也都还在 —— 否则"更安静"会悄悄
+    #      变成"能力删除"，以后想开回来也开不回来（用户的原话是"不要改坏了"）。
+    #
+    # ⚠️ 唯一有意的连带后果：`Dim x As <这里>` 不再补内建类型名（Long / String …），
+    #    因为那个位置的候选是"先出候选、再按 type_names 过滤"——不在池子里就永远
+    #    显示不出来。54.5 把它钉成【预期行为】，免得以后被当成 bug 反复"修"。
+    # ==================================================================
+    print("\n=== 54. v77：默认只提示工程内名字（语言自带的四批全关）===")
+    try:
+        import vbe_bridge as VB54R
+        import vba_builtins as VB54B
+        import engine as E54
+
+        class _CM54R(object):
+            def __init__(self, text):
+                self.text = text
+
+            @property
+            def CountOfLines(self):
+                return self.text.count("\n") + 1
+
+            def Lines(self, start, count):
+                return "\r\n".join(
+                    self.text.split("\n")[start - 1:start - 1 + count])
+
+        class _Ctl54R(object):
+            def __init__(self, name):
+                self.Name = name
+
+        class _Ctls54R(object):
+            def __init__(self, names):
+                self._items = [_Ctl54R(n) for n in names]
+                self.Count = len(self._items)
+
+            def Item(self, i):
+                return self._items[i]
+
+        class _Designer54R(object):
+            def __init__(self, ctl_names):
+                self.Controls = _Ctls54R(ctl_names)
+
+        class _Comp54R(object):
+            def __init__(self, name, text, ctype, ctls=()):
+                self.Name = name
+                self.Type = ctype
+                self.CodeModule = _CM54R(text)
+                self.Designer = _Designer54R(list(ctls))
+
+        class _Proj54R(object):
+            def __init__(self, comps):
+                self.Name = "VBAProject"
+                self.VBComponents = list(comps)
+
+        class _Pane54R(object):
+            def __init__(self, comp):
+                self._c = comp
+                self.sel = (1, 1, 1, 1)
+
+            @property
+            def CodeModule(self):
+                return self._c.CodeModule
+
+            def GetSelection(self):
+                return self.sel
+
+        class _VBE54R(object):
+            def __init__(self, comps, act):
+                self.ActiveVBProject = _Proj54R(comps)
+                self.ActiveCodePane = _Pane54R(act)
+
+        # 最小工程：模块里【一个字都没提过】MsgBox / If / Dim / Long
+        _m54 = _Comp54R(
+            "Module1",
+            "Sub Foo()\n    declaredVar = 1\n    looseVar = 2\nEnd Sub",
+            VB54R.VBE_CT_STDMODULE)
+        _f54 = _Comp54R("UserForm1", "", VB54R.VBE_CT_MSFORM,
+                        ctls=["Label1", "cmdOK"])
+        # 光标停在窗体上 -> 控件名（只存在于设计器里）才会被收进来
+        _vbe54 = _VBE54R([_m54, _f54], _f54)
+
+        _orig54 = VB54R._get_vbe_cached
+        VB54R._get_vbe_cached = lambda: _vbe54
+        _saved54 = (VB54R.ENABLE_VBA_BUILTINS, VB54R.ENABLE_VBA_KEYWORDS,
+                    VB54R.ENABLE_VBA_CONSTANTS, VB54R.ENABLE_HOST_ENUMS)
+
+        def _set54(b, k, c, h):
+            (VB54R.ENABLE_VBA_BUILTINS, VB54R.ENABLE_VBA_KEYWORDS,
+             VB54R.ENABLE_VBA_CONSTANTS, VB54R.ENABLE_HOST_ENUMS) = (b, k, c, h)
+
+        def _pool54():
+            """按【此刻的开关】重收一遍（开关是模块级常量，收集时实时读）。
+
+            每次新建一个后端实例：标识符缓存是实例级 + 2 秒 TTL，复用实例会拿到
+            上一轮的旧池子。"""
+            _bk = VB54R.VbeBackend()
+            return _bk, set(str(r[0]).lower() for r in _bk.get_identifiers())
+
+        class _EngineBackend54(object):
+            """把真后端的池子接到引擎上（引擎要的接口一套给全）。"""
+
+            def __init__(self, bk, module="Module1", word="ms"):
+                self._bk = bk
+                self._mod = module
+                self._word = word
+
+            def get_context(self):
+                _ln = "    " + self._word
+                return {"line_no": 1, "line_text": _ln,
+                        "caret_col": len(_ln) + 1, "in_string": False,
+                        "in_comment": False, "in_type_position": False,
+                        "in_decl_position": False, "decl_names": [],
+                        "proc_name": None, "module_name": self._mod}
+
+            def get_identifiers(self):
+                return self._bk.get_identifiers()
+
+            def get_declared_names(self):
+                return sorted(self._bk.get_declared_names())
+
+            def declared_elsewhere(self, name, module_name):
+                return bool(self._bk.declared_elsewhere(name, module_name))
+
+            def get_structural_names(self):
+                return self._bk.get_structural_names()
+
+            def get_builtin_names(self):
+                return self._bk.get_builtin_names()
+
+            def get_type_names(self):
+                return list(self._bk.get_type_names())
+
+            def get_host_enum_names(self):
+                return self._bk.get_host_enum_names()
+
+            def names_outside_caret(self, caret, scope_only=False):
+                # 现场文本证据：桩里就等于"池子里的【工程内】名字"。
+                # 内建那批不在现场文本里 —— 真机上它们也正是靠 structural_names
+                # 那一路放行的（回声防护的设计，这里如实模拟，别把两路混成一路）。
+                return set(
+                    str(n).lower() for n, _m, _p, _pv in self._bk.get_identifiers()
+                    if str(_m) not in (VB54R._BUILTIN_MODULE,
+                                       VB54R._HOST_ENUM_MODULE))
+
+            def apply_completion(self, *a, **k):
+                return None
+
+            # 让位/避让一律"探不到"（本机不一定在跑 Excel，保持确定性）
+            def vbe_yield_visible(self):
+                return False
+
+            def vbe_popup_visible(self):
+                return False
+
+            def vbe_popup_info(self):
+                return []
+
+        class _UI54(object):
+            def __init__(self):
+                self.shown = False
+
+            def show(self, rows, sel, c):
+                self.shown = True
+
+            def hide(self):
+                self.shown = False
+
+            def update_selection(self, sel):
+                pass
+
+            def contains_point(self, x, y):
+                return False
+
+        def _trig54(word="ms"):
+            _c = E54.Completer(_EngineBackend54(VB54R.VbeBackend(),
+                                                word=word), _UI54())
+            _c.trigger(True)
+            return sorted(_c.matches or [])
+
+        try:
+            # ---- 54.1 ★默认口径：语言自带的名字一条都不进池 ----
+            _set54(False, False, False, False)
+            _bk54, _nm54 = _pool54()
+            # 语言自带的四批，各取一个代表（函数 / 关键字 / vb 枚举 / 内建类型）。
+            # 宿主枚举（xl*/mso*）不放进来：打开它要真去加载 Excel 类型库，
+            # 这一节刻意与 Excel 无关（它的开关由 47.4 单独守）。
+            _lang54 = ["msgbox", "left", "split", "dim", "sub", "function",
+                       "long", "string", "vbcrlf", "vbyes"]
+            # 工程内该有的四种名字（变量 / 自定义过程 / 模块名 / 窗体名 + 控件名）
+            _mine54 = ["declaredvar", "loosevar", "foo", "module1",
+                       "userform1", "label1", "cmdok"]
+            check("54.1 ★默认口径：语言自带的 %d 个代表名一条都没有（漏进来：%s）"
+                  % (len(_lang54), sorted(set(_lang54) & _nm54)),
+                  [sorted(set(_lang54) & _nm54),
+                   sorted(n for n in _mine54 if n not in _nm54),
+                   dict(_bk54.get_host_enum_names()),
+                   sorted(_bk54.get_builtin_names())],
+                  expect_contain=[[], [], {}, []])
+
+            # ---- 54.2 ★反向对照：打开开关 -> 那些名字立刻回来 ----
+            _set54(True, True, True, False)
+            _bk54on, _nm54on = _pool54()
+            check("54.2 ★反向对照：开关打开后 10 个代表名全回来（证明是开关在起作用）；"
+                  "宿主枚举那一批仍不越界",
+                  [sorted(n for n in _lang54 if n not in _nm54on),
+                   "xlup" not in _nm54on],
+                  expect_contain=[[], True])
+
+            # ---- 54.3 开关逐批独立：只开关键字，内建函数照旧不收 ----
+            _set54(False, True, False, False)
+            _bk54k, _nm54k = _pool54()
+            check("54.3 开关逐批独立：只开关键字 -> Sub/If 回来，MsgBox/Long 仍不在",
+                  ["sub" in _nm54k, "if" in _nm54k,
+                   "msgbox" not in _nm54k, "long" not in _nm54k,
+                   "vbcrlf" not in _nm54k],
+                  expect_contain=[True, True, True, True, True])
+
+            # ---- 54.4 ★四份清单没被裁 + 收集门都在（只关开关，不删能力）----
+            _src54 = open(os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "vbe_bridge.py"), encoding="utf-8").read()
+            check("54.4 ★四份清单一个字没裁（函数 %d / 常量 %d / 类型 %d / 关键字 %d）"
+                  "+ 三个收集门都在 + 默认值就是 False"
+                  % (len(VB54B.BUILTIN_FUNCTIONS), len(VB54B.BUILTIN_CONSTANTS),
+                     len(VB54B.BUILTIN_TYPE_NAMES), len(VB54B.BUILTIN_KEYWORDS)),
+                  [len(VB54B.BUILTIN_FUNCTIONS) >= 150,
+                   len(VB54B.BUILTIN_CONSTANTS) >= 100,
+                   len(VB54B.BUILTIN_TYPE_NAMES) >= 5,
+                   len(VB54B.BUILTIN_KEYWORDS) >= 30,
+                   "MsgBox" in VB54B.BUILTIN_FUNCTIONS,
+                   "Long" in VB54B.BUILTIN_TYPE_NAMES,
+                   "Sub" in VB54B.BUILTIN_KEYWORDS,
+                   _src54.count("if ENABLE_VBA_BUILTINS:") >= 1,
+                   _src54.count("if ENABLE_VBA_KEYWORDS:") >= 1,
+                   _src54.count("if ENABLE_VBA_CONSTANTS:") >= 1,
+                   _src54.count("if ENABLE_HOST_ENUMS:") >= 1,
+                   '_env_flag("VBECOMPLETE_VBA_BUILTINS", False)' in _src54,
+                   '_env_flag("VBECOMPLETE_VBA_KEYWORDS", False)' in _src54],
+                  expect_contain=[True] * 13)
+
+            # ---- 54.5 As 位置的连带后果（钉成预期行为，别再当 bug 修）----
+            _tn54_off = set(str(t).lower() for t in _bk54.get_type_names())
+            _tn54_on = set(str(t).lower() for t in _bk54on.get_type_names())
+            check("54.5 `Dim x As |`：内建类型默认不在，你自己的类型一直在；"
+                  "开关打开就回来",
+                  ["long" not in _tn54_off, "string" not in _tn54_off,
+                   "userform1" in _tn54_off,
+                   "long" in _tn54_on and "string" in _tn54_on,
+                   "userform1" in _tn54_on],
+                  expect_contain=[True] * 5)
+
+            # ---- 54.6 ★端到端：默认打 ms 一个候选都不出 ----
+            _set54(False, False, False, False)
+            _off54 = _trig54("ms")
+            _set54(True, True, False, False)
+            _on54 = _trig54("ms")
+            check("54.6 ★端到端：默认打 ms 零候选；打开内建 -> MsgBox（第 1 个）",
+                  [len(_off54), _on54[:1]],
+                  expect_contain=[0, ["MsgBox"]])
+
+            # 默认口径下"工程内名字"照旧能补（别把保留项一起关没了）
+            _set54(False, False, False, False)
+            _proj54 = _trig54("decl")
+            check("54.7 默认口径下工程内名字照旧（decl -> declaredVar）",
+                  ["declaredVar" in _proj54], expect_contain=[True])
+        finally:
+            _set54(*_saved54)
+            VB54R._get_vbe_cached = _orig54
+    except Exception as _e54:
+        check("第 54 节异常: %s" % _e54, [True], expect_contain=[False])
 
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))
