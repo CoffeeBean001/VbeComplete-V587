@@ -41,6 +41,27 @@ try:
 except Exception:
     YIELD_TO_VBE_LIST = True
 
+# v73：让位的【宽限期】（秒）—— 见 Completer.trigger 里让位那段。
+#
+# 让位原来的假设是"我们让开，VBE 的成员列表就会顶上"。这个假设在 With 块里
+# **不成立**：VBE 的自动列出成员要先把 `With` 的对象类型解析出来，解析不了
+# （`With Range("a1:10")` 这种地址写错、或模块里有待编译的错误）就一个窗都不弹。
+# 那时"让位"= 什么都不给 —— 用户看到的现象正是"在 With 块里输入 .Size 什么都
+# 不弹了"。
+#
+# 所以让位改成【待定】：先让，宽限期内 VBE 的列表真出现就认；没出现就由
+# main.py 的轮询把候选窗补回来（见 Completer.confirm_yield）。这样两种情形
+# 都对：VBE 弹 -> 我们让；VBE 不弹 -> 我们自己上。
+#
+# 调大 = 更愿意等 VBE（VBE 慢的机器上有用）；调小 = 更快补上自己的候选。
+#   set VBECOMPLETE_YIELD_GRACE=0.6
+try:
+    YIELD_GRACE = float(os.environ.get("VBECOMPLETE_YIELD_GRACE", "").strip())
+except Exception:
+    YIELD_GRACE = 0.25
+if not (0.0 < YIELD_GRACE < 5.0):
+    YIELD_GRACE = 0.25
+
 # 标识符（含中文）：首字符为字母/下划线，其后可跟字母/数字/下划线。
 # [^\W\d] = 非“非单词字符”且非数字 = 字母或下划线（Unicode 感知，含中文）。
 _IDENT = re.compile(r"[^\W\d]\w*$")
@@ -648,6 +669,15 @@ class Completer:
         self.view_top = 0
         # 结构性名字的本次触发缓存（v67）。见 _structural_names 的说明。
         self._struct_cache = None
+        # ---- v73：待定让位 ----
+        # yield_pending = (到期时刻, 位置签名) —— 我们刚在"VBE 会弹成员列表"的
+        #   位置让了位，正等 VBE 的列表自己出现。到期由 main.py 的轮询调
+        #   confirm_yield() 裁决。
+        # yield_given_up = 位置签名 —— 已经确认过"这个位置 VBE 根本不会弹"，
+        #   于是不再让位（免得"让开-补上-再让开-再补上"来回抖）。
+        # 位置签名取 (模块名, 行号)：同一行内只判定一次，换行自动失效。
+        self.yield_pending = None
+        self.yield_given_up = None
 
     def _clamp_top(self):
         """把窗口起点夹到合法区间（不能越过列表末尾）。"""
@@ -1017,6 +1047,38 @@ class Completer:
                 return False
         return False
 
+    def confirm_yield(self, member_list_visible):
+        """宽限期到：这次让位到底算不算数？（v73）
+
+        由 main.py 的轮询在 YIELD_GRACE 到期后调用。只读、不碰 UI；VBE 成员
+        列表的可见性由调用方探好后传进来（这样本方法保持纯逻辑，可单测）。
+
+        返回 True  = 让位成立 —— VBE 的列表出现了，或用户已经离开那一处；
+        返回 False = VBE 没弹 —— 调用方应紧接着 trigger(False) 把候选补回来。
+        """
+        pend = self.yield_pending
+        if not pend:
+            return True
+        self.yield_pending = None
+        if member_list_visible:
+            return True
+        # VBE 没弹。只有"光标还停在同一处让位位置"时才值得补 —— 用户要是已经
+        # 走开了（换行、改到别的词上），补出来的窗只是打扰。
+        ctx = None
+        try:
+            ctx = self.backend.get_context()
+        except Exception:
+            ctx = None
+        if not ctx:
+            return True
+        if (ctx.get("module_name"), ctx.get("line_no")) != pend[1]:
+            return True
+        if not vbe_list_expected(ctx.get("line_text"), ctx.get("caret_col")):
+            return True
+        # 记下来：这一处 VBE 不会弹 -> 本次输入期间不再让位
+        self.yield_given_up = pend[1]
+        return False
+
     def _vbe_popup_desc(self):
         """VBE 提示窗的明细，仅用于日志（后端没提供该接口时返回 None）。"""
         hook = getattr(self.backend, "vbe_popup_info", None)
@@ -1063,9 +1125,29 @@ class Completer:
         if require_ident_before_caret and YIELD_TO_VBE_LIST \
                 and vbe_list_expected(ctx.get("line_text"),
                                       ctx.get("caret_col")):
-            _log("trigger: VBE 自带列表位置 -> 让位")
-            self.hide()
-            return
+            # v73：从"一让到底"改成【待定让位】。
+            #
+            # 原来我们让开就假定"VBE 的成员列表会顶上"。可在 With 块里 VBE
+            # 常常一个窗都不弹 —— 它的自动列出成员要先把 `With` 的对象类型解析
+            # 出来，解析不了（`With Range("a1:10")` 这种地址写错、模块里有待
+            # 编译的错误）就什么都不弹。那时让位 = 什么都不给，用户看到的就是
+            # "在 With 块里输入 .Size 什么都不弹了"。
+            #
+            # 现在：先让，再由 main.py 的轮询在 YIELD_GRACE 之后调
+            # confirm_yield() 裁决 —— VBE 的列表真出现就认这个让位；没出现就
+            # 把候选窗补回来。两种情形都对。
+            _ysig = (ctx.get("module_name"), ctx.get("line_no"))
+            if _ysig == self.yield_given_up:
+                # 这个位置刚让过、VBE 并没弹 -> 别再让，照常出我们自己的候选
+                _log("trigger: 此处已放弃让位（VBE 没弹）-> 照常出候选")
+                self.yield_pending = None
+            else:
+                _log("trigger: VBE 自带列表位置 -> 待定让位(%dms)"
+                     % int(YIELD_GRACE * 1000))
+                self.hide()
+                # 每次让位都续期：用户还在打这一处，就别急着替他补
+                self.yield_pending = (time.time() + YIELD_GRACE, _ysig)
+                return
         # v63：VBE 自己弹着的东西【真的显示在屏幕上】时也让位。v65 收窄了范围。
         #
         # 上面那条走的是"语法位置"猜测，只覆盖成员访问（`标识符.`）与类型位置

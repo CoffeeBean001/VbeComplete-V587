@@ -6213,6 +6213,183 @@ def main():
     except Exception as _e49:
         check("第 49 节异常: %s" % _e49, [True], expect_contain=[False])
 
+    # ==================================================================
+    # 50. v73：让位的【宽限确认】—— VBE 不弹时自己补上
+    #
+    # 用户报（v72 之后）：在 With 块里输入 .Size **什么都不弹了**。
+    #
+    # 根因不是"我们把 VBE 的窗关掉了"（让位路径只有 ui.hide()，碰不到 VBE），
+    # 而是【让位这个设计本身的假设不成立】：我们让开，是假定"VBE 的成员列表
+    # 一定会顶上"。可 VBE 的自动列出成员要先把 `With` 的对象类型解析出来 ——
+    # 解析不了（`With Range("a1:10")` 这种地址写错、模块里有待编译的错误）它
+    # 一个窗都不弹。那时让位 = 什么都不给。
+    #
+    # v73 把让位改成【待定】：先让，YIELD_GRACE 之后由 main.py 的轮询调
+    # Completer.confirm_yield() 裁决 —— VBE 的列表真出现就认；没出现就把候选
+    # 补回来（trigger(False)）。同一处只判定一次（yield_given_up），避免
+    # "让开-补上-再让开-再补上"来回抖。
+    # ==================================================================
+    print("\n=== 50. v73：让位宽限确认（VBE 没弹就自己补） ===")
+    try:
+        import vba_builtins as VB50
+
+        _POOL50 = [(n, "VBA", None, False) for n in VB50.BUILTIN_FUNCTIONS]
+        _bl50 = set(r[0].lower() for r in _POOL50)
+
+        class _B50(object):
+            def __init__(self, line_text, caret_col, line_no=1,
+                         module="模块1"):
+                self._lt = line_text
+                self._cc = caret_col
+                self._ln = line_no
+                self._mod = module
+
+            def move(self, line_text, caret_col, line_no=None, module=None):
+                self._lt = line_text
+                self._cc = caret_col
+                if line_no is not None:
+                    self._ln = line_no
+                if module is not None:
+                    self._mod = module
+
+            def get_context(self):
+                return {"line_no": self._ln, "line_text": self._lt,
+                        "caret_col": self._cc, "in_string": False,
+                        "in_comment": False, "in_type_position": False,
+                        "in_decl_position": False, "decl_names": [],
+                        "proc_name": None, "module_name": self._mod}
+
+            def get_identifiers(self):
+                return list(_POOL50)
+
+            def get_declared_names(self):
+                return []
+
+            def declared_elsewhere(self, name, module_name):
+                return False
+
+            def get_structural_names(self):
+                return []
+
+            def get_builtin_names(self):
+                return set(_bl50)
+
+            def get_type_names(self):
+                return []
+
+            def get_host_enum_names(self):
+                return {}
+
+            def names_outside_caret(self, caret, scope_only=False):
+                return set()
+
+            def apply_completion(self, *a, **k):
+                return None
+
+        class _UI50(object):
+            def __init__(self):
+                self.hides = 0
+
+            def show(self, rows, sel, c):
+                pass
+
+            def hide(self):
+                self.hides += 1
+
+            def update_selection(self, sel):
+                pass
+
+            def contains_point(self, x, y):
+                return False
+
+        _line50 = "    .Si"
+        _b50 = _B50(_line50, len(_line50) + 1)
+        _ui50 = _UI50()
+        _c50 = E.Completer(_b50, _ui50)
+
+        _c50.trigger(True)
+        check("50.1 ★让位后挂上待定（还没裁决），候选不弹",
+              [_c50.yield_pending is not None,
+               len(_c50.matches or []) == 0],
+              expect_contain=[True, True])
+
+        check("50.2 VBE 成员列表出现了 -> confirm_yield 认这个让位（True）",
+              [_c50.confirm_yield(True), _c50.yield_pending is None],
+              expect_contain=[True, True])
+
+        _c50.trigger(True)
+        check("50.3 ★VBE 没弹 -> confirm_yield 判 False（该补候选了）",
+              [_c50.confirm_yield(False)], expect_contain=[False])
+
+        _c50.trigger(False)
+        check("50.4 ★补上后候选照出（%d 条）—— 这就是「With 块里什么都不弹」的修复"
+              % len(_c50.matches or []),
+              [len(_c50.matches or []) > 0], expect_contain=[True])
+
+        _ui50.hides = 0
+        _c50.trigger(True)
+        check("50.5 ★同一处再自动触发 -> 不再让位（候选留着、一次都不 hide）"
+              "—— 防「让-补-让-补」抖动",
+              [len(_c50.matches or []) > 0, _ui50.hides == 0],
+              expect_contain=[True, True])
+
+        _b50.move("    .Bo", 8, line_no=7)
+        _c50.trigger(True)
+        check("50.6 换到另一行 -> 重新让位（「这一处 VBE 不弹」的记忆不跨行）",
+              [len(_c50.matches or []) == 0,
+               _c50.yield_pending is not None],
+              expect_contain=[True, True])
+
+        _b50.move("    Msg", 8, line_no=8)
+        check("50.7 宽限期内用户已走开 -> confirm_yield 判 True（不补，别打扰）",
+              [_c50.confirm_yield(False)], expect_contain=[True])
+
+        _c50b = E.Completer(_B50("    Msg", 8), _UI50())
+        check("50.8 没有待定让位时 confirm_yield 一律 True（幂等，不凭空补）",
+              [_c50b.confirm_yield(True), _c50b.confirm_yield(False)],
+              expect_contain=[True, True])
+
+        _c50c = E.Completer(_B50("    .Si", 8), _UI50())
+        _c50c.trigger(False)
+        check("50.9 手动 Ctrl+Space -> 不挂待定（让位只拦自动路径）",
+              [_c50c.yield_pending is None,
+               len(_c50c.matches or []) > 0],
+              expect_contain=[True, True])
+
+        _c50d = E.Completer(_B50("    .Si", 8), _UI50())
+        _c50d.trigger(True)
+        _c50d.backend.get_context = lambda: None
+        check("50.10 拿不到 ctx（COM 暂时不可用）-> 不补（保持让位，不乱弹）",
+              [_c50d.confirm_yield(False)], expect_contain=[True])
+
+        check("50.11 YIELD_GRACE 默认 0.25 秒且在合理区间",
+              [0.0 < E.YIELD_GRACE < 5.0], expect_contain=[True])
+
+        _root50 = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+        def _read50(name):
+            try:
+                return open(os.path.join(_root50, name),
+                            encoding="utf-8").read()
+            except Exception:
+                return ""
+
+        _src50 = _read50("engine.py")
+        check("50.12 VBECOMPLETE_YIELD_GRACE 可调（开关 / 宽限期 / 裁决都在引擎里）",
+              ["VBECOMPLETE_YIELD_GRACE" in _src50,
+               "YIELD_GRACE" in _src50,
+               "confirm_yield" in _src50],
+              expect_contain=[True, True, True])
+
+        _msrc50 = _read50("main.py")
+        check("50.13 接线护栏：poll 调 confirm_yield，判 False 时 trigger(False) 补上",
+              ["confirm_yield" in _msrc50,
+               "yield_pending" in _msrc50,
+               "completer.trigger(False)" in _msrc50],
+              expect_contain=[True, True, True])
+    except Exception as _e50:
+        check("第 50 节异常: %s" % _e50, [True], expect_contain=[False])
+
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))
     if FAILURES:

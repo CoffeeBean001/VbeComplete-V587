@@ -1058,6 +1058,33 @@ def main():
                             post(popup.reposition)
                 except Exception:
                     pass
+            # v73：待定让位的【宽限确认】。
+            #
+            # 我们刚在"VBE 会弹成员列表"的位置让了位（`标识符.`、`As`/`New`
+            # 之后、With 块的 `.成员`），现在看 VBE 到底弹没弹：
+            #   * 弹了 -> 认这个让位，什么都不做；
+            #   * 没弹 -> 把候选窗补回来。
+            # 为什么必须有这一步：VBE 的自动列出成员要先解析出对象的类型，
+            # With 块里解析不了（地址写错、模块有待编译错误）它一个窗都不弹 ——
+            # 那时"让位"就等于"什么都不给"，正是用户报的"在 With 块里输入
+            # .Size 什么都不弹了"。
+            #
+            # 只探测 Win32 窗口可见性（只读），且只在宽限到期那一刻探一次。
+            try:
+                _yp = completer.yield_pending
+                if _yp and time.time() >= _yp[0]:
+                    _ml = any(c in vbe_bridge.VBE_YIELD_CLASSES
+                              for (c, _l, _t, _r, _b)
+                              in vbe_bridge.vbe_popup_rects())
+                    if completer.confirm_yield(_ml):
+                        _log("poll: 让位宽限到 -> VBE 列表在（或已离开该处），保持让位")
+                    else:
+                        _log("poll: 让位宽限到 -> VBE 没弹成员列表，自己补上候选")
+                        # 这次窗是我们自己补的，VBE 的列表一冒出来照样该让位
+                        state["popup_manual"] = False
+                        post(lambda: completer.trigger(False))
+            except Exception:
+                pass
             snap = backend.snapshot() if _com_allowed() else None
             # 诊断心跳（只在 VBECOMPLETE_LOG=1 时产生，约每 3 秒一行）。
             # 排查"某处输入什么都不弹"时，它一眼分清是【没读到快照】（COM 读到
