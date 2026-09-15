@@ -562,6 +562,8 @@ def main():
 
     def _run_trigger():
         state["trigger_queued"] = False
+        # v72：轮询（自动）路径弹出来的候选窗 —— VBE 的成员列表一冒出来就该让位
+        state["popup_manual"] = False
         completer.trigger(True)
 
     def post_trigger():
@@ -774,6 +776,10 @@ def main():
                 # 让位，手动唤出永远有效。
                 # v64：但焦点得真在代码窗格上（属性窗口里按 Ctrl+Space 不弹）。
                 if in_vbe_code_area():
+                    # v72：手动唤出的是用户点名要的列表，不该被下面那条
+                    # "VBE 成员列表出现就让位"的兜底收掉 —— 否则就成了
+                    # "按了 Ctrl+Space 却没反应"（比被遮住更让人以为工具坏了）。
+                    state["popup_manual"] = True
                     post(completer.trigger)
             elif state["ctrl"] and not state["alt"] and _is_vk_char(key, "j"):
                 # Ctrl+J / Ctrl+Shift+J = VBE 唤出它自己的「列出属性/方法」。
@@ -1031,10 +1037,25 @@ def main():
                     _sig = tuple(vbe_bridge.vbe_popup_rects())
                     if _sig != state.get("_popup_sig"):
                         state["_popup_sig"] = _sig
-                        _log("poll: 提示窗矩形变化 %r -> 重摆候选窗" % (_sig,))
-                        # 注意调的是 UI（popup）而不是 completer：重摆是画布的
-                        # 事，引擎那层没有这个方法。
-                        post(popup.reposition)
+                        # v72 兜底：冒出来的是 VBE 的【成员列表】时，要做的不是
+                        # "挪开"而是"整个让位" —— 它和我们同质（也是一份候选
+                        # 列表，也吃 Tab / ↑ / ↓ / Enter），叠在一起既遮挡又抢
+                        # 键盘。语法判据（engine.vbe_list_expected）已经在 VBE
+                        # 弹窗之前拦住了 `对象.` / `As` / `New` / With 块的
+                        # `.成员`；这里兜的是它预测不到的路径（输入法、粘贴、
+                        # 超大模块，以及 VBE 自己在别处弹的列表）。判据只有一条：
+                        # **VBE 的列表真的画在屏幕上了**。
+                        # 手动 Ctrl+Space 唤出的窗不在此列 —— 那是用户点名要的。
+                        if not state.get("popup_manual") and any(
+                                c in vbe_bridge.VBE_YIELD_CLASSES
+                                for (c, _l, _t, _r, _b) in _sig):
+                            _log("poll: VBE 成员列表出现 %r -> 让位" % (_sig,))
+                            post(completer.hide)
+                        else:
+                            _log("poll: 提示窗矩形变化 %r -> 重摆候选窗" % (_sig,))
+                            # 注意调的是 UI（popup）而不是 completer：重摆是画布
+                            # 的事，引擎那层没有这个方法。
+                            post(popup.reposition)
                 except Exception:
                     pass
             snap = backend.snapshot() if _com_allowed() else None

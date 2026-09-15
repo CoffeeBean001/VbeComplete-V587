@@ -219,6 +219,23 @@ def typed_separator(old_line, new_line):
 # 点号左边允许出现的"能取成员的东西"末尾字符
 _MEMBER_OWNER_TAIL = "_)]}"
 
+# v72：点号左边出现这些字符（跳过空白后）时，这个点同样落在【VBE 会自己弹
+# 成员列表】的位置上 —— 因为它们在 VBA 里与 `.` 组合只有一种合法解释：
+# **With 块的成员访问**。
+#     `:`   语句分隔          a = 1: .Size = 2
+#     `=`   赋值 / 比较       Set f = .Font     If x = .Left Then
+#     `,`   实参分隔          MySub a, .Font
+#     `(`   实参起始          MySub (.Font)
+#     `& + - * / \ ^ > <`    运算符右值        x = .Left + .Width
+# 点顶在行首（前面最多几个缩进空白）同理 —— 那是 With 块最标准的写法：
+#     With Range("a1:a10").Font
+#         .Size = 12          <- 这个点左边只有缩进
+#
+# 这些位置 VBE 不会弹别的列表，我们能给的候选也无从谈起，让位不会错失任何
+# 提示；而真正需要提示的位置（标识符 / `)` / `]` / `}` 之后的成员访问）
+# 一个都没动。
+_WITH_OWNER_BOUNDARY = ":,=(&+-*/\\^><"
+
 
 def _in_comment_or_string(line_text, col):
     """光标（1-based 列）左边是否落在字符串 / 注释里（极简扫描）。
@@ -246,6 +263,10 @@ def vbe_member_list_expected(line_text, caret_col):
 
     判据：光标左边形如 `xxx.` + 正在输入的成员名（成员名可以还没开始打）。
     纯文本判定，不碰窗口、不碰 COM，可单测。
+
+    v72 起还认 With 块的成员访问：点顶在行首（`    .Size`）或紧跟语句 /
+    运算符边界（`a = 1: .Size`、`Set f = .Font`、`x = .Left + .Width`）。
+    见 _WITH_OWNER_BOUNDARY。
     """
     if not line_text or not caret_col or caret_col < 1:
         return False
@@ -264,8 +285,18 @@ def vbe_member_list_expected(line_text, caret_col):
     m = k - 1
     while m >= 0 and line_text[m] in " \t":
         m -= 1
-    if m < 0:
-        return False
+    # 【v72】点顶在行首、或紧跟在语句 / 运算符边界后面 —— 这是 With 块的成员
+    # 访问（见 _WITH_OWNER_BOUNDARY），VBE 在这儿同样会弹成员列表。
+    #
+    # ⚠️ 这里必须靠【语法判据】在 VBE 弹窗【之前】就让位，不能只指望"等它真
+    # 的画出可见窗口再让"那条：我们的候选窗是 overrideredirect + topmost 的
+    # 悬浮窗，一弹出就压在 VBE 的成员列表上面；而 VBE 的列表在失去激活时会
+    # 自行收起。两者叠加的结果正是用户报的现象 ——
+    # 「在 With 块里输入 .Size / .Bold 时，VBE 的弹窗反而给我们的让位了」。
+    # 等它真的画出来再去让位，这个"让位"本身已经被我们破坏掉了。
+    if m < 0 or line_text[m] in _WITH_OWNER_BOUNDARY:
+        # 注释 / 字符串里 VBE 不弹，我们照旧弹（`x = 1 ' c: .foo` 这种）
+        return not _in_comment_or_string(line_text, k + 1)
     if not (line_text[m].isalnum() or line_text[m] in _MEMBER_OWNER_TAIL):
         return False
     # 4) `1.5` 这种小数点：点号左边整段是纯数字，VBE 不弹列表

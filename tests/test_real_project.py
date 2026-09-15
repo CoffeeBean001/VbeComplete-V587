@@ -3321,8 +3321,12 @@ def main():
               [_yl("    ' UserForm1.", 17)], expect_contain=[False])
         check("34.10 字符串里的点号 -> 不让位",
               [_yl('    s = "a."', 12)], expect_contain=[False])
-        check("34.11 行首就是点号 -> 不让位",
-              [_yl(".", 2)], expect_contain=[False])
+        # 【v72 语义变更】行首的点号 = With 块的成员访问（`With obj` 之后成员
+        # 各占一行，点就顶在行首），VBE 在那儿同样会弹成员列表 -> 让位。
+        # 旧断言（v55 时代写的"不让位"）是错的：它默认"点号左边必须有东西"，
+        # 恰恰漏掉了用户报的 `With Range(...).Font` + `.Size = 12` 场景。
+        check("34.11 ★行首就是点号 -> 让位（With 块成员访问；v72 语义变更）",
+              [_yl(".", 2)], expect_contain=[True])
         check("34.12 成员名打完（等号后）-> 立刻恢复，不让位",
               [_yl("    UserForm1.Caption = ", 25)], expect_contain=[False])
         check("34.13 空行 / 列号缺失 -> 不让位（不炸）",
@@ -5127,13 +5131,24 @@ def main():
             _mins44 = sorted({m for _n, m in _items44})
             _nxl44 = len([1 for n, _m in _items44 if n.lower().startswith("xl")])
             _nms44 = len([1 for n, _m in _items44 if n.lower().startswith("mso")])
+            # 家族前缀集合（= 名字的小写前 m 个字符）；形态必须健康
+            _fams44 = sorted({n.lower()[:m] for n, m in _items44})
+            _badfam44 = sorted(
+                f for f in _fams44
+                if not (2 <= len(f) <= 4 and f.isalnum() and f == f.lower()))
             _ok44 = (isinstance(_items44, list)
                      and all(m >= 2 for _n, m in _items44)
                      and _nxl44 >= 1000 and _nms44 >= 1000
-                     and all(n.lower().startswith(("xl", "mso"))
-                             for n, _m in _items44))
-            _desc44 = "共 %d 条，xl*=%d mso*=%d，最短输入长度=%s" % (
-                len(_items44), _nxl44, _nms44, _mins44)
+                     and not _badfam44)
+            # 家族前缀不写死 xl / mso：这条断言要跟着"工程引用了哪些库"走。
+            # 后端给的第 2 个值就是该库推导出的家族前缀长度，取名字的小写前缀
+            # 即是那个前缀 —— 它必须是小写字母数字、2~4 个字符（单字母前缀会
+            # 让一两个字母带出半屏名字，后端不会收）。
+            # 实测本机：xl=2173（Excel）、mso=2365（Office）、fm=180（MSForms ——
+            # 工程自己引的库，这正是"你引用什么就补什么"该有的样子）。
+            _desc44 = ("共 %d 条，家族前缀=%s，xl*=%d mso*=%d，"
+                       "最短输入长度=%s" % (len(_items44), _fams44,
+                                        _nxl44, _nms44, _mins44))
         except Exception as _e44:
             _ok44, _desc44 = "异常: %s" % _e44, ""
         check("44.8 真机：枚举出 %s" % (_desc44,), [_ok44], expect_contain=[True])
@@ -6038,6 +6053,165 @@ def main():
               [_n2 == _n4, _t2 < 50 and _t4 < 50], expect_contain=[True, True])
     except Exception as _e48:
         check("第 48 节异常: %s" % _e48, [True], expect_contain=[False])
+
+    # ==================================================================
+    # 49. v72：With 块内的 `.成员` 让位（修「VBE 的弹窗反被我们挤掉」）
+    #
+    # 用户报：`With Range("a1:a10").Font` + `    .Size = 12` + `    .Bold = True`
+    # 这样写的时候，在 With 块内输入 `.Size` / `.Bold`，本该我们让位给 VBE 的
+    # 成员列表，实际却是「VBE 的弹窗给我们的弹窗让位了」。
+    #
+    # 根因：让位的【语法判据】只认"点号左边有东西"（标识符 / ) / ] / }），
+    # `vbe_member_list_expected` 里就是 `m < 0 -> return False`。而 With 块最
+    # 标准的写法恰恰是点顶在行首（前面只有缩进）。第二路"窗口可见性"判据在
+    # 这种场景下也兜不住：我们的候选窗是 overrideredirect + topmost 悬浮窗，
+    # 一弹出就压在 VBE 的列表上面，而 VBE 的列表在失去激活时会自己收起 ——
+    # "等它真的画出来再让"永远来不及。
+    #
+    # v72 的修法（两条）：
+    #   1) 语法判据认识 With 块：点号左边是行首，或 _WITH_OWNER_BOUNDARY 里的
+    #      语句 / 运算符边界（`:` `=` `,` `(` 与 `& + - * / \ ^ > <`）；
+    #   2) main.py 轮询加一道兜底：VBE 的成员列表真的可见就收起我们的
+    #      （手动 Ctrl+Space 唤出的除外）。
+    # ==================================================================
+    print("\n=== 49. v72：With 块内的 .成员 让位 ===")
+    try:
+        import vba_builtins as VB49
+
+        _POOL49 = [(n, "VBA", None, False) for n in VB49.BUILTIN_FUNCTIONS]
+        _POOL49 += [(n, "VBA", None, False) for n in VB49.BUILTIN_TYPE_NAMES]
+        _bl49 = set(r[0].lower() for r in _POOL49)
+
+        class _B49(object):
+            def __init__(self, line_text, caret_col):
+                self._lt = line_text
+                self._cc = caret_col
+
+            def get_context(self):
+                return {"line_no": 1, "line_text": self._lt,
+                        "caret_col": self._cc, "in_string": False,
+                        "in_comment": False, "in_type_position": False,
+                        "in_decl_position": False, "decl_names": [],
+                        "proc_name": None, "module_name": "模块1"}
+
+            def get_identifiers(self):
+                return list(_POOL49)
+
+            def get_declared_names(self):
+                return sorted(_bl49)
+
+            def declared_elsewhere(self, name, module_name):
+                return str(name).lower() in _bl49
+
+            def get_structural_names(self):
+                return sorted(_bl49)
+
+            def get_builtin_names(self):
+                return set(_bl49)
+
+            def get_type_names(self):
+                return list(VB49.BUILTIN_TYPE_NAMES)
+
+            def get_host_enum_names(self):
+                return {}
+
+            def names_outside_caret(self, caret, scope_only=False):
+                return set()
+
+            def apply_completion(self, *a, **k):
+                return None
+
+        class _UI49(object):
+            def __init__(self):
+                self.hides = 0
+
+            def show(self, rows, sel, c):
+                pass
+
+            def hide(self):
+                self.hides += 1
+
+            def update_selection(self, sel):
+                pass
+
+            def contains_point(self, x, y):
+                return False
+
+        _yl49 = E.vbe_list_expected
+
+        def _yl49s(line):
+            """按「光标停在行尾」判定这一行该不该让位。"""
+            return bool(_yl49(line, len(line) + 1))
+
+        check("49.1 ★行首的点（With 块标准写法）-> 让位",
+              [_yl49s("    .Size"), _yl49s("\t.Bold"), _yl49s("    ."),
+               _yl49s("    .si")],
+              expect_contain=[True, True, True, True])
+        check("49.2 ★语句 / 运算符边界后的点 -> 让位"
+              "（a = 1: .Size / Set f = .Font / MySub a, .Font / x = .Left + .Width）",
+              [_yl49s("    a = 1: .Size"), _yl49s("    Set f = .Font"),
+               _yl49s("    MySub a, .Font"), _yl49s("    x = .Left + .Width")],
+              expect_contain=[True, True, True, True])
+        check("49.3 反例（不让位，防过度让位）：小数点 / 注释里的点 / 字符串里的点"
+              " / 注释里的冒号点 / 纯标识符 / 空行",
+              [_yl49s("    x = 1.5"), _yl49s("    ' UserForm1."),
+               _yl49s('    s = "a."'), _yl49s("    x = 1 ' c: .foo"),
+               _yl49s("abc"), _yl49s("")],
+              expect_contain=[False, False, False, False, False, False])
+        check("49.4 原有位置照旧让位、没退化：obj. / a(1). / Dim x As / New",
+              [_yl49s("    UserForm1.SelectedList"), _yl49s("    a(1)."),
+               _yl49s("    Dim x As "), _yl49s("    Set c = New ")],
+              expect_contain=[True, True, True, True])
+        check("49.5 _WITH_OWNER_BOUNDARY 覆盖语句边界与算术/比较运算符",
+              [set(":=,(") <= set(E._WITH_OWNER_BOUNDARY),
+               set("+-*/\\^<>") <= set(E._WITH_OWNER_BOUNDARY)],
+              expect_contain=[True, True])
+
+        def _trig49(line, auto=True, yield_on=None):
+            _ui = _UI49()
+            _c = E.Completer(_B49(line, len(line) + 1), _ui)
+            _oy = E.YIELD_TO_VBE_LIST
+            if yield_on is not None:
+                E.YIELD_TO_VBE_LIST = yield_on
+            try:
+                _c.trigger(bool(auto))
+            finally:
+                E.YIELD_TO_VBE_LIST = _oy
+            return list(_c.matches or []), _ui.hides
+
+        _m6, _h6 = _trig49("    .si")
+        check("49.6 ★引擎端到端：轮询自动触发 + With 块内 .si -> 让位（不弹候选）",
+              [len(_m6) == 0, _h6 > 0], expect_contain=[True, True])
+
+        _m7, _h7 = _trig49("    .si", yield_on=False)
+        check("49.7 对照：关掉 YIELD_TO_VBE_LIST -> 候选照出（%d 条）"
+              "（证明 49.6 是「让位」在起作用，不是碰巧没候选）" % len(_m7),
+              [len(_m7) > 0], expect_contain=[True])
+
+        _m8, _h8 = _trig49("    .si", auto=False)
+        check("49.8 手动 Ctrl+Space（让位只拦自动路径）-> 照旧弹（%d 条）"
+              % len(_m8), [len(_m8) > 0], expect_contain=[True])
+
+        _m9, _h9 = _trig49("    Msg")
+        check("49.9 普通标识符位置不受影响：Msg -> 照常弹、且没被让位收掉",
+              [_h9 == 0, len(_m9) > 0], expect_contain=[True, True])
+
+        # ---- 49.10 接线护栏：main.py 轮询里的兜底 ----
+        _msrc49 = ""
+        try:
+            _msrc49 = open(os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "main.py"), encoding="utf-8").read()
+        except Exception:
+            _msrc49 = ""
+        check("49.10 接线护栏：poll 兜底在（VBE 成员列表可见 -> 让位；"
+              "手动 Ctrl+Space 唤出的除外）",
+              [_msrc49.count("VBE_YIELD_CLASSES") >= 1,
+               "popup_manual" in _msrc49,
+               _msrc49.count("popup_manual") >= 3],
+              expect_contain=[True, True, True])
+    except Exception as _e49:
+        check("第 49 节异常: %s" % _e49, [True], expect_contain=[False])
 
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))
