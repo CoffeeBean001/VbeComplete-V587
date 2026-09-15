@@ -230,6 +230,15 @@
   作用域按 VBA 语义归属到**首次出现所在的那个过程**（局部变量），
   因此**不会**从别的过程漏进来 —— 在别的过程**形参列表**里无论是敲、退格、粘贴，
   该名字都不会被回敬给你；只有模块顶层的隐式变量才全模块可见。
+- **写了 `Option Explicit` 的模块例外**（v75）：它是强制声明，只在
+  `Dim` / `Const` / `Sub` / `Function` / `Type` / `Enum` / 形参里出现过的名字才算数；
+  "只用过、没声明"的名字**不再进提示池** —— 那种写法在该模块里本来就是编译错误，
+  提示它只会把坏代码带出去。判定**按模块**做（`Option Explicit` 本身就是模块级
+  语句）：**没写它的模块一字不动**，"用过即存在"照旧提示。
+  ⚠️ 判定会先抹掉字符串与注释，所以"注释掉的那一行 Option Explicit"不算数；
+  `Option Base 1` / `Option Compare Text` 也都不算。
+  想回到旧行为（不分模块、隐式变量一律收）：
+  `set VBECOMPLETE_IMPLICIT_HONOR_EXPLICIT=0`。
 
 ## 开机 / 打开 VBE 自动启用
 
@@ -316,6 +325,17 @@
   多出来的全部落在 `kind 0` 档，**不会顶掉**精确 / 前缀 / 连续命中 ——
   打 `ms` 第 1 个仍是 `MsgBox`。嫌多就用 `set VBECOMPLETE_BUILTIN_SCATTER_MIN=4`
   退回 v61~v70 的老口径。
+- **某个"用过但没声明"的变量名不再提示了（v75）**：这是**按模块**生效的 ——
+  该模块的**第一行附近写了 `Option Explicit`**（强制声明），于是只用过、从没
+  `Dim` 过的名字不再进池子（那种写法在该模块里是编译错误）。
+  逐条排查：
+  1. VBE 里打开那个模块，看顶部有没有 `Option Explicit`（注释掉的**不算**）；
+  2. 想让它照旧提示：给这个名字补一行 `Dim`，或整批回到旧行为 ——
+     `set VBECOMPLETE_IMPLICIT_HONOR_EXPLICIT=0`；
+  3. 只想要"完全不收隐式变量"（连没写 `Option Explicit` 的模块也不收）：
+     那是另一个更老的开关，改源码里的 `vbe_bridge.ENABLE_IMPLICIT_IDENTIFIERS`。
+  日志里搜 `不收集隐式变量` —— 被闸掉的模块会逐行列出来
+  （`mod=CopyPicturesToCells Option Explicit -> 不收集隐式变量`）。
 - **`xl` 后面只打两个字母（`xlde` / `xd`）补不出 `xlWorkbookDefault`**（**打开**宿主
   枚举时才会遇到）：这是**故意的**，别再放宽 —— 放宽了也不会出现，只会更糟。
   实测真机 4538 条：

@@ -48,6 +48,22 @@ ENABLE_IMPLICIT_IDENTIFIERS = True
 #   "proc"   —— 按"首次出现所在过程"限定作用域（更贴近 VBA 语义，避免跨过程泄漏）
 IMPLICIT_SCOPE = "proc"
 
+# ★v75：隐式变量要不要【尊重模块自己写的 Option Explicit】。
+#
+# 用户口径："没有 Option Explicit 时，用过的变量名就算已经被定义、可以直接提示；
+# 写了 Option Explicit 是强制声明，没声明过的变量名在后续就不该被提示。"
+#
+# 判定是【按模块】做的 —— Option Explicit 本来就是模块级语句：
+#   * 没写它的模块：完全保持原样（用过的名字照旧进池子，用户明确说这样好）；
+#   * 写了它的模块：只收"真声明过"的名字（Dim / Const / Sub / Function / Type /
+#     Enum / 形参）；"只用过、没声明"的名字不再进池子 —— 那种写法在该模块里
+#     是编译错误，提示它只会带出坏代码。
+#
+# 想回到旧行为（不分模块，隐式变量一律收）：
+#   set VBECOMPLETE_IMPLICIT_HONOR_EXPLICIT=0
+IMPLICIT_HONOR_OPTION_EXPLICIT = _env_flag(
+    "VBECOMPLETE_IMPLICIT_HONOR_EXPLICIT", True)
+
 # VBA 语言自带的名字（内建函数 / 常用内建常量 / 内建数据类型）是否纳入提示。
 # 关闭后回到旧行为：只提示工程代码里出现过的名字（外加组件名、窗体控件名；
 # 关键字另见下面的 ENABLE_VBA_KEYWORDS，同样关掉才是完全旧行为）。
@@ -532,6 +548,24 @@ def _collect_components(vbe, caret_mod=None):
         return []
     _log("collect: 收集全部工程（%d 个组件）" % len(comps))
     return comps
+
+
+def implicit_gate_applies(code):
+    """这个模块的"隐式变量"要不要被 Option Explicit 闸掉（v75）。
+
+    True  = 该模块写了 `Option Explicit` ⇒ 只收真声明过的名字，
+            "用过但没声明"的名字不进候选池（那种写法在该模块里是编译错误）。
+    False = 照旧收（没写 Option Explicit，或者开关被关掉了）。
+
+    纯函数（只看文本 + 两个开关，不碰 COM），便于单测 —— 这里最容易出错的
+    是开关极性，而不是文本判定本身。
+    """
+    if not ENABLE_IMPLICIT_IDENTIFIERS or not IMPLICIT_HONOR_OPTION_EXPLICIT:
+        return False
+    try:
+        return vba_parser.has_option_explicit(code)
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -1997,14 +2031,22 @@ class VbeBackend:
                                 _n, set()).add(str(mod_name).lower())
                     # 隐式变量（没写 Option Explicit 时"用到即存在"）：
                     # 只补 extract_records 没声明过的名字，避免重复与作用域冲突。
+                    #
+                    # v75：写了 Option Explicit 的模块整段跳过（详见
+                    # IMPLICIT_HONOR_OPTION_EXPLICIT 的说明）—— "用过但没声明"
+                    # 在那里是编译错误，收进来只会提示出坏代码。
                     imp = []
                     if ENABLE_IMPLICIT_IDENTIFIERS:
-                        imp = vba_parser.extract_implicit_records(
-                            code, module=mod_name, is_std_module=is_std,
-                            declared=recs,
-                            scope=IMPLICIT_SCOPE,
-                            caret=apply_caret)
-                        records.extend(imp)
+                        if implicit_gate_applies(code):
+                            _log("  mod=%-16s Option Explicit -> 不收集隐式变量"
+                                 % mod_name)
+                        else:
+                            imp = vba_parser.extract_implicit_records(
+                                code, module=mod_name, is_std_module=is_std,
+                                declared=recs,
+                                scope=IMPLICIT_SCOPE,
+                                caret=apply_caret)
+                            records.extend(imp)
                     _log("  mod=%-16s type=%-3s std=%-5s recs=%-4d imp=%-4d caret_applied=%s"
                          % (mod_name, comp.Type, is_std, len(recs), len(imp),
                             bool(apply_caret)))

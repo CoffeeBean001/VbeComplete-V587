@@ -2196,12 +2196,26 @@ def main():
                   [_m2], expect_contain=[["numArr"]])
 
             # 24.3 隐式变量（别处用过、没声明）的前缀补全不能被误杀
+            #
+            # ⚠️ v75 起这条【不能再用 Option Explicit】—— 写了它的模块不再收集
+            # 隐式变量（用户口径，见第 52 节），旧写法等于在断言新行为。
+            # 本断言真正要守的是"回声防护不误杀隐式变量"，与是否强制声明无关，
+            # 所以这里去掉那一行、行号随之前移。
             _trig, _thr = _session24()
-            _m3 = _trig([("Module1", "Option Explicit\nSub Foo()\n    arr = 1\n"
+            _m3 = _trig([("Module1", "Sub Foo()\n    arr = 1\n"
                                        "    ar\nEnd Sub")],
-                        "Module1", 4, 5 + 2)
-            check("24.3 隐式变量前缀补全仍在（ar -> arr）",
+                        "Module1", 3, 5 + 2)
+            check("24.3 隐式变量前缀补全仍在（不带 Option Explicit：ar -> arr）",
                   [_m3], expect_contain=[["arr"]])
+            # 反向对照：同一个文本加上 Option Explicit 后，arr 用过但没声明
+            # ⇒ 不该再被提示（v75 的语义翻转，与第 52 节同源）。
+            _trig, _thr = _session24()
+            _m3b = _trig([("Module1", "Option Explicit\nSub Foo()\n    arr = 1\n"
+                                        "    ar\nEnd Sub")],
+                         "Module1", 4, 5 + 2)
+            check("24.3b ★对照：带 Option Explicit 时 arr 不再提示"
+                  "（用过但没声明 = 编译错误）",
+                  [_m3b], expect_absent=["arr"])
 
             # 24.4 别的模块的 Public 名字仍要提示（跨模块靠"声明集合"这一路证据）
             _trig, _thr = _session24()
@@ -6573,6 +6587,271 @@ def main():
               [len(_bad51)], expect_contain=[0])
     except Exception as _e51:
         check("第 51 节异常: %s" % _e51, [True], expect_contain=[False])
+
+    # ==================================================================
+    # 52. v75：隐式变量尊重模块自己的 Option Explicit
+    #
+    # 用户口径："没有 Option Explicit 时，用过的变量名就算已经被定义、可以直接
+    # 提示（现在这样很好，不要提前定义变量名）；写了 Option Explicit 是强制声明，
+    # 没声明过的变量名在后续就不该被提示。"
+    #
+    # 判定【按模块】做 —— Option Explicit 本来就是模块级语句：
+    #   * 没写它的模块：一字不动（用过的名字照旧进池子）；
+    #   * 写了它的模块：只收"真声明过"的名字（Dim / Const / Sub / Function /
+    #     Type / Enum / 形参），隐式变量整段不收 —— 那种写法在该模块里是编译
+    #     错误，提示它只会把坏代码带出去。
+    #
+    # 落点在【收集侧】（extract_implicit_records 之前），因为隐式变量是唯一
+    # "用过但没声明"的名字来源：extract_records 收的都是真声明，而隐式变量从不
+    # 进 declared_names / _decl_by_mod（回声防护那边只靠"现场文本"兜）。改这一处
+    # 就够，引擎与 UI 一行不用动。
+    # ==================================================================
+    print("\n=== 52. v75：Option Explicit 模块不再收「用过但没声明」的名字 ===")
+    try:
+        import os as _os52
+        import vbe_bridge as VB52
+        import parser as P52
+
+        # ---- 52.1 has_option_explicit 真值表（文本判定，纯函数）----
+        # 全是"认错就出事"的边界：把注释掉的 Option Explicit 认成真，会把整个
+        # 模块的隐式变量误砍掉（而那正是用户要保留的行为）；把真行漏掉则等于白改。
+        _oe52 = [
+            P52.has_option_explicit("Option Explicit\nSub A()\nEnd Sub"),
+            P52.has_option_explicit("option explicit\nSub A()"),
+            P52.has_option_explicit("   Option   Explicit\nSub A()"),
+            P52.has_option_explicit("Attribute VB_Name = \"M\"\r\n"
+                                    "Option Explicit\r\nSub A()"),
+            P52.has_option_explicit("Option Base 1\nOption Compare Text\nSub A()"),
+            P52.has_option_explicit("' Option Explicit\nSub A()\nEnd Sub"),
+            P52.has_option_explicit('Sub A()\n    s = "Option Explicit"\nEnd Sub'),
+            P52.has_option_explicit("Sub A()\n    x = 1 ' Option Explicit\nEnd Sub"),
+            P52.has_option_explicit(""),
+            P52.has_option_explicit(None),
+        ]
+        check("52.1 ★文本判定：行首的 Option Explicit 才算（缩进 / 小写 / 带 "
+              "Attribute 头都算）；注释掉的 / 字符串里的 / 其它 Option 语句 / "
+              "空文本都不算",
+              [_oe52],
+              expect_contain=[[True, True, True, True, False, False, False,
+                               False, False, False]])
+
+        # ---- 52.2~52.6 真实后端全链路（桩 VBE：一个不带、一个带 OE）----
+        class _CM52(object):
+            def __init__(self, comp, text):
+                self.Parent = comp
+                self.text = text
+
+            @property
+            def CountOfLines(self):
+                return self.text.count("\n") + 1
+
+            def Lines(self, start, count):
+                return "\r\n".join(
+                    self.text.split("\n")[start - 1:start - 1 + count])
+
+        class _Comp52(object):
+            def __init__(self, name, text, ctype=1):
+                self.Name = name
+                self.Type = ctype
+                self.CodeModule = _CM52(self, text)
+
+        class _Proj52(object):
+            def __init__(self, comps):
+                self.Name = "VBAProject"
+                self.VBComponents = list(comps)
+
+        class _Pane52(object):
+            def __init__(self, comp):
+                self._c = comp
+
+            @property
+            def CodeModule(self):
+                return self._c.CodeModule
+
+            def GetSelection(self):
+                # 光标落在【最后一个空行】上：既不会抹掉任何标识符，也不会被
+                # 当成"声明行"（否则正在声明的名字会被排除，干扰本节的断言）。
+                return (10, 1, 10, 1)
+
+        class _VBE52(object):
+            def __init__(self, proj, act):
+                self.ActiveVBProject = proj
+                self.ActiveCodePane = _Pane52(act)
+
+        # 带 Option Explicit：looseVar2 用过但没声明（编译错误）；declaredVar 真声明；
+        # nParam 是形参（也是声明）。
+        _EX52 = ("Option Explicit\n"
+                 "Sub A()\n"
+                 "    Dim declaredVar As Long\n"
+                 "    declaredVar = 2\n"
+                 "    looseVar2 = 1\n"
+                 "End Sub\n"
+                 "Sub C(ByVal nParam As Long)\n"
+                 "    nParam = nParam + 1\n"
+                 "End Sub\n")
+        # 不带 Option Explicit：looseVar 同样是"用过即存在"，必须照旧收。
+        _LO52 = ("Sub B()\n"
+                 "    looseVar = 1\n"
+                 "End Sub\n")
+        _cEX52 = _Comp52("ExplicitMod", _EX52)
+        _cLO52 = _Comp52("LooseMod", _LO52)
+        _vbe52 = _VBE52(_Proj52([_cEX52, _cLO52]), _cEX52)
+
+        _orig52 = VB52._get_vbe_cached
+        _saved52 = (VB52.IMPLICIT_HONOR_OPTION_EXPLICIT,
+                    VB52.ENABLE_IMPLICIT_IDENTIFIERS,
+                    VB52.ENABLE_VBA_BUILTINS, VB52.ENABLE_VBA_KEYWORDS)
+        VB52._get_vbe_cached = lambda: _vbe52
+        try:
+            # 只看工程内名字：把语言自带的两批关掉，池子干净好断言。
+            VB52.ENABLE_VBA_BUILTINS = False
+            VB52.ENABLE_VBA_KEYWORDS = False
+
+            VB52.ENABLE_IMPLICIT_IDENTIFIERS = True
+            VB52.IMPLICIT_HONOR_OPTION_EXPLICIT = True
+            _on52 = set(str(r[0]).lower()
+                        for r in VB52.VbeBackend().get_identifiers())
+
+            VB52.IMPLICIT_HONOR_OPTION_EXPLICIT = False
+            _off52 = set(str(r[0]).lower()
+                         for r in VB52.VbeBackend().get_identifiers())
+
+            VB52.ENABLE_IMPLICIT_IDENTIFIERS = False
+            VB52.IMPLICIT_HONOR_OPTION_EXPLICIT = True
+            _none52 = set(str(r[0]).lower()
+                          for r in VB52.VbeBackend().get_identifiers())
+        finally:
+            VB52._get_vbe_cached = _orig52
+            (VB52.IMPLICIT_HONOR_OPTION_EXPLICIT,
+             VB52.ENABLE_IMPLICIT_IDENTIFIERS,
+             VB52.ENABLE_VBA_BUILTINS, VB52.ENABLE_VBA_KEYWORDS) = _saved52
+
+        check("52.2 ★带 Option Explicit 的模块：用过但没声明的 looseVar2 不进池；"
+              "真声明的 declaredVar、形参 nParam 照常在",
+              ["loosevar2" not in _on52, "declaredvar" in _on52,
+               "nparam" in _on52],
+              expect_contain=[True, True, True])
+        check("52.3 ★不带 Option Explicit 的模块一字不动：looseVar 照旧进池"
+              "（用户明确说这样好）",
+              ["loosevar" in _on52], expect_contain=[True])
+        check("52.4 ★反向对照：闸门关掉（旧行为）时 looseVar2 必须回来 "
+              "—— 证明是这道闸门在起作用，不是碰巧没有",
+              ["loosevar2" in _off52], expect_contain=[True])
+        check("52.5 差异精确：闸门只摘掉 looseVar2 一个名字（不多不少）",
+              [sorted(_off52 - _on52), sorted(_on52 - _off52)],
+              expect_contain=[["loosevar2"], []])
+        check("52.6 两个开关互不干扰：ENABLE_IMPLICIT_IDENTIFIERS=False 时"
+              "looseVar 也没了，但真声明照旧",
+              ["loosevar" not in _none52, "loosevar2" not in _none52,
+               "declaredvar" in _none52],
+              expect_contain=[True, True, True])
+
+        # ---- 52.7 接线护栏 ----
+        def _read52(name):
+            return io.open(os.path.join(ROOT, name), encoding="utf-8").read()
+
+        _br52 = _read52("vbe_bridge.py")
+        _ps52 = _read52("parser.py")
+        check("52.7 接线护栏：收集段真的问了闸门；判定函数在两边都只有一份",
+              ["implicit_gate_applies(code)" in _br52,
+               "implicit_gate_applies" in _br52 and "has_option_explicit" in _ps52,
+               "IMPLICIT_HONOR_OPTION_EXPLICIT" in _br52,
+               _ps52.count("def has_option_explicit") == 1],
+              expect_contain=[True, True, True, True])
+
+        # ---- 52.8 环境变量开关（必须用干净模块：现场那份可能被前导段改过）----
+        _KEY52 = "VBECOMPLETE_IMPLICIT_HONOR_EXPLICIT"
+        _old52 = _os52.environ.get(_KEY52)
+        _freshD52 = _freshE52 = None
+
+        def _load52(modname):
+            import importlib.util as _iu52
+            _sp52 = _iu52.spec_from_file_location(
+                modname, os.path.join(ROOT, "vbe_bridge.py"))
+            _m52 = _iu52.module_from_spec(_sp52)
+            _sp52.loader.exec_module(_m52)
+            return _m52
+
+        try:
+            _os52.environ.pop(_KEY52, None)
+            try:
+                _freshD52 = _load52("vbe_bridge_fresh52d")
+            except Exception:
+                _freshD52 = None
+            _os52.environ[_KEY52] = "0"
+            try:
+                _freshE52 = _load52("vbe_bridge_fresh52e")
+            except Exception:
+                _freshE52 = None
+        finally:
+            if _old52 is None:
+                _os52.environ.pop(_KEY52, None)
+            else:
+                _os52.environ[_KEY52] = _old52
+        check("52.8 出厂默认开启；set VBECOMPLETE_IMPLICIT_HONOR_EXPLICIT=0 "
+              "可回到旧行为",
+              [(_freshD52.IMPLICIT_HONOR_OPTION_EXPLICIT if _freshD52 else "加载失败",
+                _freshE52.IMPLICIT_HONOR_OPTION_EXPLICIT if _freshE52 else "加载失败")],
+              expect_contain=[(True, False)])
+
+        # ---- 52.9 真机不变式（Excel 没开就跳过）----
+        # 断言形式刻意做成"零泄漏"而不是"某模块有几条"：用户随时会改工程，
+        # 写死数字的护栏下次就该报假警了。
+        _fresh52 = None
+        try:
+            _fresh52 = _load52("vbe_bridge_fresh52r")
+        except Exception:
+            _fresh52 = None
+        _r52 = None
+        if _fresh52 is None:
+            check("52.9 真机：干净模块加载失败 —— 跳过", [True], expect_contain=[True])
+        else:
+            try:
+                _be52r = _fresh52.VbeBackend()
+                _pool52r = set(str(r[0]).lower()
+                               for r in _be52r.get_identifiers())
+                _decl52r = set(str(n).lower()
+                               for n in _be52r.get_declared_names())
+                _str52r = set(str(n).lower()
+                              for n in _be52r.get_structural_names())
+                _gated52, _leak52 = 0, []
+                _comps52r = _fresh52._collect_components(
+                    _fresh52._get_vbe_cached(), None)
+                if not _comps52r:
+                    raise RuntimeError("拿不到组件")
+                for _cp52r in _comps52r:
+                    try:
+                        _nm52r = str(_cp52r.Name)
+                        _ct52r = _cp52r.CodeModule.CountOfLines
+                        _cd52r = (_cp52r.CodeModule.Lines(1, _ct52r)
+                                  if _ct52r > 0 else "")
+                    except Exception:
+                        continue
+                    if not _fresh52.implicit_gate_applies(_cd52r):
+                        continue
+                    _gated52 += 1
+                    _std52r = bool(_cp52r.Type == 1)
+                    _recs52r = P52.extract_records(
+                        _cd52r, module=_nm52r, is_std_module=_std52r)
+                    for (_n52r, _m52r, _p52r, _pr52r) in P52.extract_implicit_records(
+                            _cd52r, module=_nm52r, is_std_module=_std52r,
+                            declared=_recs52r, scope="proc"):
+                        _l52r = str(_n52r).lower()
+                        if _l52r in _decl52r or _l52r in _str52r:
+                            continue        # 别处真声明过：本来就该在池子里
+                        if _l52r in _pool52r:
+                            _leak52.append(_l52r)
+                _r52 = (sorted(set(_leak52)), _gated52)
+            except Exception as _e52r:
+                _r52 = None
+                check("52.9 真机：拿不到 VBE（Excel 未开？）—— 跳过（%s）"
+                      % _e52r, [True], expect_contain=[True])
+        if _r52 is not None:
+            check("52.9 ★真机：%d 个带 Option Explicit 的模块，其「用过但没声明」"
+                  "的名字一个都没进池子（若列表非空即为泄漏）" % (_r52[1],),
+                  [_r52[0]], expect_contain=[[]])
+    except Exception as _e52:
+        check("第 52 节异常: %s" % _e52, [True], expect_contain=[False])
 
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))

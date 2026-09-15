@@ -815,6 +815,42 @@ def ident_at_caret(text, line_no, col):
     return ""
 
 
+# `Option Explicit`（强制变量声明）—— 模块级语句，必须出现在所有过程之前。
+# 只在【行首】（允许缩进）认，且必须过字符串/注释掩码（见 has_option_explicit）。
+_RE_OPTION_LINE = re.compile(r"(?im)^[ \t]*Option\b")
+_RE_OPTION_EXPLICIT = re.compile(r"(?im)^[ \t]*Option[ \t]+Explicit\b")
+
+
+def has_option_explicit(code):
+    """模块是否写了 `Option Explicit`（= 强制声明变量）。
+
+    纯文本判定，不碰 COM、可单测。判据要点：
+
+      * 只在【行首】（允许前导空白）认 —— `Option Explicit` 是模块级语句，
+        不会出现在语句中间；
+      * **先过 _mask_strings_and_comments**：字符串里的 `"Option Explicit"` 与
+        注释里的 `' Option Explicit` 都不算。真实工程里"临时注释掉这一行"很常见，
+        认错了会把整个模块的隐式变量误砍掉（而那是用户明确要保留的行为）；
+      * 大小写不敏感（`option explicit` 同样合法）；
+      * 只认 Explicit —— `Option Base 1` / `Option Compare Text` /
+        `Option Private Module` 都与"是否必须声明变量"无关，不算数。
+
+    为什么要判它：写了 Option Explicit 的模块里，"用过但没声明"的名字是
+    **编译错误**，不该再进候选池（见 vbe_bridge.IMPLICIT_HONOR_OPTION_EXPLICIT）。
+    """
+    if not code:
+        return False
+    # 廉价预筛：绝大多数模块连 Option 语句都没有，连掩码都不用做。
+    if not _RE_OPTION_LINE.search(code):
+        return False
+    try:
+        return bool(_RE_OPTION_EXPLICIT.search(_mask_strings_and_comments(code)))
+    except Exception:
+        # 判定失败一律当"没写"—— 宁可多给提示，也不要因为一个解析意外
+        # 把整个模块的隐式变量砍掉。
+        return False
+
+
 def extract_implicit_records(code, module=None, is_std_module=True,
                              declared=None, scope="module", include_usage=True,
                              caret=None):
@@ -844,6 +880,10 @@ def extract_implicit_records(code, module=None, is_std_module=True,
 
     caret=(line_no, col)：光标位置（1-based）。该位置上的标识符会被忽略，
     避免"正在输入的词"被当成已使用过的变量收录（自我提示）。
+
+    ⚠️ 本函数【不自己判 Option Explicit】—— 那份判定（连同开关）住在调用方
+    `vbe_bridge.implicit_gate_applies`：写了 Option Explicit 的模块干脆不该调
+    本函数（"用过但没声明"在那里是编译错误），先问一次能省掉整模块解析。
     """
     # 光标处的词必须在【原始文本】上抹掉，不能先 mask 再抹。
     #
