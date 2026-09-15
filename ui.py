@@ -799,6 +799,21 @@ class Popup:
         except Exception:
             return False
 
+    def geometry_now(self):
+        """候选窗此刻的实际几何 (x, y, w, h)；没收起 / 拿不到返回 None（v76）。
+
+        只给诊断日志用 —— 排查"VBE 的成员列表被我们的窗盖住"时必须能看到我们
+        自己的窗到底画在哪儿。与 clashes_with_popup 同一套只读取值（winfo_*），
+        拿不到一律 None，绝不影响显示。
+        """
+        try:
+            if self.win is None or self.win.state() == "withdrawn":
+                return None
+            return (self.win.winfo_x(), self.win.winfo_y(),
+                    self.win.winfo_width(), self.win.winfo_height())
+        except Exception:
+            return None
+
     def update_selection(self, selected):
         self.root.after(0, self._update_selection, selected)
 

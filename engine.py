@@ -1160,12 +1160,34 @@ class Completer:
         # 才让位，弹形参签名不需要让位"。成员列表是候选列表（同质：遮挡 + 抢键盘），
         # 而参数信息（形参签名）只是只读提示、不吃键盘，且它出现时用户正在填实参，
         # 正是最需要候选的时候；在那儿让位就是"输入任何字符都无提醒"（v65 的 bug）。
-        if require_ident_before_caret and YIELD_TO_VBE_LIST \
-                and self._vbe_popup_showing():
+        # 【v76】这条判据【不再要求 require_ident_before_caret】：VBE 的成员列表
+        # 画在屏幕上是**客观事实**，此时我们该不该让位与"这次触发是自动轮询还是
+        # 手动 Ctrl+Space"无关 —— 我们的是 topmost 悬浮窗，一挂上去就把它整个
+        # 盖住。用户口径（v76 原话）："VBE 的弹窗和我们项目弹窗冲突时，屏蔽我们
+        # 项目弹窗……直接消失让位。"
+        #
+        # 解绑之后顺带补上 v73 补位路径的一个时序洞：补位走的是
+        # `trigger(False)`（刻意绕过让位判据），而它只在"探到 VBE 列表不可见"时
+        # 才发起 —— 从那次探测到主线程真正执行 trigger 之间隔着动作队列，VBE 的
+        # 列表完全可能已经弹出来了，那时补出来的窗就会直接压在它上面。现在这条
+        # 判据在任何触发路径下都生效，这个缝就没了。
+        if YIELD_TO_VBE_LIST and self._vbe_popup_showing():
             # 记下【是哪个窗】在让位（成员列表 / 参数信息），排查"某处什么都不弹"
             # 时必须能一眼分开（v65）。
             _log("trigger: VBE 成员列表窗可见 -> 让位 %r"
                  % (self._vbe_popup_desc(),))
+            # 【v76】VBE 的列表真的画出来了 -> 之前"它在这一处不弹"的判断作废。
+            #
+            # 这条很关键：`yield_given_up` 是按 (模块, 行号) 记的，一旦记上，这一行
+            # 后续的【语法判据】就永久跳过让位（走"照常出候选"那条路），只能靠上面
+            # 这条窗口判据兜着 —— 而窗口判据恰恰可能被我们自己的窗破坏：候选窗是
+            # topmost 悬浮窗，一压上去，VBE 的列表就失去激活、自行收起，之后再也探
+            # 不到它（v72 的认知）。于是"探测失败 -> 不让位 -> 更探不到"会自我强化。
+            # VBE 的列表既然还在屏幕上，就说明这一处它确实会弹，语法判据重新生效才
+            # 稳（不必依赖探测）。
+            if self.yield_given_up is not None:
+                _log("trigger: VBE 列表确实在 -> 清掉此处\"已放弃让位\"的标记")
+                self.yield_given_up = None
             self.hide()
             return
         if require_ident_before_caret and not _ident_char_before_caret(ctx):

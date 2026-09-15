@@ -4552,8 +4552,17 @@ def main():
         check("40.9 探测抛异常 -> 不让位、不炸（异常被吞）",
               [_trig40(popup=True, boom=True)],
               expect_contain=[_hit40])
-        check("40.10 手动 Ctrl+Space（require_ident_before_caret=False）照弹",
+        # 【v76 口径变更】让位判据不再区分"自动轮询 / 手动 Ctrl+Space"。
+        # 理由见 engine.trigger：VBE 的成员列表画在屏幕上是客观事实，我们的窗是
+        # topmost 悬浮窗，一挂上去就把它整个盖住。用户 v76 原话："VBE 的弹窗和
+        # 我们项目弹窗冲突时，屏蔽我们项目弹窗……直接消失让位。"
+        # 成对保留一条对照（40.10b）：列表不可见时手动路径照弹 —— 证明挡它的确实
+        # 是"列表可见"，而不是把手动路径整个禁掉了。
+        check("40.10 ★v76 手动 Ctrl+Space：提示窗可见时同样让位（不再区分触发来源）",
               [_trig40(popup=True, manual=True)],
+              expect_contain=[([], False)])
+        check("40.10b 对照：提示窗不可见 -> 手动 Ctrl+Space 照弹（让位只管「可见」）",
+              [_trig40(popup=False, manual=True)],
               expect_contain=[_hit40])
 
         # 40.11 判据与语法位置无关：普通赋值行上，窗口可见同样让位
@@ -4872,8 +4881,14 @@ def main():
         check("42.9 vbe_yield_visible 抛异常 -> 不让位、不炸",
               [_trig42(pop=True, yld=False, boom2=True)],
               expect_contain=[_hit42])
-        check("42.10 手动 Ctrl+Space：成员列表可见也照弹（让位只管自动触发）",
+        # 【v76 口径变更】同 40.10：成员列表可见时，手动路径也让位 —— 这条判据
+        # 现在是"不依赖触发来源的通用不变量"（v73 的补位路径 trigger(False) 也受
+        # 它约束，那正是补出来的窗会压住 VBE 列表的那个时序缝）。
+        check("42.10 ★v76 手动 Ctrl+Space：成员列表可见 -> 同样让位（不再区分触发来源）",
               [_trig42(manual=True, pop=False, yld=True)],
+              expect_contain=[([], False)])
+        check("42.10b 对照：成员列表不可见 -> 手动路径照弹",
+              [_trig42(manual=True, pop=False, yld=False)],
               expect_contain=[_hit42])
 
         # 42.11 真机：让位判据与明细一致
@@ -6218,12 +6233,15 @@ def main():
                 "main.py"), encoding="utf-8").read()
         except Exception:
             _msrc49 = ""
-        check("49.10 接线护栏：poll 兜底在（VBE 成员列表可见 -> 让位；"
-              "手动 Ctrl+Space 唤出的除外）",
+        # v76：兜底里那句 `not state.get("popup_manual") and ...` 的前置条件已经
+        # 去掉 —— 用户口径是"冲突时直接把我们的窗收掉"，不分手动/自动。这里除了
+        # 确认接线还在，额外钉住【这个前置条件不许回来】。
+        check("49.10 接线护栏：poll 兜底在（VBE 成员列表可见 -> 让位，不再分手动）",
               [_msrc49.count("VBE_YIELD_CLASSES") >= 1,
                "popup_manual" in _msrc49,
-               _msrc49.count("popup_manual") >= 3],
-              expect_contain=[True, True, True])
+               _msrc49.count("popup_manual") >= 3,
+               'if not state.get("popup_manual") and any(' not in _msrc49],
+              expect_contain=[True, True, True, True])
     except Exception as _e49:
         check("第 49 节异常: %s" % _e49, [True], expect_contain=[False])
 
@@ -6852,6 +6870,253 @@ def main():
                   [_r52[0]], expect_contain=[[]])
     except Exception as _e52:
         check("第 52 节异常: %s" % _e52, [True], expect_contain=[False])
+
+    # ==================================================================
+    # 53. v76：让位判据不再区分触发来源（手动 / 补位都受约束）
+    #     + 「VBE 列表确实可见」清掉 yield_given_up
+    #
+    # 用户报："VBE 的弹窗和我们项目弹窗冲突时，屏蔽我们项目弹窗……以前你修好了，
+    # 就一直没出，刚才你改完，就出这个 bug 了。" 对号入座的三问答案：
+    # VBE 弹的是【成员列表】；现象是【我们的窗盖住了它】；期望是【直接消失让位】。
+    #
+    # 排查（先证伪再定位）：
+    #   1) 先确认工具跑的是哪版代码 —— GetProcessTimes 拿 pythonw 启动时间
+    #      (13:05:06) 对比源文件 mtime (main/ui 09:41、vbe_bridge 12:59) ⇒ 跑的确实
+    #      是修完的最新代码，不是"改了没重启"的错觉；
+    #   2) `git diff v73..v74 -- ui.py` 逐行核对：rect_overlap 的重构与旧判据
+    #      (r<=x / l>=x+w / b<=y / t>=y+h) 逐项等价 ⇒ v74 的方向只会让"避让"更多，
+    #      不会更少 ⇒ 问题不在避让，在【让位】这一侧；
+    #   3) 让位的第二路（窗口可见性）天生脆：我们的窗是 topmost 悬浮窗，一压上去
+    #      VBE 的列表就失去激活、自行收起，之后再也探不到（v72 的认知）。所以
+    #      必须让【不依赖探测】的那些判据尽量多扛一手。
+    #
+    # 两个确定的病灶（都不依赖探测，因此不受上面那个自弱化循环影响）：
+    #   a) 第二路判据原来带 require_ident_before_caret ⇒ 手动 Ctrl+Space 与 v73 的
+    #      补位路径 trigger(False) 都【绕过】它。补位那条尤其危险：它是先探到
+    #      "列表不可见"才发起的，而从那次探测到主线程真正执行 trigger 之间隔着
+    #      动作队列，VBE 的列表完全可能已经弹出来了 —— 补出来的窗就直接压在它上面。
+    #   b) yield_given_up 按 (模块, 行号) 记，一旦记上，这一行的【语法判据】就永久
+    #      跳过让位，只剩第二路兜着 —— 而第二路正是上面那条会自弱化的路。
+    #      现在"VBE 的列表确实可见"会把标记清掉，语法判据重新生效。
+    #
+    # 口径变更（用户 v76 明确表态）：VBE 的成员列表可见时我们的窗【直接消失】，
+    # 不分手动/自动 —— 成员列表本身就是一份候选列表，它在屏幕上时用户的目的已经
+    # 达到，再挂着我们的（topmost）只会把它整个盖住。
+    # ==================================================================
+    print("\n=== 53. v76：让位不区分触发来源；VBE 列表真在就清「已放弃」 ===")
+    try:
+        import vba_builtins as VB53
+        import ui as UI53
+
+        _POOL53 = [(n, "VBA", None, False) for n in VB53.BUILTIN_FUNCTIONS]
+        _bl53 = set(r[0].lower() for r in _POOL53)
+
+        class _B53(object):
+            """桩后端：成员列表可见性（yld）可随时切，位置由 line_text 决定。"""
+
+            def __init__(self, line_text="    .Si", caret_col=None,
+                         line_no=1, module="模块1", yld=False):
+                self._lt = line_text
+                self._cc = (caret_col if caret_col is not None
+                            else len(line_text) + 1)
+                self._ln = line_no
+                self._mod = module
+                self._yld = yld
+
+            def set_yield(self, yld):
+                self._yld = yld
+
+            def get_context(self):
+                return {"line_no": self._ln, "line_text": self._lt,
+                        "caret_col": self._cc, "in_string": False,
+                        "in_comment": False, "in_type_position": False,
+                        "in_decl_position": False, "decl_names": [],
+                        "proc_name": None, "module_name": self._mod}
+
+            def get_identifiers(self):
+                return list(_POOL53)
+
+            def get_declared_names(self):
+                return []
+
+            def declared_elsewhere(self, name, module_name):
+                return False
+
+            def get_structural_names(self):
+                return []
+
+            def get_builtin_names(self):
+                return set(_bl53)
+
+            def get_type_names(self):
+                return []
+
+            def get_host_enum_names(self):
+                return {}
+
+            def names_outside_caret(self, caret, scope_only=False):
+                return set()
+
+            def apply_completion(self, *a, **k):
+                return None
+
+            # 只表达【成员列表】语义（v65）：参数信息不参与让位
+            def vbe_yield_visible(self):
+                return self._yld
+
+            def vbe_popup_visible(self):
+                return self._yld
+
+            def vbe_popup_info(self):
+                return [("NameListWndClass", 120, 90)] if self._yld else []
+
+        class _UI53(object):
+            def __init__(self):
+                self.shown = False
+                self.hides = 0
+
+            def show(self, rows, sel, c):
+                self.shown = True
+
+            def hide(self):
+                self.shown = False
+                self.hides += 1
+
+            def update_selection(self, sel):
+                pass
+
+            def contains_point(self, x, y):
+                return False
+
+        def _mk53(line_text="    .Si", yld=False):
+            _be = _B53(line_text=line_text, yld=yld)
+            _ui = _UI53()
+            return E.Completer(_be, _ui), _be, _ui
+
+        # 53.1 基础不变式：语法位置 + 列表不可见 + 自动触发 -> 待定让位（v73）
+        _c53, _b53, _u53 = _mk53(yld=False)
+        _c53.trigger(True)
+        check("53.1 语法位置 + 列表不可见 + 自动触发 -> 待定让位（不弹）",
+              [len(_c53.matches or []) == 0, _c53.yield_pending is not None],
+              expect_contain=[True, True])
+
+        # 53.2 列表可见 + 自动触发 -> 让位
+        _c53, _b53, _u53 = _mk53(yld=True)
+        _c53.trigger(True)
+        check("53.2 成员列表可见 + 自动触发 -> 让位（不弹）",
+              [len(_c53.matches or []) == 0, _u53.hides > 0],
+              expect_contain=[True, True])
+
+        # 53.3 ★口径变更：手动 Ctrl+Space 同样让位
+        _c53, _b53, _u53 = _mk53(yld=True)
+        _c53.trigger(False)
+        check("53.3 ★v76 成员列表可见 + 手动 Ctrl+Space -> 同样让位"
+              "（不再区分触发来源）",
+              [len(_c53.matches or []) == 0, _u53.hides > 0],
+              expect_contain=[True, True])
+
+        # 53.4 ★★补位路径（trigger(False)）也受这条判据约束 —— 那个时序缝
+        _c53, _b53, _u53 = _mk53(line_text="    freeNa", yld=True)
+        _c53.trigger(False)
+        check("53.4 ★★v73 补位路径 trigger(False) + 列表可见 -> 也让位"
+              "（补出来的窗不许压住 VBE 的列表）",
+              [len(_c53.matches or []) == 0, _u53.hides > 0],
+              expect_contain=[True, True])
+
+        # 53.5 对照：列表不可见 + 手动 -> 照弹（挡它的确实是"可见"）
+        _c53, _b53, _u53 = _mk53(line_text="    .Si", yld=False)
+        _c53.trigger(False)
+        check("53.5 对照：列表不可见 + 手动 -> 照弹（%d 条）"
+              % len(_c53.matches or []),
+              [len(_c53.matches or []) > 0, _u53.shown],
+              expect_contain=[True, True])
+
+        # 53.6 ★VBE 的列表确实在 -> 清掉"此处已放弃让位"的标记
+        _c53, _b53, _u53 = _mk53(yld=False)
+        _c53.trigger(True)                  # 先让位（挂 pending）
+        _r536 = _c53.confirm_yield(False)   # VBE 没弹 -> 记 given_up
+        _gu536 = _c53.yield_given_up
+        _b53.set_yield(True)                # VBE 的列表随后真的出现了
+        _u53.hides = 0
+        _c53.trigger(True)
+        check("53.6 ★VBE 列表确实可见 -> 清掉「已放弃让位」标记并让位"
+              "（语法判据重新生效，不必再依赖探测）",
+              [_r536 is False, _gu536 is not None,
+               _c53.yield_given_up is None,
+               len(_c53.matches or []) == 0, _u53.hides > 0],
+              expect_contain=[True, True, True, True, True])
+
+        # 53.7 对照：列表不可见时标记不许被乱清
+        _c53, _b53, _u53 = _mk53(yld=False)
+        _c53.trigger(True)
+        _c53.confirm_yield(False)
+        _gu537 = _c53.yield_given_up
+        _c53.trigger(True)
+        check("53.7 对照：列表仍不可见 -> 「已放弃让位」标记保持不变",
+              [_gu537 is not None, _c53.yield_given_up == _gu537],
+              expect_contain=[True, True])
+
+        # 53.8 源码护栏：那条窗口判据不许再挂回 require_ident_before_caret
+        _root53 = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        _esrc53 = ""
+        try:
+            _esrc53 = open(os.path.join(_root53, "engine.py"),
+                           encoding="utf-8").read()
+        except Exception:
+            _esrc53 = ""
+        check("53.8 ★源码护栏：窗口可见性判据不依赖触发来源"
+              "（写回 require_ident_before_caret 就会挂）",
+              ["if YIELD_TO_VBE_LIST and self._vbe_popup_showing():" in _esrc53,
+               "require_ident_before_caret and YIELD_TO_VBE_LIST" in _esrc53],
+              expect_contain=[True, True])
+
+        # 53.9 main.py：兜底不分手动 + 轨迹日志在 _LOG_ENABLED 里
+        _msrc53 = ""
+        try:
+            _msrc53 = open(os.path.join(_root53, "main.py"),
+                           encoding="utf-8").read()
+        except Exception:
+            _msrc53 = ""
+        check("53.9 接线护栏：poll 兜底不分手动、仍认 VBE_YIELD_CLASSES；"
+              "trace 日志被 _LOG_ENABLED 包住、几何取 popup.geometry_now()",
+              ['if not state.get("popup_manual") and any(' not in _msrc53,
+               "VBE_YIELD_CLASSES" in _msrc53,
+               "if _LOG_ENABLED:" in _msrc53,
+               "popup.geometry_now()" in _msrc53],
+              expect_contain=[True, True, True, True])
+
+        # 53.10 ui.Popup.geometry_now：只读，拿不到一律 None
+        class _FW53(object):
+            def __init__(self, state="normal"):
+                self._st = state
+
+            def state(self):
+                return self._st
+
+            def winfo_x(self):
+                return 10
+
+            def winfo_y(self):
+                return 20
+
+            def winfo_width(self):
+                return 200
+
+            def winfo_height(self):
+                return 90
+
+        _p53 = UI53.Popup.__new__(UI53.Popup)
+        _p53.win = None
+        _g_none = _p53.geometry_now()
+        _p53.win = _FW53("withdrawn")
+        _g_wd = _p53.geometry_now()
+        _p53.win = _FW53("normal")
+        _g_ok = _p53.geometry_now()
+        check("53.10 geometry_now：没有窗 / 已收起 -> None；正常 -> 实际几何",
+              [_g_none is None, _g_wd is None, _g_ok == (10, 20, 200, 90)],
+              expect_contain=[True, True, True])
+    except Exception as _e53:
+        check("第 53 节异常: %s" % _e53, [True], expect_contain=[False])
 
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))

@@ -73,6 +73,7 @@ import vbe_bridge
 from vbe_bridge import VbeBackend, com_backoff_remaining
 from ui import Popup, MAX_VISIBLE_ROWS
 from log import log as _log, log_boot as _log_boot
+from log import LOG_ENABLED as _LOG_ENABLED
 
 
 # ---------------- Windows 虚拟键码 ----------------
@@ -1036,6 +1037,31 @@ def main():
                 state["_popup_sig"] = _sig
             except Exception:
                 _sig, _sig_changed = (), False
+            # 【v76】状态轨迹：只在开日志时产生，且只在状态【真的变化】时写一行。
+            #
+            # 排查"VBE 的成员列表和我们候选窗冲突"这类问题时，下面三件事必须能一眼
+            # 分开，否则只能靠猜：
+            #   * VBE提示窗=()     -> 根本没探到提示窗（句柄缓存 / 类名 / 宿主 PID）
+            #   * 手动=True        -> Ctrl+Space 的标记还挂着（v72 起它会让兜底跳过让位）
+            #   * 两者几何明明相交 -> 窗不知道自己叠着（避让/自愈那一侧的问题）
+            # 注意：取几何是额外几次只读调用，所以必须用 _LOG_ENABLED 包住。
+            if _LOG_ENABLED:
+                try:
+                    _trace = (completer.is_visible(),
+                              state.get("popup_manual"),
+                              bool(completer.yield_pending),
+                              completer.yield_given_up,
+                              _sig,
+                              popup.geometry_now() if completer.is_visible()
+                              else None)
+                    if _trace != state.get("_trace"):
+                        state["_trace"] = _trace
+                        _log("poll: trace 候选窗可见=%r 手动=%r 待定让位=%r"
+                             " 已放弃让位=%r 候选窗几何=%r VBE提示窗=%r"
+                             % (_trace[0], _trace[1], _trace[2], _trace[3],
+                                _trace[5], _trace[4]))
+                except Exception:
+                    pass
             # v64：候选窗只允许活在"焦点真在代码窗格"的时候。焦点一旦落到属性
             # 窗口 / 工程窗口 / 窗体设计器（都不是写代码的地方），立刻收起 ——
             # 否则它会继续挂在那些工作区里，而且 Tab / ↑ / ↓ 还会被我们吞掉、
@@ -1058,11 +1084,20 @@ def main():
                     # `.成员`；这里兜的是它预测不到的路径（输入法、粘贴、
                     # 超大模块，以及 VBE 自己在别处弹的列表）。判据只有一条：
                     # **VBE 的列表真的画在屏幕上了**。
-                    # 手动 Ctrl+Space 唤出的窗不在此列 —— 那是用户点名要的。
-                    if not state.get("popup_manual") and any(
-                            c in vbe_bridge.VBE_YIELD_CLASSES
-                            for (c, _l, _t, _r, _b) in _sig):
-                        _log("poll: VBE 成员列表出现 %r -> 让位" % (_sig,))
+                    #
+                    # 【v76】不再区分"手动唤出"。用户口径（原话）："VBE 的弹窗和
+                    # 我们项目弹窗冲突时，屏蔽我们项目弹窗……直接消失让位。"
+                    #
+                    # v72 当初加 popup_manual 是为了防"按了 Ctrl+Space 却没反应"，
+                    # 而那个担心只在【VBE 列表不在】时才成立 —— 那种情况下下面这个
+                    # any(...) 本来就是 False，压根走不到 hide。所以去掉这个前置
+                    # 条件不会把 v72 的问题带回来；反过来，VBE 的成员列表本身就是
+                    # 一份候选列表，它画在屏幕上时用户的目的已经达到，这时候还挂着
+                    # 我们的窗（topmost）只会把它整个盖住。
+                    if any(c in vbe_bridge.VBE_YIELD_CLASSES
+                           for (c, _l, _t, _r, _b) in _sig):
+                        _log("poll: VBE 成员列表出现 %r -> 让位 (手动=%r)"
+                             % (_sig, state.get("popup_manual")))
                         post(completer.hide)
                     else:
                         # 两条判据任一命中就重摆（都不命中则什么都不做 ——
