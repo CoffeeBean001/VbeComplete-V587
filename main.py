@@ -150,6 +150,31 @@ def send_char(ch):
         return False
 
 
+def send_vk(vk):
+    """把一个【虚拟键】原样"还给"系统（keydown+keyup）。
+
+    只用于兜底：Shift+↑/↓（跳出候选列表并移动光标）那一下已经被我们吞了，
+    而对应的 COM 动作没能落成（Excel 正忙 / 代理失效）。此时必须让这一下按键
+    真的发生 —— 绝不能"吞掉按键却什么都没发生"（v57 的老规矩）。
+    注入的事件带 LLKHF_INJECTED，钩子会放行，不会自己截自己。
+    """
+    try:
+        evts = (_INPUT * 2)()
+        for i, flags in enumerate((0, KEYEVENTF_KEYUP)):
+            e = evts[i]
+            e.type = INPUT_KEYBOARD
+            e.u.ki.wVk = int(vk)
+            e.u.ki.wScan = 0
+            e.u.ki.dwFlags = flags
+            e.u.ki.time = 0
+            e.u.ki.dwExtraInfo = 0
+        n = ctypes.windll.user32.SendInput(
+            2, ctypes.byref(evts), ctypes.sizeof(_INPUT))
+        return int(n) == 2
+    except Exception:
+        return False
+
+
 def _is_newline_shortcut(vk, shift_down):
     """Shift+Enter 是否应触发"在当前行下方新起一行"（纯判断，便于单测）。
 
@@ -157,6 +182,16 @@ def _is_newline_shortcut(vk, shift_down):
     VK_RETURN，因此与主键盘一视同仁。
     """
     return vk == VK_RETURN and bool(shift_down)
+
+
+def _is_line_nav_shortcut(vk, shift_down):
+    """Shift+↑ / Shift+↓ 是否应触发"跳出候选列表 + 光标上/下移一行"（纯判断）。
+
+    v78：只认 ↑/↓ 这两个导航键 + Shift 按住。**必须在"在列表里选词"那条
+    分支之前判**，否则 Shift+↑ 会被当成普通 ↑ 去列表里选词 —— 那就又回到
+    用户抱怨的"没法把光标移到上下行"了。
+    """
+    return vk in NAV_VKS and bool(shift_down)
 
 
 def _pair_char_for_key(vk, shift_down):
@@ -224,6 +259,22 @@ DISMISS_VKS = (VK_LEFT, VK_RIGHT)
 # 确认键：**只用 Tab**。
 # 回车刻意不确认——回车在 VBE 里是换行，误触发代价太大（用户要求去掉）。
 CONFIRM_VKS = (VK_TAB,)
+
+# 候选窗可见时，Shift+↑ / Shift+↓ = **跳出候选列表**，把光标上/下移一行（v78）。
+#
+# 用户口径：「当提示词列表框出现的时候，按 ↑↓ 会一直在列表框选词，不能将光标
+# 移动上下行。帮我新增 Shift+↑，可以跳出列表框，并将光标上移一行；Shift+↓ 同理。」
+#
+# 为什么不用"放行按键让 VBE 自己动光标"：VBE 原生的 Shift+↑/↓ 是**扩展选区**
+# （按住 Shift 按一下会把上一行整行选进去），并不是"光标干净地上移一行"。所以
+# 这里由我们吞键 + 用 COM 落光标，见 VbeBackend.move_caret_line。
+# 想关掉（Shift+↑/↓ 原样交给 VBE，即原生"扩展选区"）：
+#   set VBECOMPLETE_NO_SHIFT_NAV=1
+try:
+    SHIFT_NAV_JUMP = (os.environ.get("VBECOMPLETE_NO_SHIFT_NAV",
+                                     "0").strip() != "1")
+except Exception:
+    SHIFT_NAV_JUMP = True
 
 # 弹窗可见时这些键由 win32_filter 接管（↑/↓ 导航、Tab 确认、Esc 取消），
 # 且会被 suppress_event() 吞掉。on_press 里绝不能抢先收起弹窗，否则"按方向键
@@ -601,6 +652,27 @@ def main():
         except Exception:
             pass
 
+    def _move_caret_here(delta):
+        """Shift+↑/↓（候选窗可见时）：收起我们的窗，光标上/下移一行（v78）。
+
+        顺序与 _new_line_here 一致：先收窗（光标要换行了，列表留着没意义），
+        再用 COM 落光标。COM 没落成（Excel 正忙 / 代理临时失效）就把这一下按键
+        原样还给系统 —— 绝不"吞掉按键却什么都没发生"；代价是那一下退化成 VBE
+        原生的 Shift+↑/↓（扩展选区）。
+        """
+        try:
+            completer.hide()
+        except Exception:
+            pass
+        _ok = False
+        try:
+            _ok = backend.move_caret_line(delta)
+        except Exception:
+            _ok = False
+        if not _ok:
+            _log("navline: COM 未落成 -> 按键原样还给系统 (delta=%d)" % delta)
+            send_vk(VK_UP if delta < 0 else VK_DOWN)
+
     def _auto_pair_here(ch):
         """自动配对（`(` -> `()`、`"` -> `""`、右半边已存在则跨过去）。
 
@@ -701,6 +773,19 @@ def main():
                     elif vk == VK_ESCAPE:
                         action = (completer.hide, ())
                         suppress = True
+                    elif _is_line_nav_shortcut(vk, _shift_down()):
+                        # v78：Shift+↑/↓ = 跳出候选列表 + 光标上/下移一行。
+                        # 刻意【不】走下面的"在列表里选词"分支 —— 这正是用户要的
+                        # "跳出列表框"的手感。按键由我们接管（COM 落光标），因为
+                        # VBE 原生的 Shift+↑/↓ 是扩展选区、不是单纯移动光标。
+                        # 开关关掉（或 COM 退避中）则不吞键：原样交给 VBE。
+                        if (SHIFT_NAV_JUMP
+                                and com_backoff_remaining() <= 0
+                                and in_vbe_code_area()):
+                            post(completer.hide)
+                            action = (_move_caret_here,
+                                      (-1 if vk == VK_UP else 1,))
+                            suppress = True
                     elif vk in NAV_VKS:
                         action = (completer.move, (-1 if vk == VK_UP else 1,))
                         suppress = True

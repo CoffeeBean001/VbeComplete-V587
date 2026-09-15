@@ -7410,6 +7410,126 @@ def main():
     except Exception as _e54:
         check("第 54 节异常: %s" % _e54, [True], expect_contain=[False])
 
+    # ---- 55. v78：Shift+↑/↓ 跳出候选列表 + 光标上/下移一行 ----
+    #
+    # 用户口径：「当提示词列表框出现的时候，按 ↑↓ 会一直在列表框选词，不能将
+    # 光标移动上下行。帮我新增按 Shift+↑，可以跳出我们项目的提示词列表框，并将
+    # 光标上移一行；Shift+↓ 同理。」
+    #
+    # 两个关键决定，都由断言守着：
+    #   1) 不用"放行按键让 VBE 自己动光标" —— VBE 原生的 Shift+↑/↓ 是【扩展选区】
+    #      （把上一行整行选进去），不是"光标干净地上移一行"。所以由我们吞键 +
+    #      用 COM 落光标（VbeBackend.move_caret_line）。
+    #   2) 判据必须排在"在列表里选词"那条分支【之前】，否则 Shift+↑ 又被当成
+    #      普通 ↑ 去列表里选词 —— 那就完全没解决问题（55.6 钉着这个次序）。
+    print("\n=== 55. Shift+↑/↓ 跳出候选列表并移动光标（v78）===")
+    try:
+        import main as M55
+        import vbe_bridge as VB55
+        _orig55 = VB55._get_vbe_cached
+
+        # ---- 55.1 纯判断：只认 ↑/↓ + Shift 按住 ----
+        check("55.1 _is_line_nav_shortcut：Shift+↑/↓ 认；裸 ↑、Shift+Enter、"
+              "Shift+←、Shift 没按都不认",
+              [M55._is_line_nav_shortcut(M55.VK_UP, True),
+               M55._is_line_nav_shortcut(M55.VK_DOWN, True),
+               M55._is_line_nav_shortcut(M55.VK_UP, False),
+               M55._is_line_nav_shortcut(M55.VK_RETURN, True),
+               M55._is_line_nav_shortcut(M55.VK_LEFT, True),
+               M55._is_line_nav_shortcut(M55.VK_DOWN, 0)],
+              expect_contain=[True, True, False, False, False, False])
+
+        class _CM55(object):
+            def __init__(self, lines):
+                self.lines = list(lines)
+                self.Name = "Module1"
+
+            @property
+            def CountOfLines(self):
+                return len(self.lines)
+
+            def Lines(self, start, count):
+                s0 = max(0, int(start) - 1)
+                return "".join(l + "\n"
+                               for l in self.lines[s0:s0 + int(count)])
+
+        class _Pane55(object):
+            def __init__(self, cm, sel):
+                self.CodeModule = cm
+                self.sel = tuple(sel)
+
+            def GetSelection(self):
+                return self.sel
+
+            def SetSelection(self, sl, sc, el, ec):
+                self.sel = (sl, sc, el, ec)
+
+        class _VBE55(object):
+            def __init__(self, pane):
+                self.ActiveCodePane = pane
+
+        def _mv55(lines, sel, delta):
+            cm55 = _CM55(lines)
+            pane55 = _Pane55(cm55, sel)
+            VB55._get_vbe_cached = lambda: _VBE55(pane55)
+            ok55 = VB55.VbeBackend().move_caret_line(delta)
+            return ok55, cm55.lines, pane55.sel
+
+        _SRC55 = ["Sub Foo()", "    Dim x", "    x = 1 + 2", "End Sub"]
+
+        # ---- 55.2/55.3 下移 / 上移一行（同列，且不碰文本）----
+        _ok55d, _ls55d, _sel55d = _mv55(_SRC55, (2, 9, 2, 9), 1)
+        _ok55u, _ls55u, _sel55u = _mv55(_SRC55, (3, 9, 3, 9), -1)
+        check("55.2 下移一行：光标 (2,9) -> (3,9)，同列、文本一动不动",
+              [_ok55d, _sel55d, _ls55d],
+              expect_contain=[True, (3, 9, 3, 9), _SRC55])
+        check("55.3 上移一行：光标 (3,9) -> (2,9)，同列、文本一动不动",
+              [_ok55u, _sel55u, _ls55u],
+              expect_contain=[True, (2, 9, 2, 9), _SRC55])
+
+        # ---- 55.4 越界 / 无 VBE 一律 False（调用方据此【不吞键】）----
+        _b55 = []
+        _b55.append(_mv55(_SRC55, (1, 1, 1, 1), -1)[0])     # 首行再上移
+        _b55.append(_mv55(_SRC55, (4, 8, 4, 8), 1)[0])      # 末行再下移
+        _b55.append(_mv55(_SRC55, (0, 0, 0, 0), 1)[0])      # 行号 0（空模块）
+        VB55._get_vbe_cached = lambda: None
+        _b55.append(VB55.VbeBackend().move_caret_line(1))
+        VB55._get_vbe_cached = lambda: _VBE55(None)
+        _b55.append(VB55.VbeBackend().move_caret_line(1))
+        check("55.4 首行上移 / 末行下移 / 行号 0 / 无 VBE / 无代码窗 -> 全 False",
+              [_b55], expect_contain=[[False] * 5])
+
+        # ---- 55.5 反向选择时以【活动端】为基准（选中框的另一头不算）----
+        _ok55r, _ls55r, _sel55r = _mv55(_SRC55, (4, 3, 2, 7), -1)
+        check("55.5 反向选区（sl=4 > el=2）以 (4,3) 为基准 -> 上移到 (3,3)",
+              [_ok55r, _sel55r], expect_contain=[True, (3, 3, 3, 3)])
+
+        # ---- 55.6 ★接线护栏：次序 + 先收窗后落光标 + 兜底 + 开关 ----
+        _src55 = open(os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "main.py"), encoding="utf-8").read()
+        _i55_nav = _src55.index("elif _is_line_nav_shortcut(vk, _shift_down()):")
+        _i55_pick = _src55.index("elif vk in NAV_VKS:")
+        _i55_fn = _src55.index("def _move_caret_here(delta):")
+        _i55_mv = _src55.index("backend.move_caret_line(delta)")
+        check("55.6 ★接线护栏：Shift+↑/↓ 的判据排在「在列表里选词」之前；"
+              "先收窗再落光标；COM 没落成要走 send_vk 兜底；开关在",
+              [_i55_nav < _i55_pick,
+               "completer.hide()" in _src55[_i55_fn:_i55_mv],
+               _i55_fn < _i55_mv,
+               "send_vk(VK_UP if delta < 0 else VK_DOWN)" in _src55,
+               'os.environ.get("VBECOMPLETE_NO_SHIFT_NAV"' in _src55,
+               "SHIFT_NAV_JUMP" in _src55],
+              expect_contain=[True] * 6)
+
+        # ---- 55.7 出厂默认：这个接管是开着的 ----
+        check("55.7 ★出厂默认：Shift+↑/↓ 接管开着（VBECOMPLETE_NO_SHIFT_NAV 未设）",
+              [M55.SHIFT_NAV_JUMP], expect_contain=[True])
+
+        VB55._get_vbe_cached = _orig55
+    except Exception as _e55:
+        check("第 55 节异常: %s" % _e55, [True], expect_contain=[False])
+
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))
     if FAILURES:

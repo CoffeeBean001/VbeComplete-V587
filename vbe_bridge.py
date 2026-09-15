@@ -2611,3 +2611,44 @@ class VbeBackend:
             # 与 apply_completion 同理：写过代码（VBAProject 变脏），立刻放开
             # 手里的 COM 代理，别拖住 Excel 的退出/写回。
             _release_vbe_proxy()
+
+    # ---- 按行移动光标（Shift+↑ / Shift+↓） ----
+    def move_caret_line(self, delta):
+        """把代码窗光标上（delta<0）/ 下（delta>0）移 delta 行，尽量保持同一列。
+
+        【为什么不用"放行按键让 VBE 自己动光标"】VBE 里 Shift+↑ / Shift+↓ 的
+        原生语义是**扩展选区**——按住 Shift 按一下会把上一行整行选进去，光标
+        并没"干净地"上移一行。v78 用户口径是"跳出候选列表，并把光标上移 /
+        下移一行"，所以这里由我们用 COM 直接落光标，那一对按键由调用方吞掉。
+
+        列刻意沿用 GetSelection 给的列值原样透传：VBE 的列与 SetSelection 的列
+        是同一套语义（显示列，Tab 展开），因此同一列值就是"同一视觉列"；目标
+        行较短时由 VBE 自己钳到行尾（不在这里做字符数换算，避免 Tab 行算错）。
+
+        成功返回 True；取不到 COM / 光标行无效 / 目标行越界 / 出任何异常都返回
+        False —— 调用方据此把这一下按键原样还给系统，绝不吞掉用户的按键。
+        """
+        try:
+            vbe = _get_vbe_cached()
+            if vbe is None:
+                return False
+            cp = vbe.ActiveCodePane
+            if cp is None:
+                return False
+            cm = cp.CodeModule
+            sl, sc, el, ec = cp.GetSelection()
+            # 光标在选区的【活动端】：正向选择在 (el, ec)，反向选择在 (sl, sc)。
+            if int(el) >= int(sl):
+                line, col = int(el), int(ec)
+            else:
+                line, col = int(sl), int(sc)
+            target = line + int(delta)
+            if line <= 0 or target <= 0 or target > int(cm.CountOfLines):
+                return False
+            cp.SetSelection(target, col, target, col)
+            return True
+        except Exception:
+            return False
+        finally:
+            # 与 new_line_below 同理：立刻放开手里的 COM 代理，别拖住 Excel 退出。
+            _release_vbe_proxy()
