@@ -1016,6 +1016,26 @@ def main():
         VBE 不可用时 snapshot() 返回 None，自然退化为空转。
         """
         try:
+            # v74：提示窗签名【每轮都采样】，不再"只在候选窗可见时采"。
+            #
+            # v66 起这句是写在 if completer.is_visible() 里面的。于是候选窗
+            # 不可见期间发生的任何变化（VBE 弹出/收起签名窗）都不会被记录 ——
+            # 下次候选窗弹出时，签名可能恰好等于那个【陈旧】的缓存值，后面那句
+            # `_sig != _popup_sig` 便永远看不见这次变化 ⇒ 候选窗一直压在签名窗
+            # 上，直到用户自己挪光标。用户报的「instr 参数信息很长、与我们候选
+            # 窗重叠」走的就是这条路：先在实参里打出候选（签名窗在 ⇒ 缓存记下
+            # 它），随后删字重打（中途候选窗收起，缓存不动），签名窗在同一位置
+            # 重新出现 —— 签名没变，"变化检测"瞎了。
+            #
+            # 代价可忽略：提示窗句柄是缓存好的，一轮只是几次只读 Win32 调用
+            # （FindWindow + IsWindowVisible + GetWindowRect），量级远小于同
+            # 一轮里 backend.snapshot() 那次 COM 读取。
+            try:
+                _sig = tuple(vbe_bridge.vbe_popup_rects())
+                _sig_changed = _sig != state.get("_popup_sig")
+                state["_popup_sig"] = _sig
+            except Exception:
+                _sig, _sig_changed = (), False
             # v64：候选窗只允许活在"焦点真在代码窗格"的时候。焦点一旦落到属性
             # 窗口 / 工程窗口 / 窗体设计器（都不是写代码的地方），立刻收起 ——
             # 否则它会继续挂在那些工作区里，而且 Tab / ↑ / ↓ 还会被我们吞掉、
@@ -1028,31 +1048,36 @@ def main():
                 except Exception:
                     pass
                 # v66：候选窗挂着的时候，VBE 随时可能弹出/收起【参数信息】窗
-                # （形参签名）—— 它就在光标正下方，与我们默认的位置重叠。这里
-                # 盯着提示窗的矩形变化：一变就让候选窗重新摆放（下移到签名下方、
-                # 或签名收起后回到原位）。
-                #   只在候选窗可见时探测（正常打字路径零开销），且矩形没变就
-                #   什么都不做 —— 不会周期性重设 geometry 造成闪烁。
+                # （形参签名）—— 它就在光标正下方，与我们默认的位置重叠，要让开。
                 try:
-                    _sig = tuple(vbe_bridge.vbe_popup_rects())
-                    if _sig != state.get("_popup_sig"):
-                        state["_popup_sig"] = _sig
-                        # v72 兜底：冒出来的是 VBE 的【成员列表】时，要做的不是
-                        # "挪开"而是"整个让位" —— 它和我们同质（也是一份候选
-                        # 列表，也吃 Tab / ↑ / ↓ / Enter），叠在一起既遮挡又抢
-                        # 键盘。语法判据（engine.vbe_list_expected）已经在 VBE
-                        # 弹窗之前拦住了 `对象.` / `As` / `New` / With 块的
-                        # `.成员`；这里兜的是它预测不到的路径（输入法、粘贴、
-                        # 超大模块，以及 VBE 自己在别处弹的列表）。判据只有一条：
-                        # **VBE 的列表真的画在屏幕上了**。
-                        # 手动 Ctrl+Space 唤出的窗不在此列 —— 那是用户点名要的。
-                        if not state.get("popup_manual") and any(
-                                c in vbe_bridge.VBE_YIELD_CLASSES
-                                for (c, _l, _t, _r, _b) in _sig):
-                            _log("poll: VBE 成员列表出现 %r -> 让位" % (_sig,))
-                            post(completer.hide)
-                        else:
-                            _log("poll: 提示窗矩形变化 %r -> 重摆候选窗" % (_sig,))
+                    # v72 兜底：冒出来的是 VBE 的【成员列表】时，要做的不是
+                    # "挪开"而是"整个让位" —— 它和我们同质（也是一份候选
+                    # 列表，也吃 Tab / ↑ / ↓ / Enter），叠在一起既遮挡又抢
+                    # 键盘。语法判据（engine.vbe_list_expected）已经在 VBE
+                    # 弹窗之前拦住了 `对象.` / `As` / `New` / With 块的
+                    # `.成员`；这里兜的是它预测不到的路径（输入法、粘贴、
+                    # 超大模块，以及 VBE 自己在别处弹的列表）。判据只有一条：
+                    # **VBE 的列表真的画在屏幕上了**。
+                    # 手动 Ctrl+Space 唤出的窗不在此列 —— 那是用户点名要的。
+                    if not state.get("popup_manual") and any(
+                            c in vbe_bridge.VBE_YIELD_CLASSES
+                            for (c, _l, _t, _r, _b) in _sig):
+                        _log("poll: VBE 成员列表出现 %r -> 让位" % (_sig,))
+                        post(completer.hide)
+                    else:
+                        # 两条判据任一命中就重摆（都不命中则什么都不做 ——
+                        # 不会周期性重设 geometry 造成闪烁）：
+                        #   * 签名变化  —— 事件驱动：签名窗刚出现 / 收起 / 换行；
+                        #   * 实测仍重叠 —— 状态自愈（v74）：兜住"事件漏了"的
+                        #     情况。只做几次矩形比较，拿不到几何一律 False。
+                        try:
+                            _clash = popup.clashes_with_popup()
+                        except Exception:
+                            _clash = False
+                        if _sig_changed or _clash:
+                            _log("poll: 重摆候选窗"
+                                 " (提示窗=%r 签名变化=%r 实测重叠=%r)"
+                                 % (_sig, _sig_changed, _clash))
                             # 注意调的是 UI（popup）而不是 completer：重摆是画布
                             # 的事，引擎那层没有这个方法。
                             post(popup.reposition)
@@ -1073,9 +1098,10 @@ def main():
             try:
                 _yp = completer.yield_pending
                 if _yp and time.time() >= _yp[0]:
+                    # 复用本轮开头采的那份签名 —— 同一 tick 内两处判据必须看
+                    # 同一时刻的窗口状态，别再探一次（v74）。
                     _ml = any(c in vbe_bridge.VBE_YIELD_CLASSES
-                              for (c, _l, _t, _r, _b)
-                              in vbe_bridge.vbe_popup_rects())
+                              for (c, _l, _t, _r, _b) in _sig)
                     if completer.confirm_yield(_ml):
                         _log("poll: 让位宽限到 -> VBE 列表在（或已离开该处），保持让位")
                     else:

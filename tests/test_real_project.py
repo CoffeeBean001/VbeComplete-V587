@@ -6390,6 +6390,190 @@ def main():
     except Exception as _e50:
         check("第 50 节异常: %s" % _e50, [True], expect_contain=[False])
 
+    # ==================================================================
+    # 51. v74：候选窗 × 参数信息窗重叠的【状态自愈】
+    #
+    # 用户报："instr 那个函数的参数信息比较长，与我们候选窗重叠了"（v66 修过，
+    # 又复现）。
+    #
+    # 根因不是避让算法 —— avoid_popup_rects 逐条验过没毛病（第 43 节守着它），
+    # 而是轮询的【变化检测】有个洞：提示窗矩形签名只在候选窗可见时采样，于是
+    # "候选窗不可见期间提示窗出现过、又回到同一位置"这件事永远不被记录 ——
+    # 下次候选窗弹出时签名恰好等于那个陈旧缓存值，`_sig != _popup_sig` 便看不见
+    # 变化，候选窗一直压在签名窗上，直到用户自己挪光标。
+    #
+    # 修法两条（互补，都要守）：
+    #   1) 签名【每轮都采】，与候选窗可见性无关 —— 堵住那个洞；
+    #   2) 加一道【状态检查】：叠着就重摆，压根不依赖"变没变"（自愈）。
+    # ==================================================================
+    print("\n=== 51. v74：候选窗 × 参数信息窗重叠的状态自愈 ===")
+    try:
+        import ui as UI51
+
+        # 51.1 "重叠"的定义只此一份（避让与自愈必须同一把尺子）
+        check("51.1 rect_overlap：真重叠 True；只共边 / 共点 / 分开都 False",
+              [[UI51.rect_overlap((0, 0, 10, 10), (5, 5, 15, 15)),
+                UI51.rect_overlap((0, 0, 10, 10), (10, 0, 20, 10)),
+                UI51.rect_overlap((0, 0, 10, 10), (10, 10, 20, 20)),
+                UI51.rect_overlap((0, 0, 10, 10), (20, 0, 30, 10))]],
+              expect_contain=[[True, False, False, False]])
+
+        # 51.2 clashes_with_popup：状态检查（不问变化，只问"现在叠着没有"）
+        check("51.2 clashes_with_popup：叠着 True / 没提示窗 False / 已躲开 False",
+              [[UI51.clashes_with_popup(100, 220, 200, 90, [(0, 220, 400, 240)]),
+                UI51.clashes_with_popup(100, 220, 200, 90, []),
+                UI51.clashes_with_popup(100, 242, 200, 90,
+                                        [(0, 220, 400, 240)])]],
+              expect_contain=[[True, False, False]])
+
+        # 51.3 真机那条长签名窗（探针实测 505x18 @ 1091,601）：避让后不叠，
+        #      且用【自愈判据】复核也是"不叠" —— 两条路径结论必须一致。
+        _tip51 = (1091, 601, 1596, 619)
+        _y51 = UI51.avoid_popup_rects(1368, 601, 250, 150, 583, 1080, [_tip51])
+        check("51.3 ★长签名窗 505x18：避让到 y=%d，自愈复核不叠（同一把尺子）"
+              % (_y51,),
+              [[_y51, UI51.clashes_with_popup(1368, _y51, 250, 150, [_tip51])]],
+              expect_contain=[[621, False]])
+
+        # 51.4 ★★用户场景复现：候选窗【先】落在 601（签名窗还没出现），随后
+        #      签名窗在【同一位置】出现 —— 变化检测看不见（签名与缓存相等），
+        #      但状态检查必须看见。这条就是修好的那个洞。
+        check("51.4 ★★陈旧签名 + 候选窗停在 601 -> 状态检查必须报「叠着」",
+              [UI51.clashes_with_popup(1368, 601, 250, 150, [_tip51])],
+              expect_contain=[True])
+
+        # 51.5~51.7 Popup.clashes_with_popup：拿窗口【当前实际几何】比对
+        class _FR51(object):
+            def winfo_screenwidth(self):
+                return 1920
+
+            def winfo_screenheight(self):
+                return 1080
+
+        class _FC51(object):
+            def cget(self, k):
+                return 200 if k == "width" else 90
+
+        class _FW51(object):
+            def __init__(self, state="normal"):
+                self._st = state
+
+            def state(self):
+                return self._st
+
+            def geometry(self, s):
+                pass
+
+            def winfo_x(self):
+                return 100
+
+            def winfo_y(self):
+                return 220
+
+            def winfo_width(self):
+                return 200
+
+            def winfo_height(self):
+                return 90
+
+        def _mk51(win):
+            p = UI51.Popup.__new__(UI51.Popup)
+            p.root, p.canvas, p.win = _FR51(), _FC51(), win
+            p._last_geom = None
+            return p
+
+        _o51rects = UI51.screen_popup_rects
+        try:
+            UI51.screen_popup_rects = lambda: [(0, 220, 400, 240)]
+            _c51 = _mk51(_FW51()).clashes_with_popup()
+            UI51.screen_popup_rects = lambda: []
+            _c51b = _mk51(_FW51()).clashes_with_popup()
+            _c51c = _mk51(_FW51("withdrawn")).clashes_with_popup()
+            _c51d = _mk51(None).clashes_with_popup()
+        finally:
+            UI51.screen_popup_rects = _o51rects
+        check("51.5 候选窗实际位置(100,220,200x90) × 签名窗 -> 报「叠着」",
+              [_c51], expect_contain=[True])
+        check("51.6 没有提示窗 / 已收起 / 没有窗 -> 一律 False（拿不准不动手）",
+              [[_c51b, _c51c, _c51d]],
+              expect_contain=[[False, False, False]])
+
+        # 51.8~51.11 main.py 接线护栏（轮询那段的结构性不变量）
+        _root51 = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+        def _read51(name):
+            try:
+                return open(os.path.join(_root51, name),
+                            encoding="utf-8").read()
+            except Exception:
+                return ""
+
+        _msrc51 = _read51("main.py")
+
+        def _fn51(text, name):
+            """把嵌套函数 name 的函数体从源码里抠出来（到下一个同级 def 为止）。"""
+            i = text.find("def %s(" % name)
+            if i < 0:
+                return ""
+            j = text.find("\n    def ", i + 1)
+            return text[i:j if j > 0 else len(text)]
+
+        _poll51 = _fn51(_msrc51, "poll_editor")
+        # 只看代码、不看注释 —— v74 的说明里就写着 "if completer.is_visible()"
+        # 这几个字，直接 find 会先命中注释（第一版测试就是这么写错的）。
+        _code51 = "\n".join(_l for _l in _poll51.splitlines()
+                            if not _l.lstrip().startswith("#"))
+        _i_sig51 = _code51.find("_sig = tuple(vbe_bridge.vbe_popup_rects())")
+        _i_set51 = _code51.find('state["_popup_sig"] = _sig')
+        _i_vis51 = _code51.find("if completer.is_visible():")
+        check("51.8 ★签名采样与落缓存都在【可见性判断之前】（无条件采样 —— 洞就堵在这）",
+              [[_i_sig51 >= 0, _i_set51 >= 0, _i_vis51 >= 0,
+                _i_sig51 < _i_vis51, _i_set51 < _i_vis51]],
+              expect_contain=[[True, True, True, True, True]])
+
+        check("51.9 ★接线：重叠时调 popup.clashes_with_popup() 触发重摆",
+              [[_poll51.count("popup.clashes_with_popup()") == 1,
+                "post(popup.reposition)" in _poll51,
+                "_sig_changed or _clash" in _poll51]],
+              expect_contain=[[True, True, True]])
+
+        check("51.10 同一 tick 内两处判据共用一份签名（不再各探一次）",
+              [[_msrc51.count("vbe_bridge.vbe_popup_rects()") == 1,
+                _poll51.count("vbe_bridge.vbe_popup_rects()") == 1,
+                "_sig)\n" in _poll51 or "in _sig)" in _poll51]],
+              expect_contain=[[True, True, True]])
+
+        check("51.11 Popup.clashes_with_popup 存在、可调用（reposition 的老位子旁边）",
+              [[callable(getattr(UI51.Popup, "clashes_with_popup", None)),
+                callable(getattr(UI51.Popup, "reposition", None)),
+                callable(getattr(UI51, "rect_overlap", None))]],
+              expect_contain=[[True, True, True]])
+
+        # 51.12 避让与自愈对同一批矩形必须给出一致结论（性质检查，随机 300 组）
+        import random as _rnd51
+        _bad51 = []
+        _g51 = _rnd51.Random(20260915)
+        for _ in range(300):
+            _b51 = _g51.randint(0, 300)
+            _x51 = _g51.randint(0, 600)
+            _y51b = _g51.randint(0, 700)
+            _m51 = _g51.randint(0, 400)
+            _r51 = [(_x51 - _g51.randint(0, 50), _y51b,
+                     _x51 + _g51.randint(0, 400), _y51b + 20)]
+            _new51 = UI51.avoid_popup_rects(_x51, _y51b, _m51, 90, 100,
+                                            1080, _r51)
+            # 避让说"躲开了"，自愈就不能说"还叠着"（除非真的贴底放不下）
+            if not UI51.clashes_with_popup(_x51, _new51, _m51, 90, _r51):
+                continue
+            if _new51 >= max(0, 1080 - 90) or _new51 < 0:
+                continue                    # 贴底/翻上方：确实无处可去
+            _bad51.append((_x51, _y51b, _new51))
+        check("51.12 ★避让后自愈复核：300 组随机矩形零反例（%d 组残留）"
+              % (len(_bad51),),
+              [len(_bad51)], expect_contain=[0])
+    except Exception as _e51:
+        check("第 51 节异常: %s" % _e51, [True], expect_contain=[False])
+
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))
     if FAILURES:

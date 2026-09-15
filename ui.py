@@ -185,6 +185,16 @@ def screen_popup_rects():
         return []
 
 
+def rect_overlap(a, b):
+    """两个 (左, 上, 右, 下) 矩形是否真的重叠（只共边/共点不算）。
+
+    纯函数。**"重叠"的定义只此一份** —— 避让（avoid_popup_rects）与事后自愈
+    判据（clashes_with_popup）必须用同一把尺子，否则会出现"避让觉得躲开了、
+    自愈觉得还叠着"这种自相矛盾（v74 抽出它就是为了防这个）。
+    """
+    return not (a[2] <= b[0] or a[0] >= b[2] or a[3] <= b[1] or a[1] >= b[3])
+
+
 def avoid_popup_rects(x, y, w, h, caret_top, screen_h, rects):
     """把候选窗的 y 往下挪到不与任何提示窗重叠；返回新的 y。
 
@@ -199,10 +209,8 @@ def avoid_popup_rects(x, y, w, h, caret_top, screen_h, rects):
     for _ in range(POPUP_TRY_MAX):
         moved = False
         for (l, t, r, b) in rects:
-            if r <= x or l >= x + w:
-                continue                    # 水平不相交
-            if b <= y or t >= y + h:
-                continue                    # 垂直不相交
+            if not rect_overlap((x, y, x + w, y + h), (l, t, r, b)):
+                continue
             y = b + POPUP_GAP               # 挪到它下面
             moved = True
         if not moved:
@@ -210,12 +218,27 @@ def avoid_popup_rects(x, y, w, h, caret_top, screen_h, rects):
     if y + h > screen_h:
         # 下移后超出屏幕底边 -> 翻到光标上方（提示窗在光标下方，上方一般不冲突）
         alt = caret_top - h - POPUP_GAP
-        clash = any(r > x and l < x + w and b > alt and t < alt + h
-                    for (l, t, r, b) in rects)
+        clash = any(rect_overlap((x, alt, x + w, alt + h), r) for r in rects)
         if alt >= 0 and not clash:
             return alt
         return max(0, screen_h - h)          # 实在放不下：贴屏幕底部
     return y
+
+
+def clashes_with_popup(x, y, w, h, rects):
+    """候选窗矩形 (x, y, w, h) 此刻是否正与某个提示窗重叠（v74）。
+
+    与 avoid_popup_rects 的分工：
+      * avoid_popup_rects 是【事件驱动】—— 提示窗出现/移动时把窗挪开；
+      * 本函数是【状态检查】—— 不问"变没变"，只问"现在叠着没有"。
+    为什么要两条：事件驱动依赖"矩形签名变化"这个信号，而那个信号可能被漏掉
+    （候选窗不可见期间提示窗出现过又回到原位，签名与陈旧缓存值相等 —— 见
+    main.py 轮询里的说明）。状态检查不受影响，叠着就修，自愈。
+    """
+    if not rects:
+        return False
+    me = (x, y, x + w, y + h)
+    return any(rect_overlap(me, r) for r in rects)
 
 
 class Popup:
@@ -751,6 +774,30 @@ class Popup:
             self._position()
         except Exception:
             pass
+
+    def clashes_with_popup(self):
+        """候选窗【当前实际位置】是否正与 VBE 的提示窗重叠（v74，供轮询自愈）。
+
+        与 _position 里的避让互补：避让由"提示窗出现了"这个事件触发，而事件
+        可能被漏掉（候选窗不可见期间提示窗出现过、又回到同一位置 —— 那时矩形
+        签名与缓存里的值相等，"变化检测"永远看不见它，候选窗就一直压在提示窗
+        上：用户报的「instr 参数信息很长、与候选窗重叠」正是这个洞）。
+        这里不看变化、只看状态，叠着就让调用方重摆 —— 漏一次事件也能自愈。
+
+        只读 tkinter 自己的几何 + 只读 Win32 的提示窗矩形，拿不到一律 False
+        （绝不让"拿不准"去打乱显示，v54 的教训）。
+        """
+        try:
+            if self.win is None or self.win.state() == "withdrawn":
+                return False
+            rects = screen_popup_rects()
+            if not rects:
+                return False
+            return clashes_with_popup(self.win.winfo_x(), self.win.winfo_y(),
+                                      self.win.winfo_width(),
+                                      self.win.winfo_height(), rects)
+        except Exception:
+            return False
 
     def update_selection(self, selected):
         self.root.after(0, self._update_selection, selected)
