@@ -680,6 +680,129 @@ def next_line_indent(cur_line, lines_above=(), unit="    "):
     return base + unit if opens_block(ref) else base
 
 
+# ── v81：块【内】分支行自动对齐（Else / ElseIf…Then / Case… / #Else / #ElseIf）
+# 用户口径："我在写了一行 if 之后，回车会自动缩进和补充 end if，然后我再写 else，
+# 此时的 else 是缩进状态，不能自动对齐上面的 if。我想在我打完 else，或 elseif
+# （if 里的多分支）再按回车后，else / elseif 能够自动对齐上方的 if。其他类似的结构，
+# 比如 select case，里面可以多分支的，都帮我做成这样能自动对齐的。"
+#
+# 为什么会歪：`Else` 是 _block_kind 认的块头（要缩进一级），所以这一下回车被我们
+# 接管了 —— 而 VBE 原生回车【会】把刚敲完的那一行拉回它该在的层级，我们一接管，
+# 那个自动对齐就没机会跑。于是 `Else` 一直停在"块体那一级"（上面自动补完 End If 后
+# 光标停的那一行）。这里补的正是这一下：回车时先把分支行拉回【它所属块头】的缩进，
+# 再让新行深一级 —— 就是 VBE 原生会做的那件事。
+#
+# 归属关系在 VBA 里没有歧义：Else / ElseIf…Then 属于最近的还开着的 `If … Then`，
+# Case… 属于最近的还开着的 `Select Case`，#Else / #ElseIf 属于最近的还开着的 `#If … Then`。
+_BRANCH_OWNER = {"else": "if", "elseif": "if", "case": "select"}
+# 条件编译的收尾。_BLOCK_CLOSERS 里刻意没收 `#If`（那个收尾必须由用户自己写），
+# 但"往上找还开着的 #If"这一步照样要用到它，所以单独放在这里。
+_DIRECTIVE_CLOSER = "#End If"
+
+
+def _directive_word(line_text):
+    """`#` 开头的条件编译指令的第一段（不含 `#`）：`#If VBA7 Then` -> 'if'。纯函数。"""
+    code = _code_part(line_text)
+    if not code:
+        return None
+    low = " ".join(code.lower().split())
+    if not low.startswith("#"):
+        return None
+    rest = low[1:].strip()
+    return rest.split(" ")[0] if rest else None
+
+
+def _branch_word(line_text):
+    """这一行是哪种【块内分支】？返回 'else' / 'elseif' / 'case'；不是 -> None。纯函数。
+
+    与 _block_kind 的 'branch' 一档严格对应（`#` 开头的条件编译分支返回同一个词，
+    调用方再按"有没有 `#`"决定去找哪类块头）：
+      * `Else` / `Case 1` / `Case Else` / `Case Is > 3` -> 'else' / 'case'；
+      * `ElseIf y Then`          -> 'elseif'（少了 Then 不算，与 _block_kind 同口径）；
+      * `Else If y Then`         -> 'else'   （VBA 里这是"Else + 一行新 If"，不是 ElseIf）；
+      * `End If` / `Next` / 普通行 / 续行（行尾 `_`）-> None。
+    """
+    code = _code_part(line_text)
+    if not code:
+        return None
+    if code.endswith("_"):
+        return None
+    low = " ".join(code.lower().split())
+    words = low.split(" ")
+    i = 0
+    while i < len(words) and words[i] in _MOD_FIRST_WORDS:
+        i += 1
+    first = words[i].lstrip("#") if i < len(words) else ""
+    if first == "elseif":
+        return "elseif" if _RE_TAIL_THEN.search(low) else None
+    if first in ("else", "case"):
+        return first
+    return None
+
+
+def _unclosed_owner_above(lines_above, kind):
+    """上方最近一个【还开着】的 kind 类块头在哪？返回它的行首空白；没有 -> None。纯函数。
+
+    lines_above: 当前行【上方】各行（越靠近它的越靠后）
+    kind:        'if' / 'select' / 'directive'（_block_kind 的口径）
+
+    括号配对法（与 _closer_owner_above 同一套思路，只是方向相反）：从近到远扫，
+    收尾（`End If` / `End Select` / `#End If`）计 +1，同类的块头计 -1；扫到
+    "count 已经是 0 的同类块头"，它就是这一档分支的归属者。
+
+    ⚠️ 为什么 `ElseIf` / `Else` 不算块头：它们和 `If` 共用同一个 `End If`，要是也
+    计一层，配平永远对不上（`If` / `Else` / `End If` 会配成 -2）。`_block_kind` 对
+    它们返回的是 'branch' 而不是 'if'，天然被跳过 —— 这正是这里必须用 `_block_kind`
+    而不是"行首是不是 If"来判的原因。
+    """
+    closer = _DIRECTIVE_CLOSER if kind == "directive" else _BLOCK_CLOSERS.get(kind)
+    if not closer:
+        return None
+    depth = 0
+    for raw in reversed(list(lines_above or ())):
+        if not (raw or "").strip():
+            continue
+        if _is_closer_text(raw, closer):
+            depth += 1
+            continue
+        if kind == "directive":
+            # 条件编译：只有 `#If … Then` 开一层；`#Else` / `#ElseIf` 是兄弟分支，
+            # 别的指令（`#Const` / `Option …` 之类）一律不看。
+            if _directive_word(raw) != "if":
+                continue
+        elif _block_kind(raw) != kind:
+            continue
+        if depth == 0:
+            return _leading_ws(raw)
+        depth -= 1
+    return None
+
+
+def branch_align(line_text, lines_above, unit="    "):
+    """块内分支行该对齐到哪里（v81，纯函数）。
+
+    line_text:   光标所在行的文本（正在写的那一行，光标在行尾）
+    lines_above: 它上方各行的文本（越靠近它的越靠后）
+    unit:        一级缩进
+
+    返回 `(本行应有的行首空白, 新行应有的行首空白)`；不是分支行、或上方找不到它
+    所属的块头（`If x Then y = 1` 这种单选 If、`Else` 敲在 `If` 前面、`Case` 敲在
+    `Select Case` 前面…）-> 返回 None，调用方维持原行为（新行 = 本行缩进 + 一级）。
+    **绝不猜**：找不到归属者就当没这回事，宁可不对齐也不要挪错。
+    """
+    word = _branch_word(line_text)
+    if not word:
+        return None
+    hashed = _code_part(line_text).lstrip().startswith("#")
+    kind = "directive" if hashed else _BRANCH_OWNER.get(word)
+    if not kind:
+        return None
+    owner = _unclosed_owner_above(lines_above, kind)
+    if owner is None:
+        return None
+    return owner, owner + unit
+
+
 def _indent_unit_for(lines):
     """一级缩进用什么字符串：默认 4 个空格；这个工程里用 Tab 缩进就跟着用 Tab。
 
@@ -3200,7 +3323,7 @@ class VbeBackend:
             lines.pop()                    # Lines() 末尾带回车，会多一个空元素
         return [l.rstrip("\r") for l in lines]
 
-    def new_line_below(self, smart=False, auto_close=False):
+    def new_line_below(self, smart=False, auto_close=False, align_branch=True):
         """在光标所在行的【下方】新起一行，光标落在缩进之后。
 
         等价于"先把光标移到本行末尾，再按回车"，但一步到位 —— 而且当前行
@@ -3230,6 +3353,13 @@ class VbeBackend:
         由纯函数 block_closer + closer_needed 决定：下面已经挂着本块的收尾、或者
         这块的下文已经在写了 —— 都不补，免得顶开已有代码。
 
+        align_branch=True（分支行自动对齐，v81）—— 仅对 smart 模式生效：
+        本行是块【内】的分支（`Else` / `ElseIf … Then` / `Case …`，含条件编译的
+        `#Else` / `#ElseIf`）时，先把它【自己】拉回所属块头那一级（`Else` 对齐 `If … Then`、
+        `Case` 对齐 `Select Case`、`#Else` 对齐 `#If … Then`），新行再深一级。
+        要不要对齐、对齐到哪，由纯函数 branch_align 决定：上方找不到那个"还开着的块头"
+        就什么都不做（宁可不对齐，也不要挪错）。**只改行首空白**，行内一个字符都不碰。
+
         ⚠️ v79c：内层块下面压着的往往是【外层】的收尾（双层 `For` 里的 `Next`），
         它的缩进正好比内层块头浅一格 —— 单看缩进会误判成"已经有收尾了"。所以
         closer_needed 还会查"上方有没有一个同类、未闭合、缩进正好对上它的块头"，
@@ -3249,6 +3379,11 @@ class VbeBackend:
             sl, sc, el, ec = cp.GetSelection()
             line_text = None
             closer_text = None             # 要补的块收尾（smart + auto_close 才可能有）
+            # ⚠️ v81：这个必须在 if smart 之外初始化 —— 放在 smart 分支里的话，
+            # smart=False（Shift+Enter）走到下面那句 `if fixed_line is not None`
+            # 会抛 NameError，被 `except -> return False` 吞成"Shift+Enter 不换行"
+            # （第 29.4~29.7 / 56.8e / 57.4h 当场全红，和 v79b 的 closer_text 同坑）。
+            fixed_line = None              # 分支行要拉回它所属块头的缩进
             if smart:
                 if int(sl) != int(el) or int(sc) != int(ec):
                     return False           # 有选区：不接管
@@ -3265,8 +3400,12 @@ class VbeBackend:
                 if line_text[col - 1:].strip():
                     return False           # 光标后面还有内容 -> 是"拆行"
                 above = self._lines_above(cm, anchor)
-                indent = next_line_indent(
-                    line_text, above, _indent_unit_for(above + [line_text]))
+                unit = _indent_unit_for(above + [line_text])
+                indent = next_line_indent(line_text, above, unit)
+                if align_branch:
+                    _al = branch_align(line_text, above, unit)
+                    if _al is not None:
+                        fixed_line, indent = _al
                 if auto_close:
                     # 块头才谈得上收尾；"要不要真的补"交给纯函数判（下面可能
                     # 已经挂着同一个收尾、或者这块的下文已经在写了）。
@@ -3286,6 +3425,15 @@ class VbeBackend:
                 if anchor <= 0:
                     return False
                 indent = _leading_ws(cm.Lines(anchor, 1))
+            if fixed_line is not None:
+                # v81：分支行（Else / ElseIf…Then / Case…）先拉回它所属块头的缩进。
+                # 只动【行首空白】，行内一个字符都不碰；写不成就不动、也不插新行，
+                # 让调用方把这一下回车原样还给系统。
+                _raw = str(line_text).rstrip("\r\n")
+                _ws = _leading_ws(_raw)
+                if _ws != fixed_line and not self._write_line(
+                        cm, anchor, fixed_line + _raw[len(_ws):]):
+                    return False
             # InsertLines 在 anchor+1 处插入（anchor == CountOfLines 时即追加到末尾），
             # 已有行自动下移 —— 正是"在本行下方新起一行"。
             cm.InsertLines(anchor + 1, indent)

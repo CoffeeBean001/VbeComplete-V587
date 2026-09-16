@@ -9117,6 +9117,289 @@ def main():
     except Exception as _e61:
         check("第 61 节异常: %s" % _e61, [True], expect_contain=[False])
 
+    # ------------------------------------------------------------------
+    # 62. v81：块【内】分支行按回车自动对齐（Else / ElseIf…Then / Case… /
+    #     #Else / #ElseIf）
+    #     （用户报：写完 `If … Then` 回车补了 `End If`、光标停在新行，再敲 `Else`
+    #      就落在"块体那一级"，回车也不会把它拉回与 `If` 同级）
+    # ------------------------------------------------------------------
+    print("\n=== 62. 分支行按回车自动对齐（Else / ElseIf / Case）（v81）===")
+    try:
+        import vbe_bridge as VB62
+
+        _bw62 = VB62._branch_word
+        _uo62 = VB62._unclosed_owner_above
+        _ba62 = VB62.branch_align
+
+        # ---- 62.1 _branch_word：认分支行 ----
+        check("62.1 _branch_word：Else / ElseIf…Then / Case…（含 Case Else / Case Is）"
+              "与 `#` 条件编译分支都认得出；`Else If y Then` 按 Else 算（VBA 语义："
+              "它是 Else + 一行新 If）；`ElseIf y` 少了 Then / 闭合行 / 普通行 / 续行"
+              " -> None",
+              [[_bw62("    Else"), _bw62("        ElseIf y Then"),
+                _bw62("Case 1, 2"), _bw62("    Case Else"),
+                _bw62("    Case Is > 3"), _bw62("    #Else"),
+                _bw62("    #ElseIf VBA7 Then"), _bw62("    Else If y Then"),
+                _bw62("    ElseIf y"), _bw62("    End If"),
+                _bw62("    x = 1"), _bw62("    ElseIf y Then _"),
+                _bw62("'Else 注释里"), _bw62("")]],
+              expect_contain=[["else", "elseif", "case", "case", "case",
+                               "else", "elseif", "else", None, None,
+                               None, None, None, None]])
+
+        # ---- 62.2 _unclosed_owner_above：这一档分支归谁 ----
+        _AB62 = ["Sub Test()", "    If a = 1 Then", "        x = 1",
+                 "    If b = 2 Then", "        y = 1", "    End If",
+                 "        z = 1"]
+        check("62.2 _unclosed_owner_above：`End If` 计 +1、`If … Then` 计 -1 —— "
+              "落在最近那个【还开着】的 If 上（嵌套里是内层的 `If b`）；"
+              "普通行不算归属者、没有 -> None；条件编译只认 `#If`（`#Else` 是兄弟）",
+              [[_uo62(_AB62, "if"),
+                _uo62(["Sub Test()", "    Select Case x"], "select"),
+                _uo62(["Sub Test()"], "if"),
+                _uo62(["    #If VBA7 Then"], "directive"),
+                _uo62(["#If VBA7 Then", "    x = 1", "#Else",
+                       "    #If VBA64 Then"], "directive")]],
+              expect_contain=[["    ", "    ", None, "    ", "    "]])
+
+        # ---- 62.3 branch_align：算得对不对 ----
+        check("62.3 branch_align：Else 对齐最近的 `If … Then`（块体再深一级）；"
+              "Case 对齐 `Select Case`；上方没有归属者（单选 If `If x Then y = 1` / "
+              "先敲了 Else 还没写 If）-> None（绝不猜）；非分支行 -> None",
+              [[_ba62("        Else", ["Sub Test()", "    If x = 1 Then"], "    "),
+                _ba62("            Case 1",
+                      ["Sub Test()", "    Select Case x"], "    "),
+                _ba62("    #Else", ["    #If VBA7 Then"], "    "),
+                _ba62("        Else",
+                      ["Sub Test()", "    If x = 1 Then y = 1"], "    "),
+                _ba62("    Else", ["Sub Test()"], "    "),
+                _ba62("    Case 1", ["Sub Test()", "    x = 1"], "    "),
+                _ba62("    x = 1", ["Sub Test()", "    If x = 1 Then"], "    ")]],
+              expect_contain=[[("    ", "        "),
+                               ("    ", "        "),
+                               ("    ", "        "),
+                               None, None, None, None]])
+
+        # ---- 集成骨架（带 ReplaceLine：v81 要改本行行首空白）----
+        class _CM62(object):
+            def __init__(self, lines):
+                self.lines = list(lines)
+                self.Name = "Module1"
+                self.replace_calls = 0
+
+            @property
+            def CountOfLines(self):
+                return len(self.lines)
+
+            def Lines(self, start, count):
+                s0 = max(0, int(start) - 1)
+                return "".join(l + "\n"
+                               for l in self.lines[s0:s0 + int(count)])
+
+            def InsertLines(self, start, text):
+                i = min(max(0, int(start) - 1), len(self.lines))
+                for k, ln in enumerate(str(text).split("\n")):
+                    self.lines.insert(i + k, ln)
+
+            def ReplaceLine(self, line, text):
+                self.replace_calls += 1
+                self.lines[int(line) - 1] = str(text)
+
+        class _Pane62(object):
+            def __init__(self, cm, sel):
+                self.CodeModule = cm
+                self.sel = sel
+
+            def GetSelection(self):
+                return self.sel
+
+            def SetSelection(self, sl, sc, el, ec):
+                self.sel = (sl, sc, el, ec)
+
+        class _VBE62(object):
+            def __init__(self, pane):
+                self.ActiveCodePane = pane
+
+        _orig62 = VB62._get_vbe_cached
+
+        def _nl62(lines, line_no, align=True, cm_cls=_CM62):
+            """光标落在第 line_no 行【行尾】，回车走 smart + auto_close。"""
+            cm62 = cm_cls(lines)
+            col = len(lines[line_no - 1]) + 1
+            pane62 = _Pane62(cm62, (line_no, col, line_no, col))
+            VB62._get_vbe_cached = lambda: _VBE62(pane62)
+            ok62 = VB62.VbeBackend().new_line_below(smart=True, auto_close=True,
+                                                    align_branch=align)
+            return (ok62, cm62.lines, pane62.sel, cm62.replace_calls)
+
+        # ---- 62.4 ★集成：用户原话的场景 ----
+        check("62.4 ★集成（用户原话的场景）：`If … Then` 回车补出 `End If`、光标停在"
+              "缩进好的那行；在那行敲 `Else` 再回车 -> `Else` 被拉回与 `If` 同级、"
+              "新行再深一级（光标落在新行缩进后），`End If` 一个字没动",
+              [_nl62(["Sub Test()",
+                      "    If x = 1 Then",
+                      "        Else",
+                      "    End If",
+                      "End Sub"], 3)],
+              expect_contain=[(True,
+                               ["Sub Test()",
+                                "    If x = 1 Then",
+                                "    Else",
+                                "        ",
+                                "    End If",
+                                "End Sub"],
+                               (4, 9, 4, 9),
+                               1)])
+
+        # ---- 62.5 ★集成：Select Case 里的 Case ----
+        check("62.5 ★集成：`Select Case` 里同样处理 —— `Case 1` 对齐 `Select Case`、"
+              "块体深一级；`End Select` 不动",
+              [_nl62(["Sub Test()",
+                      "    Select Case x",
+                      "            Case 1",
+                      "    End Select",
+                      "End Sub"], 3)],
+              expect_contain=[(True,
+                               ["Sub Test()",
+                                "    Select Case x",
+                                "    Case 1",
+                                "        ",
+                                "    End Select",
+                                "End Sub"],
+                               (4, 9, 4, 9),
+                               1)])
+
+        # ---- 62.6 集成：ElseIf ----
+        check("62.6 集成：`ElseIf … Then` 与 `Else` 同口径（归最近的 `If … Then`），"
+              "且它【不】补收尾（分支没有收尾）",
+              [_nl62(["Sub Test()",
+                      "    If x = 1 Then",
+                      "          ElseIf y = 2 Then",
+                      "    End If",
+                      "End Sub"], 3)],
+              expect_contain=[(True,
+                               ["Sub Test()",
+                                "    If x = 1 Then",
+                                "    ElseIf y = 2 Then",
+                                "        ",
+                                "    End If",
+                                "End Sub"],
+                               (4, 9, 4, 9),
+                               1)])
+
+        # ---- 62.7 找不到归属者 -> 老行为（绝不猜）----
+        check("62.7 上方没有归属者 -> 维持 v79 老行为（本行缩进 + 一级、一个字不改）："
+              "单选 If `If x = 1 Then y = 1` 不算归属者",
+              [_nl62(["Sub Test()",
+                      "    If x = 1 Then y = 1",
+                      "        Else",
+                      "End Sub"], 3)],
+              expect_contain=[(True,
+                               ["Sub Test()",
+                                "    If x = 1 Then y = 1",
+                                "        Else",
+                                "            ",
+                                "End Sub"],
+                               (4, 13, 4, 13),
+                               0)])
+
+        # ---- 62.8 开关：align_branch=False 回到老行为 ----
+        check("62.8 align_branch=False（`set VBECOMPLETE_NO_BRANCH_ALIGN=1`）"
+              "-> 只缩进、不动本行，回到 v79/v79b 老口径",
+              [_nl62(["Sub Test()",
+                      "    If x = 1 Then",
+                      "        Else",
+                      "    End If",
+                      "End Sub"], 3, align=False)],
+              expect_contain=[(True,
+                               ["Sub Test()",
+                                "    If x = 1 Then",
+                                "        Else",
+                                "            ",
+                                "    End If",
+                                "End Sub"],
+                               (4, 13, 4, 13),
+                               0)])
+
+        # ---- 62.9 本行【已经对齐】-> 一次 ReplaceLine 都不发 ----
+        check("62.9 本行已经对齐 -> 不去碰它（一次 ReplaceLine 都不发），"
+              "只把新行插出来",
+              [_nl62(["Sub Test()",
+                      "    If x = 1 Then",
+                      "    Else",
+                      "    End If",
+                      "End Sub"], 3)],
+              expect_contain=[(True,
+                               ["Sub Test()",
+                                "    If x = 1 Then",
+                                "    Else",
+                                "        ",
+                                "    End If",
+                                "End Sub"],
+                               (4, 9, 4, 9),
+                               0)])
+
+        # ---- 62.10 写不成 -> 返回 False，一行都不动 ----
+        class _CM62NoWrite(_CM62):
+            def ReplaceLine(self, line, text):
+                raise RuntimeError("boom")
+
+        _nl62_fail = _nl62(["Sub Test()",
+                            "    If x = 1 Then",
+                            "        Else",
+                            "    End If",
+                            "End Sub"], 3, cm_cls=_CM62NoWrite)
+        check("62.10 拉不齐（ReplaceLine 抛异常）-> 返回 False 且【一行都没动】"
+              "（绝不半做：不写本行、也不插新行），调用方把回车原样还给系统",
+              [_nl62_fail],
+              expect_contain=[(False,
+                               ["Sub Test()",
+                                "    If x = 1 Then",
+                                "        Else",
+                                "    End If",
+                                "End Sub"],
+                               (3, 13, 3, 13),
+                               0)])
+
+        VB62._get_vbe_cached = _orig62
+
+        # ---- 62.12 ★护栏：Shift+Enter（smart=False）那条路不许被 v81 碰到 ----
+        _cm62s = _CM62(["Sub Foo()", "    Else"])
+        _pane62s = _Pane62(_cm62s, (2, 9, 2, 9))
+        VB62._get_vbe_cached = lambda: _VBE62(_pane62s)
+        _ok62s = VB62.VbeBackend().new_line_below()
+        check("62.12 ★护栏（与 v79b 的 closer_text 同坑）：Shift+Enter"
+              "（smart=False）那条路不许被 v81 碰到 —— fixed_line 必须在 `if smart:`"
+              "【之外】初始化，否则 NameError 会被『出异常一律 return False』吞成"
+              "『按了 Shift+Enter 却不换行』",
+              [(_ok62s, _cm62s.lines)],
+              expect_contain=[(True, ["Sub Foo()", "    Else", "    "])])
+
+        # ---- 62.11 ★接线护栏 ----
+        _root62 = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        _msrc62 = io.open(os.path.join(_root62, "main.py"),
+                          encoding="utf-8").read()
+        _vbsrc62 = io.open(os.path.join(_root62, "vbe_bridge.py"),
+                           encoding="utf-8").read()
+        check("62.11 ★接线护栏：main 有独立开关 BRANCH_ALIGN（含"
+              " VBECOMPLETE_NO_BRANCH_ALIGN）并把它传进后端；new_line_below 带"
+              " align_branch 参数并在 smart 分支里算；拉不齐时先 return False",
+              [["BRANCH_ALIGN" in _msrc62,
+                "VBECOMPLETE_NO_BRANCH_ALIGN" in _msrc62,
+                "align_branch=BRANCH_ALIGN" in _msrc62,
+                "def branch_align(line_text, lines_above, unit=" in _vbsrc62,
+                "def _branch_word(line_text):" in _vbsrc62,
+                "def _unclosed_owner_above(lines_above, kind):" in _vbsrc62,
+                "_BRANCH_OWNER = {\"else\": \"if\", \"elseif\": \"if\","
+                " \"case\": \"select\"}" in _vbsrc62,
+                "align_branch=True" in _vbsrc62,
+                "fixed_line, indent = _al" in _vbsrc62,
+                "cm, anchor, fixed_line + _raw[len(_ws):]" in _vbsrc62]],
+              expect_contain=[[True] * 10])
+
+    except Exception as _e62:
+        check("第 62 节异常: %s" % _e62, [True], expect_contain=[False])
+
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))
     if FAILURES:

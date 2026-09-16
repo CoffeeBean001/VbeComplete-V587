@@ -338,6 +338,23 @@ try:
 except Exception:
     AUTO_CLOSE_BLOCK = True
 
+# ---- v81：块【内】分支行（Else / ElseIf…Then / Case…）按回车自动对齐 ----
+# 用户的追加要求：「我在写了一行 if 之后，回车会自动缩进和补充 end if，然后我再写
+# else，此时的 else 是缩进状态，不能自动对齐上面的 if。我想在我打完 else，或 elseif
+# 再按回车后，else / elseif 能够自动对齐上方的 if。其他类似的结构，比如 select case，
+# 里面可以多分支的，都帮我做成这样能自动对齐的。」
+# 为什么会歪：Else 也是"块头"（要缩进一级），所以这一下回车被我们接管了 —— 而 VBE
+# 原生回车本来会把刚敲完的那一行拉回它该在的层级，我们一接管，那个自动对齐就没机会跑。
+# 归属在 VBA 里没有歧义：Else / ElseIf 归最近的 If…Then、Case 归最近的 Select Case、
+# #Else / #ElseIf 归最近的 #If…Then。判据见 vbe_bridge.branch_align（纯函数，找不到
+# 归属者就什么都不做）。
+# 想关掉：set VBECOMPLETE_NO_BRANCH_ALIGN=1
+try:
+    BRANCH_ALIGN = (os.environ.get("VBECOMPLETE_NO_BRANCH_ALIGN",
+                                   "0").strip() != "1")
+except Exception:
+    BRANCH_ALIGN = True
+
 # 弹窗可见时这些键由 win32_filter 接管（↑/↓ 导航、Tab 确认、Esc 取消），
 # 且会被 suppress_event() 吞掉。on_press 里绝不能抢先收起弹窗，否则"按方向键
 # 选词"会退化成"按方向键弹窗消失"。
@@ -734,6 +751,11 @@ def main():
         要不要补由后端按 vbe_bridge.block_closer + closer_needed 决定（下面已经
         挂着同一个收尾、或这块的下文已经在写 -> 不补）。
 
+        v81 再补一条：本行是块【内】的分支（`Else` / `ElseIf … Then` / `Case …`）
+        时，先把【它自己】拉回所属块头的缩进（`Else` 对齐 `If … Then`、`Case` 对齐
+        `Select Case`），新行再深一级 —— 补回"VBE 原生回车会自动对齐"的那个行为
+        （这一下回车被我们接管了，原生对齐就没机会跑）。判据见 vbe_bridge.branch_align。
+
         后端返回 False（光标不在行尾 / 空行 / 引号没闭合 / COM 抽风…）就把
         这一下回车【原样还给系统】—— 绝不让用户"按了回车却没换行"。
         """
@@ -744,7 +766,8 @@ def main():
         _ok = False
         try:
             _ok = backend.new_line_below(smart=True,
-                                         auto_close=AUTO_CLOSE_BLOCK)
+                                         auto_close=AUTO_CLOSE_BLOCK,
+                                         align_branch=BRANCH_ALIGN)
         except Exception:
             _ok = False
         if not _ok:
