@@ -757,6 +757,29 @@ def is_caret_in_type_position(line_text, caret_col):
     return bool(re.search(r"\bAs\b", segment, re.I))
 
 
+def _struct_decl_name_span(line):
+    """若 line 是 Sub/Function/Property/Event/Type/Enum/Declare 声明行，
+    返回它正在声明的那个【名字】在行内的 (start, end)；否则 None。
+
+    v79d：这些名字是解析器的**语法锚点**。抹掉它，整行就不再被认作一条声明，
+    后果不是"少提示一个名字"，而是这条声明【之后】的代码全部失去归属 ——
+    该过程/块里的局部变量、隐式变量统统降级成"模块级"，表现为
+    "整个模块到处都能提示出别的过程的变量"（详见 _blank_ident_at）。
+    """
+    for rx in (_RE_SUB, _RE_PROP, _RE_EVENT, _RE_TYPE, _RE_ENUM):
+        try:
+            m = rx.match(line)
+        except Exception:
+            m = None
+        if m:
+            return (m.start(1), m.end(1))
+    # API 声明：`Private Declare PtrSafe Function gApi Lib "k" ()`
+    m = _RE_DECLARE.search(line)
+    if m:
+        return (m.start(1), m.end(1))
+    return None
+
+
 def _blank_ident_at(text, line_no, col):
     """把 (line_no, col) 处（均为 1-based）的标识符抹成等长空格。
 
@@ -764,6 +787,25 @@ def _blank_ident_at(text, line_no, col):
     若被当成隐式变量收录，就会出现"打什么就提示什么"的自我提示——
     尤其是单字母（i）或单字（我）这类短词，表现最明显。
     抹成空格而非删除，是为了保持所有字符偏移不变。
+
+    ⚠️ v79d 例外：光标处的词若是这一行**正在声明的名字**（`Sub xxx`、`Type xxx`、
+    `Enum xxx` …），**不抹成空格**，改抹成**等长的下划线**。原因：这些名字是解析器
+    的语法锚点，抹成空格这一行就不再是声明行了 ——
+      * 过程头被抹废 -> 紧随其后的整个过程体失去过程归属，局部/隐式变量全部
+        降级成模块级 -> "在 A 过程里能提示出 B 过程的变量"（用户报的泄漏，
+        第二条路径，实测：把 `Sub bar()` 的 bar 抹掉，bar 里的 other 变成
+        模块级，在 test 里也能提示出来）；
+      * `Enum e` 被抹废 -> 成员行不再被当作块成员，`Red = 1` 这种成员被当成
+        隐式变量收进来（v61 记过同一类事故）。
+    为什么是下划线而不是"不抹"：
+      * "不抹"会让用户此刻正在敲的过程名/类型名作为一个【真名字】进池（`Sub zzq`
+        一敲下去池子里就有 zzq），弹窗随即把它原样提示回来 —— 正是第 21.4 节
+        钉住的"幻影词绝不提示自己"；
+      * 下划线占位符（`Sub ___`）同样保持行长度与偏移不变，但这个名字既不可能与
+        任何真实名字撞车、也永远匹配不上用户输入，于是它只承担"让这一行继续被
+        认作声明"的职责，不会作为候选冒出来。
+    自我提示的两道防线（vbe_bridge 的 caret_decl / 引擎的 decl_at_caret）不受影响：
+    它们读的是【未抹】的原文。
     """
     if not line_no or not col:
         return text
@@ -779,8 +821,15 @@ def _blank_ident_at(text, line_no, col):
     # 也可能是"已打完且后面有空格"，无法区分，猜就会误抹已有标识符。
     if c > len(line):
         c = len(line)
+    anchor = _struct_decl_name_span(line)
     for m in re.finditer(_IDENT, line):
         if m.start() <= c <= m.end():
+            if anchor and m.start() == anchor[0]:
+                # 正在声明的"语法锚点"名字：抹成等长下划线（不能抹成空格，
+                # 否则这一行就不再是声明行；也不能不动，否则会提示自己）。
+                fill = "_" * (m.end() - m.start())
+                lines[line_no - 1] = line[:m.start()] + fill + line[m.end():]
+                break
             lines[line_no - 1] = (line[:m.start()]
                                   + " " * (m.end() - m.start())
                                   + line[m.end():])
@@ -1099,11 +1148,40 @@ def extract_scoped(code):
     return out
 
 
+def is_proc_header_line(line_text):
+    """这一行是不是【过程头】（`Sub xxx` / `Function xxx` / `Property Get|Let|Set xxx`）。
+
+    v79d：给作用域判定用。光标正停在过程头那一行时，这一行**不属于任何过程的
+    "体内"** —— 它是声明，不是过程体。若把它算成"当前过程"，就会出现：
+    正在写新过程头 `Sub test`，而模块里已有一个 `Sub test()`，于是那个过程的
+    局部变量（如 targetsheet）被当成"当前过程的"提示出来（用户报的泄漏）。
+    过程头必须【严格在光标上方】才算"把光标圈在里面"。
+
+    只认"名字后面是 `(` 或行尾"的形式，与 proc_at_line 的判据完全一致
+    （`Sub` / `Function` / `Property Get` 是保留字，不可能出现在过程体语句开头，
+    所以过程体内不会有行被误判成过程头）。
+    """
+    if not line_text:
+        return False
+    s = _mask_strings_and_comments(line_text).strip()
+    if not s:
+        return False
+    try:
+        return bool(_RE_SUB.match(s) or _RE_PROP.match(s))
+    except Exception:
+        return False
+
+
 def proc_at_line(code, line_no):
     """返回第 line_no 行（1-based）所属的过程名；在模块声明区则返回 None。
 
     做法：从该行往上扫描，遇到最近的 Sub/Function/Property 头就返回其名字；
     若先遇到 End Sub/Function/Property/Type/Enum，说明在模块声明区，返回 None。
+
+    ⚠️ 本函数回答的是"这一行归哪个过程"（过程头那一行归它自己，这是"归属"的
+    自然口径，proc_owns_line 也据此回答）。**作用域判定不要直接用它** ——
+    光标停在过程头上时，正确的"当前作用域"是模块级（那一行是声明，不是过程体），
+    见 `is_proc_header_line` 与 vbe_bridge._proc_of_line 的 v79d 说明。
 
     纯文本实现，不依赖 COM（VBE 的 ProcOfLine 在 pywin32 下常因 byref
     参数 ProcKind 抛异常而取不到值），且可单测。

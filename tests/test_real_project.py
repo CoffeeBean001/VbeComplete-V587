@@ -8305,15 +8305,16 @@ def main():
         check("58.11 ★护栏：文本扫描答不出来时，绝不采信 VBE 的 ProcOfLine "
               "（它把 `End Sub` 行、过程之间的空行、声明区里第一个过程头之前"
               "的行都归给邻居过程）；这些位置必须回到 None —— 否则就是『另一个"
-              "函数的局部变量泄漏到本位置』。过程内那两行仍要正常认出 Foo",
+              "函数的局部变量泄漏到本位置』。过程体那两行仍要正常认出 Foo"
+              "（v79d 起：过程头那一行本身也算『不在过程体内』，见第 59 节）",
               [[VB58._proc_of_line(_CMVbe58(_lives58, "Foo"), 3),
                 VB58._proc_of_line(_CMVbe58(_lives58, "Foo"), 4),
                 VB58._proc_of_line(_CMVbe58(_lives58, "Foo"), 1),
                 VB58._proc_of_line(_CMVbe58(_lives58, "Foo"), 2),
                 VB58._proc_of_line(_CMVbe58(_lives58b, "Foo"), 1),
-                isinstance(VB58._proc_of_line(_CMVbe58(_lives58, "Foo"), 3),
+                isinstance(VB58._proc_of_line(_CMVbe58(_lives58, "Foo"), 2),
                            str)]],
-              expect_contain=[[None, None, "Foo", "Foo", None, False]])
+              expect_contain=[[None, None, None, "Foo", None, True]])
 
         # ---- 58.12 ★接线护栏 ----
         _vbsrc58 = io.open(os.path.join(
@@ -8372,6 +8373,193 @@ def main():
         VB58._get_vbe_cached = _orig58
     except Exception as _e58:
         check("第 58 节异常: %s" % _e58, [True], expect_contain=[False])
+
+    # ------------------------------------------------------------------
+    # 59. 跨过程局部变量泄漏 · 光标停在过程头上（v79d）
+    #
+    # 用户复现（v79c 之后仍然泄漏）：
+    #     Sub test()
+    #     Set targetSheet = Worksheets(1)     ' 没写 Dim -> 隐式变量
+    #     ...（双层 For / If / With）
+    #     End Sub
+    #   然后再定义一个过程，输入 `sub test` 时弹窗同时提示 test 和 targetSheet。
+    #
+    # 实测有【两条独立路径】，都通到同一个症状：
+    #   A) 光标这一行【自己】是过程头（`Sub test`）时，proc_at_line 把它当成了
+    #      "当前过程"；这个新名字恰好等于模块里已有的过程名 -> 那个过程的局部
+    #      变量（targetSheet）被当成"当前过程的"提示出来。
+    #   B) 光标停在过程头的【名字】上时，"抹掉正在输入的词"把整个过程头抹废，
+    #      紧随其后的过程体失去过程归属，局部/隐式变量统统降级成【模块级】
+    #      -> 模块里任何位置都能提示出它们。
+    # ------------------------------------------------------------------
+    print("\n=== 59. 光标停在过程头上：跨过程泄漏（v79d）===")
+    try:
+        import vbe_bridge as VB59
+        import parser as P59
+        import engine as E59
+
+        _USER59 = [
+            "Sub test()",                        # 1
+            "Set targetSheet = Worksheets(1)",   # 2
+            "For i = 1 To 100",                  # 3
+            "For j = 1 To 200",                  # 4
+            "If i = 1 Then",                     # 5
+            "If j = 2 Then",                     # 6
+            "With targetSheet",                  # 7
+            "With targetSheet",                  # 8
+            "End With",                          # 9
+            "End With",                          # 10
+            "End If",                            # 11
+            "End If",                            # 12
+            "Next",                              # 13
+            "Next",                              # 14
+            "End Sub",                           # 15
+        ]
+
+        class _CM59(object):
+            """假 CodeModule：文本扫描正常；COM 兜底故意学 VBE 返回邻居过程名。"""
+
+            def __init__(self, lines, com_proc="test"):
+                self.lines = list(lines)
+                self.Name = "Module1"
+                self._com = com_proc
+
+            @property
+            def CountOfLines(self):
+                return len(self.lines)
+
+            def Lines(self, start, count):
+                s0 = max(0, int(start) - 1)
+                return "".join(l + "\n"
+                               for l in self.lines[s0:s0 + int(count)])
+
+            def ProcOfLine(self, line_no, kind):
+                return (self._com, int(kind))     # 学 VBE：(名字, ProcKind)
+
+        def _vis59(lines, line_no, col):
+            """一条龙：真收集（含 caret 抹词）-> 真作用域过滤。"""
+            code = "\n".join(lines)
+            caret = (line_no, col)
+            r = list(P59.extract_records(code, module="Module1",
+                                         is_std_module=True, caret=caret))
+            r += P59.extract_implicit_records(code, module="Module1",
+                                              is_std_module=True, declared=r,
+                                              scope="proc", caret=caret)
+            proc = VB59._proc_of_line(_CM59(lines), line_no)
+            vis = E59.filter_identifiers_by_scope(r, proc, "Module1")
+            return proc, sorted(set(vis))
+
+        # ---- 59.1 纯函数：is_proc_header_line ----
+        check("59.1 is_proc_header_line：Sub / Function / Property Get|Let|Set"
+              "（含 Public/Private/Static 修饰符、名字后无括号也可）都算过程头；"
+              "`Set x = 1` / 注释里的 Sub / 空行 / 普通语句都不算",
+              [[P59.is_proc_header_line("Sub test"),
+                P59.is_proc_header_line("Sub test()"),
+                P59.is_proc_header_line("  Function F() As Long"),
+                P59.is_proc_header_line("Private Property Get X()"),
+                P59.is_proc_header_line("Static Property Let Y(v As Long)"),
+                P59.is_proc_header_line("Set targetSheet = Worksheets(1)"),
+                P59.is_proc_header_line("' Sub Foo()"),
+                P59.is_proc_header_line(""),
+                P59.is_proc_header_line("    Sub total = 1")]],
+              expect_contain=[[True, True, True, True, True,
+                               False, False, False, False]])
+
+        # ---- 59.2 ★用户场景：模块级位置正在写新过程头 ----
+        for _tail, _col in (("Sub test", 9), ("Sub test", 6),
+                            ("Sub test(", 10), ("Sub te", 7)):
+            _lines = _USER59 + [_tail]
+            _proc, _vis = _vis59(_lines, len(_lines), _col)
+            check("59.2 ★用户场景：模块里已有 Sub test()，在【模块级】新写 %r"
+                  "（光标列 %d）-> 当前过程必须是 None，targetSheet 不得出现"
+                  % (_tail, _col),
+                  [(_proc, "targetSheet" in _vis)],
+                  expect_contain=[(None, False)])
+
+        # ---- 59.3 不能过度收敛：过程体内仍按该过程过滤 ----
+        check("59.3 不能过度收敛：光标在 test 体内（第 2 / 7 行）时当前过程仍是 "
+              "test、targetSheet 照常可见；`End Sub` 那一行则回到 None",
+              [[_vis59(_USER59, 2, 3)[0], _vis59(_USER59, 7, 3)[0],
+                _vis59(_USER59, 15, 3)[0],
+                "targetSheet" in _vis59(_USER59, 2, 3)[1]]],
+              expect_contain=[["test", "test", None, True]])
+
+        # ---- 59.4 _blank_ident_at：语法锚点抹成【等长下划线】 ----
+        _b59 = P59._blank_ident_at
+        check("59.4 _blank_ident_at：过程名 / Type 名 / Enum 名抹成【等长下划线】"
+              "（行仍是声明行 -> is_proc_header_line 依然为 True）；"
+              "普通变量 / 赋值目标 / 形参名照旧抹成空格；两者都不改变行长",
+              [[_b59("Sub bar()", 1, 7),
+                _b59("Type Foo", 1, 7),
+                _b59("Enum Color", 1, 8),
+                P59.is_proc_header_line(_b59("Sub bar()", 1, 7)),
+                _b59("Set other = 1", 1, 7),
+                _b59("total = 1", 1, 4),
+                len(_b59("Sub bar()", 1, 7)) == len("Sub bar()"),
+                len(_b59("Set other = 1", 1, 7)) == len("Set other = 1")]],
+              expect_contain=[["Sub ___()", "Type ___", "Enum _____", True,
+                               "Set" + " " * 7 + "= 1",
+                               " " * 6 + "= 1", True, True]])
+
+        # ---- 59.5 ★第二条路径：光标停在过程头的【名字】里 ----
+        _mid59 = ["Sub test()", "Set targetSheet = Worksheets(1)", "End Sub",
+                  "Sub bar()", "Set other = 1", "End Sub",
+                  "Sub mid()", "Set third = 2", "End Sub"]
+        _rows59 = []
+        for _c in (6, 7, 8, 9, 10):
+            _code = "\n".join(_mid59)
+            _r = list(P59.extract_records(_code, module="Module1",
+                                          is_std_module=True, caret=(4, _c)))
+            _r += P59.extract_implicit_records(_code, module="Module1",
+                                               is_std_module=True, declared=_r,
+                                               scope="proc", caret=(4, _c))
+            _rec = dict((str(x[0]).lower(), x) for x in _r)
+            _v = E59.filter_identifiers_by_scope(_r, "test", "Module1")
+            # 过程名此刻是下划线占位符（名字正被输入、不参与归属），
+            # 要害是【它不能是 None】—— None 就等于降级成模块级、全模块可见。
+            _rows59.append((_rec.get("other") is not None
+                            and _rec["other"][2] is not None,
+                            "other" in _v))
+        check("59.5 ★第二条泄漏路径：光标停在 `Sub bar()` 的 bar 名字里"
+              "（第 6~10 列）-> bar 里的 other 必须仍带【过程归属】（绝不是模块级）"
+              "、在 test 里绝不可见（旧实现把过程头抹成空格，整个过程体失去归属）",
+              [_rows59],
+              expect_contain=[[(True, False)] * 5])
+
+        # ---- 59.6 Type/Enum 名字被占位后，块成员不得变成隐式变量 ----
+        _t59 = ["Type Foo", "    Red As Long", "End Type",
+                "Enum Color", "    A = 1", "End Enum"]
+        _code59t = "\n".join(_t59)
+        _rt = list(P59.extract_records(_code59t, module="Module1",
+                                       is_std_module=True, caret=(1, 7)))
+        _rt += P59.extract_implicit_records(_code59t, module="Module1",
+                                            is_std_module=True, declared=_rt,
+                                            scope="proc", caret=(1, 7))
+        _names59t = sorted(set(str(x[0]).lower() for x in _rt))
+        check("59.6 光标停在 `Type Foo` 的 Foo 上时，Type/Enum 的块成员"
+              "（Red / A）仍不得被当成隐式变量收进候选池",
+              [[n for n in _names59t if n in ("red", "a")]],
+              expect_contain=[[]])
+
+        # ---- 59.7 ★接线护栏 ----
+        _root59 = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        _vbsrc59 = io.open(os.path.join(_root59, "vbe_bridge.py"),
+                           encoding="utf-8").read()
+        _psrc59 = io.open(os.path.join(_root59, "parser.py"),
+                          encoding="utf-8").read()
+        _guard59 = "is_proc_header_line(cm.Lines(line_no, 1))"
+        _scan59 = "name = vba_parser.proc_at_line(head, line_no)"
+        check("59.7 ★接线护栏：_proc_of_line 用 is_proc_header_line 挡住过程头"
+              "那一行，且必须排在 proc_at_line 之前（否则文本扫描会把它当成"
+              "当前过程）；parser 提供 is_proc_header_line 与 _struct_decl_name_span",
+              [[-1 < _vbsrc59.find(_guard59) < _vbsrc59.find(_scan59),
+                "def is_proc_header_line(line_text):" in _psrc59,
+                "def _struct_decl_name_span(line):" in _psrc59,
+                "_struct_decl_name_span(line)" in _psrc59]],
+              expect_contain=[[True] * 4])
+
+    except Exception as _e59:
+        check("第 59 节异常: %s" % _e59, [True], expect_contain=[False])
 
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))

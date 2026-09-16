@@ -1628,6 +1628,14 @@ def _proc_of_line(cm, line_no):
     行为确定、可单测）；COM 的 ProcOfLine 只作兜底——它在 pywin32 下
     的 byref 参数（ProcKind）常常抛异常而拿不到值。
 
+    ⚠️ v79d：光标【自己这一行】就是过程头时，一律按"没有当前过程"（None）算。
+    判据是 `parser.is_proc_header_line`，必须放在最前面 —— 它要同时压住下面
+    两条支路（文本扫描会把这一行自己当成过程头；COM 兜底也会这么认，且
+    `proc_owns_line` 对过程头那一行恰好返回 True，拦不住）。不这么做的话：
+    正在写新过程头 `Sub test`、而模块里已有 `Sub test()` 时，那一行的
+    "当前过程"就是 test，test 的局部变量（targetsheet）会被当成当前过程的
+    提示出来 —— 用户报的泄漏。过程是"从过程头【之后】开始"的，头那一行是声明。
+
     ⚠️ v79c 修两处（都在兜底那一支，但都直接影响"作用域"判断）：
       1. pywin32 下 `ProcOfLine` 返回的是【元组】(名字, ProcKind)（ProcKind 是
          byref 出参），旧代码直接 `str(name)` 得到的是 `"('插入工分', 0)"` 这种
@@ -1643,6 +1651,13 @@ def _proc_of_line(cm, line_no):
          位置"。所以拿到名字后必须做一次归属校验（proc_owns_line）：该过程头
          在光标上方、且两者之间没有它的收尾行，才算真的在里面。
     """
+    # 0) v79d：光标这一行自己就是过程头 -> 不在任何 procedure body 里
+    try:
+        if vba_parser.is_proc_header_line(cm.Lines(line_no, 1)):
+            return None
+    except Exception:
+        pass
+
     # 1) 文本扫描：取 1..line_no 行，从光标行往上找最近的过程头
     try:
         head = cm.Lines(1, line_no)
