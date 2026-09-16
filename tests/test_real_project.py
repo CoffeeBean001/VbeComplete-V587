@@ -8760,6 +8760,363 @@ def main():
     except Exception as _e60:
         check("第 60 节异常: %s" % _e60, [True], expect_contain=[False])
 
+    # ------------------------------------------------------------------
+    # 61. v80a：回车补收尾认「下方同级代码」（用户报：在已有 for 上面再补一个
+    #     for，回车只缩进、不补 next）
+    #     v80b：让位状态按【槽位】记 + 会过期；VBE 提示窗句柄缓存周期重扫
+    #     （用户报：变量类型是自定义类模块时，我们的弹窗遮挡 VBE 的提示列表，
+    #      且"不是每次都能复现"）
+    # ------------------------------------------------------------------
+    print("\n=== 61. 同级补收尾 + 让位槽位/有效期 + 提示窗缓存重扫（v80）===")
+    try:
+        import vbe_bridge as VB61
+        import engine as E61
+        import time as T61
+
+        _orig61 = VB61._get_vbe_cached
+        _ocb = VB61._own_closer_below
+        _cn61 = VB61.closer_needed
+
+        # ---- 61.1 _own_closer_below：配平法认"本块自己的收尾" ----
+        check("61.1 _own_closer_below：配平到 0 的同级同类收尾就是本块的；"
+              "同级同类块头计一层；孤立在更深处的同类收尾算『用户写歪』（保守不补）；"
+              "同级的别的块头 -> 本块已结束；下方空 -> 没有",
+              [[_ocb(["    Next"], "Next", "for", 4),
+                _ocb(["    For i = 1 To 10", "        x = 1", "    Next i"],
+                     "Next", "for", 4),
+                _ocb(["        Next"], "Next", "for", 4),
+                _ocb(["Sub Bar()"], "End Type", "type", 0),
+                _ocb([], "Next", "for", 4)]],
+              expect_contain=[[True, False, True, False, False]])
+
+        # ---- 61.2 closer_needed：传 kind 走 v80a 新口径 ----
+        check("61.2 closer_needed（kind 给定）：下方同级压着别的代码/块 -> 补；"
+              "下面已挂着本块自己的收尾 -> 不补；更浅的同类收尾沿用 v79c 归属判定",
+              [[_cn61(["    For i = 1 To 10", "        x = 1", "    Next i",
+                       "End Sub"], "Next", 4, kind="for",
+                      lines_above=["Sub Test()"]),
+                _cn61(["    Next", "End Sub"], "Next", 4, kind="for",
+                      lines_above=["Sub Test()"]),
+                _cn61(["    x = 1", "End Sub"], "End With", 4, kind="with",
+                      lines_above=["Sub Test()"]),
+                _cn61(["    Next", "End Sub"], "Next", 8, kind="for",
+                      lines_above=["Sub Test()", "    For i = 1 To 10"]),
+                _cn61(["Next", "End Sub"], "Next", 4, kind="for",
+                      lines_above=["Sub Test()"])]],
+              expect_contain=[[True, False, True, True, False]])
+
+        # ---- 61.3 ★集成：用户原话的场景 ----
+        class _CM61(object):
+            def __init__(self, lines):
+                self.lines = list(lines)
+                self.Name = "Module1"
+
+            @property
+            def CountOfLines(self):
+                return len(self.lines)
+
+            def Lines(self, start, count):
+                s0 = max(0, int(start) - 1)
+                return "".join(l + "\n"
+                               for l in self.lines[s0:s0 + int(count)])
+
+            def InsertLines(self, start, text):
+                i = min(max(0, int(start) - 1), len(self.lines))
+                for k, ln in enumerate(str(text).split("\n")):
+                    self.lines.insert(i + k, ln)
+
+        class _Pane61(object):
+            def __init__(self, cm, sel):
+                self.CodeModule = cm
+                self.sel = sel
+
+            def GetSelection(self):
+                return self.sel
+
+            def SetSelection(self, sl, sc, el, ec):
+                self.sel = (sl, sc, el, ec)
+
+        class _VBE61(object):
+            def __init__(self, pane):
+                self.ActiveCodePane = pane
+
+        def _nl61(lines, line_no):
+            """光标落在第 line_no 行【行尾】，回车走 smart + auto_close。"""
+            cm61 = _CM61(lines)
+            col = len(lines[line_no - 1]) + 1
+            pane61 = _Pane61(cm61, (line_no, col, line_no, col))
+            VB61._get_vbe_cached = lambda: _VBE61(pane61)
+            ok61 = VB61.VbeBackend().new_line_below(smart=True,
+                                                    auto_close=True)
+            return ok61, cm61.lines, pane61.sel
+
+        check("61.3 ★集成（用户报的场景）：已经在 `For i`（回车补过 `Next i`）"
+              "【上面】再补一个 `For j`，行尾回车 -> 中间留一行缩进 8 空格、"
+              "下面补出同级的 `    Next`，原来那个 For 一个字没动",
+              [_nl61(["Sub Test()",
+                      "    For j = 1 To 5",
+                      "    For i = 1 To 10",
+                      "        MsgBox i",
+                      "    Next i",
+                      "End Sub"], 2)],
+              expect_contain=[(True,
+                               ["Sub Test()",
+                                "    For j = 1 To 5",
+                                "        ",
+                                "    Next",
+                                "    For i = 1 To 10",
+                                "        MsgBox i",
+                                "    Next i",
+                                "End Sub"],
+                               (3, 9, 3, 9))])
+
+        check("61.4 ★集成：上面补的是别的块（`With`）同理；"
+              "而下面已经挂着自己收尾的（`    Next` 紧跟随）-> 只缩进、不补重复",
+              [_nl61(["Sub Test()",
+                      "    For i = 1 To 10",
+                      "        MsgBox i",
+                      "    Next i",
+                      "End Sub"], 2)[1],
+               _nl61(["Sub Test()",
+                      "    For i = 1 To 10",
+                      "    Next i",
+                      "End Sub"], 2)[1],
+               _nl61(["Sub Test()", "    Do", "    Loop", "End Sub"], 2)[1]],
+              expect_contain=[["Sub Test()", "    Do", "        ",
+                               "    Loop", "End Sub"],
+                              ["Sub Test()", "    For i = 1 To 10",
+                               "        ", "    Next i", "End Sub"],
+                              ["Sub Test()", "    Do", "        ",
+                               "    Loop", "End Sub"]])
+
+        check("61.5 集成对照（v79b/v79c 口径不许回归）：模块级 `Type` 下面"
+              "紧邻过程头 -> 仍补 `End Type`；`Sub` 下面已挂着 `End Sub` -> 不补",
+              [_nl61(["Type Foo", "Sub Bar()", "End Sub"], 1)[1],
+               _nl61(["Sub Foo()", "End Sub"], 1)[1]],
+              expect_contain=[["Type Foo", "    ", "End Type",
+                               "Sub Bar()", "End Sub"],
+                              ["Sub Foo()", "    ", "End Sub"]])
+        VB61._get_vbe_cached = _orig61
+
+        # ---- 61.6 list_slot_anchor：算出"哪一个槽位" ----
+        check("61.6 list_slot_anchor：`As `/`New ` 之后锚点=类型名起点列（同一槽位"
+              "内打字不变）；`标识符.` / With 块的 `.成员` 锚点=成员名起点列；"
+              "非列表位置 -> None",
+              [[E61.list_slot_anchor("Dim x As ", 10),
+                E61.list_slot_anchor("Dim x As 类", 11),
+                E61.list_slot_anchor("Dim a As X, b As ", 18),
+                E61.list_slot_anchor("obj.", 5),
+                E61.list_slot_anchor("obj.Me", 7),
+                E61.list_slot_anchor("    .Si", 8),
+                E61.list_slot_anchor("x = 1", 6),
+                E61.list_slot_anchor("", 1)]],
+              expect_contain=[[10, 10, 18, 5, 5, 6, None, None]])
+
+        # ---- 61.7 一致性：vbe_list_expected 认的列表位置，锚点必须算得出来 ----
+        _cases61 = [("Dim x As ", 10), ("Dim x As Inte", 14),
+                    ("Set c = New ", 13), ("Private m_d As Dictionary", 28),
+                    ("obj.", 5), ("objs.Item(1).", 14), ("    .Si", 8),
+                    ("x = 1 'a.b", 10), ("1.5", 4), ("x = 1", 6)]
+        check("61.7 ★一致性护栏：凡是 vbe_list_expected 判为『VBE 会弹列表』的位置，"
+              "list_slot_anchor 都必须给得出锚点（两处语法不许走偏）",
+              [[(lt, cc) for (lt, cc) in _cases61
+                if E61.vbe_list_expected(lt, cc)
+                and E61.list_slot_anchor(lt, cc) is None]],
+              expect_contain=[[]])
+
+        # ---- 61.8 ★端到端：同一行两个槽位互不连累（v80b 核心口径）----
+        _POOL61 = [(n, "VBA", None, False)
+                   for n in ("类1", "类2", "Dim", "obj", "x")]
+
+        class _B61(object):
+            """桩后端：只表达"成员列表是否可见"（v65 语义），位置由文本来。"""
+
+            def __init__(self, line_text, caret_col, yld=False):
+                self._lt = line_text
+                self._cc = caret_col
+                self._ln = 1
+                self._mod = "模块1"
+                self._yld = yld
+
+            def set_line(self, lt, cc):
+                self._lt = lt
+                self._cc = cc
+
+            def get_context(self):
+                return {"line_no": self._ln, "line_text": self._lt,
+                        "caret_col": self._cc, "in_string": False,
+                        "in_comment": False, "in_type_position": False,
+                        "in_decl_position": False, "decl_names": [],
+                        "proc_name": None, "module_name": self._mod}
+
+            def get_identifiers(self):
+                return list(_POOL61)
+
+            def get_declared_names(self):
+                return []
+
+            def declared_elsewhere(self, name, module_name):
+                return False
+
+            def get_structural_names(self):
+                return []
+
+            def get_builtin_names(self):
+                return set()
+
+            def get_type_names(self):
+                return []
+
+            def get_host_enum_names(self):
+                return {}
+
+            def names_outside_caret(self, caret, scope_only=False):
+                return set()
+
+            def apply_completion(self, *a, **k):
+                return None
+
+            def vbe_yield_visible(self):
+                return self._yld
+
+            def vbe_popup_visible(self):
+                return self._yld
+
+            def vbe_popup_info(self):
+                return []
+
+        class _UI61(object):
+            def __init__(self):
+                self.shown = False
+                self.hides = 0
+
+            def show(self, rows, sel, c):
+                self.shown = True
+
+            def hide(self):
+                self.shown = False
+                self.hides += 1
+
+            def update_selection(self, sel):
+                pass
+
+            def contains_point(self, x, y):
+                return False
+
+        def _mk61(line_text, caret_col):
+            be = _B61(line_text, caret_col)
+            ui = _UI61()
+            return E61.Completer(be, ui), be, ui
+
+        _c61, _b61, _u61 = _mk61("Dim a As 类1, b As 类2", 11)   # 第一个槽位
+        _c61.trigger(True)
+        _p1_61 = _c61.yield_pending is not None
+        _r1_61 = _c61.confirm_yield(False)          # VBE 这会儿没弹
+        _gu61 = _c61.yield_given_up
+        _slot1_61 = _gu61[2] if _gu61 else None
+        _b61.set_line("Dim a As 类1, b As 类2", 20)  # 挪到第二个槽位
+        _c61.trigger(True)
+        check("61.8 ★v80b：`Dim a As 类1, b As 类2` 一行两个槽位 —— 第一个槽位"
+              "让位失败（记 given_up，锚点=10）后，移到【第二个槽位】仍然让位"
+              "（待定让位、不弹我们的窗），不再被整行连累",
+              [[_p1_61, _r1_61 is False, _slot1_61 == 10,
+                _c61.yield_pending is not None,
+                len(_c61.matches or []) == 0]],
+              expect_contain=[[True, True, True, True, True]])
+
+        # ---- 61.9 同一槽位内继续打字：不抖（标记仍然有效）----
+        _c61, _b61, _u61 = _mk61("Dim a As 类", 13)
+        _c61.trigger(True)
+        _c61.confirm_yield(False)
+        _gu2_61 = _c61.yield_given_up
+        _b61.set_line("Dim a As 类1", 14)            # 同一槽位继续打字
+        _c61.trigger(True)
+        check("61.9 对照：同一槽位内继续打字 -> 标记仍有效、不再反复让位"
+              "（避免『让开-补上-再让开』的抖动）",
+              [[_c61.yield_given_up == _gu2_61, _c61.yield_pending is None]],
+              expect_contain=[[True, True]])
+
+        # ---- 61.10 有效期：过期后重新给 VBE 一次机会 ----
+        _c61, _b61, _u61 = _mk61("Dim a As 类", 13)
+        _c61.trigger(True)
+        _c61.confirm_yield(False)
+        _c61.yield_given_up_at = T61.time() - (E61.YIELD_GIVEN_UP_TTL + 1.0)
+        _c61.trigger(True)
+        check("61.10 ★v80b：`已放弃让位`标记【过期】后再回到同一处 -> 语法判据"
+              "重新生效（待定让位、旧标记作废）—— 兜住『VBE 只是慢了一拍』",
+              [[_c61.yield_pending is not None, _c61.yield_given_up is None]],
+              expect_contain=[[True, True]])
+
+        _old_ttl61 = E61.YIELD_GIVEN_UP_TTL
+        E61.YIELD_GIVEN_UP_TTL = 0.0
+        try:
+            _c61, _b61, _u61 = _mk61("Dim a As 类", 13)
+            _c61.trigger(True)
+            _c61.confirm_yield(False)
+            _zero61 = _c61.yield_given_up
+        finally:
+            E61.YIELD_GIVEN_UP_TTL = _old_ttl61
+        check("61.11 VBECOMPLETE_YIELD_TTL=0 -> 干脆不记标记（每次都先让位）",
+              [_zero61], expect_contain=[None])
+
+        # ---- 61.12 提示窗句柄缓存：必须能【长出新句柄】 ----
+        _alive61 = VB61._hwnd_alive
+        _enum61 = VB61._enum_vbe_popup_windows
+        _st61 = {"found": [], "calls": 0}
+        try:
+            VB61._hwnd_alive = lambda h: True
+
+            def _fake_enum61():
+                _st61["calls"] += 1
+                return [(h, "NameListWndClass") for h in _st61["found"]]
+
+            VB61._enum_vbe_popup_windows = _fake_enum61
+            VB61._vbe_popup_state["hwnds"] = []
+            VB61._vbe_popup_state["at"] = 0.0
+            _st61["found"] = [100]
+            _r1_61 = VB61._vbe_popup_hwnds()
+            _st61["calls"] = 0
+            VB61._vbe_popup_hwnds()               # 立刻再调：限流，不该重扫
+            _throttled61 = _st61["calls"]
+            _st61["found"] = [100, 200]           # 后来才建出来的提示窗
+            VB61._vbe_popup_state["at"] = 0.0     # 假装过了一个重扫间隔
+            _r2_61 = sorted(VB61._vbe_popup_hwnds())
+        finally:
+            VB61._hwnd_alive = _alive61
+            VB61._enum_vbe_popup_windows = _enum61
+            VB61._vbe_popup_state["hwnds"] = []
+            VB61._vbe_popup_state["at"] = 0.0
+        check("61.12 ★v80b：提示窗句柄缓存【缓存非空时也要周期重扫】——"
+              "后来才建出来的提示窗（用到才建的参数信息窗）也能被探到；"
+              "间隔内不重复枚举（性能护栏）",
+              [[_r1_61, _throttled61, _r2_61]],
+              expect_contain=[[[100], 0, [100, 200]]])
+
+        # ---- 61.13 ★接线护栏 ----
+        _root61 = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        _esrc61 = io.open(os.path.join(_root61, "engine.py"),
+                          encoding="utf-8").read()
+        _vbsrc61 = io.open(os.path.join(_root61, "vbe_bridge.py"),
+                           encoding="utf-8").read()
+        check("61.13 ★接线护栏：让位签名带【槽位】、confirm_yield 按前缀比对；"
+              "标记带有效期；vbe_bridge 的提示窗缓存不再以『缓存为空』为前提；"
+              "v80a 新纯函数到位、老口径（kind=None）那一段没被动过",
+              [["list_slot_anchor(ctx.get(\"line_text\")" in _esrc61,
+                "tuple(pend[1])[:2]" in _esrc61,
+                "YIELD_GIVEN_UP_TTL" in _esrc61,
+                "self.yield_given_up_at" in _esrc61,
+                "now - _vbe_popup_state[\"at\"] >= _VBE_POPUP_RESCAN_SEC"
+                in _vbsrc61,
+                "if not hs:" not in _vbsrc61,
+                "def _own_closer_below(lines_below, closer, kind, base):"
+                in _vbsrc61,
+                "if kind is not None:" in _vbsrc61,
+                "return base == 0" in _vbsrc61]],
+              expect_contain=[[True] * 9])
+
+    except Exception as _e61:
+        check("第 61 节异常: %s" % _e61, [True], expect_contain=[False])
+
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))
     if FAILURES:

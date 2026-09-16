@@ -523,8 +523,67 @@ def _closer_owner_above(lines_above, kind, indent):
     return False
 
 
+def _own_closer_below(lines_below, closer, kind, base):
+    """下面是不是已经挂着【本块自己的】收尾？（v80a，纯函数）
+
+    lines_below: 光标行下方各行（越靠近它的越靠前）
+    closer:      本块的收尾文本（`Next` / `End If` / `End Type`…）
+    kind:        `_block_kind` 认出来的块头类型
+    base:        块头那行的缩进【宽度】
+
+    与 `_closer_owner_above` 正好对称的一问：那一问管"下方第一个非空行是
+    【外层块】的收尾"，这一问管"下方压着的那些同级代码里，到底有没有本块的
+    收尾"。只看【和块头同一缩进】的行，用"同类块头 +1 / 同类收尾 -1"配平：
+
+      * 同缩进的同类块头（`For` 里嵌 `For`、用户还没缩进）-> 计一层，它的
+        `Next` 只闭合它自己；
+      * 配平到 0 时遇到的同类收尾 -> 就是【本块】的，下面已经挂着了；
+      * 同缩进的其它东西（`If` / `With` / `x = 1` / 别的收尾）-> 本块早就
+        结束了（那一行就是它的边界），收尾不在下面；
+      * 缩进比块头浅的行 -> 已经出了这一层，收尾不在下面；
+      * 缩进更深的行 -> 属于嵌套块，与"本块的收尾在哪"无关，跳过；更深的
+        同类块头 / 收尾另用 deeper 配平（免得把内层的 `Next` 当成"用户写歪
+        的收尾"而少补一条）。
+
+    为什么要这一问（v80a，用户报的）：先写了一个 `For`（回车自动补了 `Next`），
+    再回到它【上面】补一个新的 `For` 并回车 —— 新 `For` 下面压着的正是原来那个
+    `For`（同级）。旧口径"同级一律不补（只有模块级缩进 0 才补）"，于是新 `For`
+    的 `Next` 永远补不出来，用户看到的就是"只换行缩进、不补 `Next`"。
+    """
+    depth = 0        # 同缩进的同类块头（本块下面嵌着的同类块）
+    deeper = 0       # 真正嵌套（缩进更深）的同类块头
+    for raw in (lines_below or ()):
+        if not (raw or "").strip():
+            continue
+        w = _indent_width(raw)
+        if w < base:
+            return False                       # 出了这一层：本块收尾不在下面
+        if _is_closer_text(raw, closer):
+            if w == base:
+                if depth == 0:
+                    return True                # 这个收尾就是本块的
+                depth -= 1
+            elif deeper > 0:
+                deeper -= 1                    # 闭合的是更深的那个同类块
+            else:
+                # 孤零零一个更深的同类收尾：位置不对，但它是用户自己写的 ——
+                # 保守起见不再补（宁可少补，也不要 `Loop` / `Next` 双份把代码
+                # 写坏）。这与 v79b 的老口径一致。
+                return True
+            continue
+        if _block_kind(raw) == kind:
+            if w == base:
+                depth += 1                     # 同缩进的同类嵌套块头
+            else:
+                deeper += 1
+            continue
+        if w == base:
+            return False                       # 同缩进的其它东西 -> 本块已结束
+    return False
+
+
 def closer_needed(lines_below, closer, base_indent, kind=None, lines_above=()):
-    """下面到底要不要补 closer（v79b；嵌套判定 v79c，纯函数）。
+    """下面到底要不要补 closer（v79b；嵌套判定 v79c；同级判定 v80a，纯函数）。
 
     lines_below: 光标行【下方】各行的文本（越靠近它的越靠前）
     closer:      block_closer 算出来的收尾文本（空 / None -> 不补）
@@ -532,39 +591,64 @@ def closer_needed(lines_below, closer, base_indent, kind=None, lines_above=()):
     kind:        块头类型（可选；给了才能判"更浅的同类收尾是不是外层块的"）
     lines_above: 块头行上方各行（可选，同上）
 
-    只看"下方第一个非空行"，免得把用户已经写好的代码顶开：
-      * 它比块头缩进得【更浅】-> 说明本块还没内容就该结束了，收尾正该落在这儿；
-        但若它就是本块的收尾（同类），先问一句"是不是外层块的收尾"（见
-        _closer_owner_above）—— 是外层的才补，否则那是用户自己写歪了的收尾；
-      * 它跟块头齐平或更深 -> 不补：这块的下文/收尾已经在写了，别硬塞；
-        唯一的例外是【块头在模块级（缩进 0）】：那里"齐平"的只可能是下一个
-        声明/过程头，说明本块还没写内容，收尾该补 —— Type / Enum 正是靠这条
-        才补得出来（它们只出现在模块级）；
+    传了 kind（生产路径上一定会传）时的口径：
+      * 下方【没有】本块自己的收尾 -> 补（怎么算"没有"，见 _own_closer_below：
+        它按缩进分类扫下方各行，同级同类块头配平、同级别的东西算边界、
+        更深的行跳过）；
+      * 下方第一个非空行就是本块的同类收尾、且缩进比块头【更浅】-> 再问一句
+        `_closer_owner_above`："那是外层块的收尾（本块该补）还是用户写歪的
+        （不补）"；
+      * 其余 -> 不补。
+
+    不传 kind 时保持 v79b 老口径（只看"下方第一个非空行"）：
+      * 它比块头缩进得【更浅】-> 补（但若它就是本块的收尾且更浅，一律不补）；
+      * 它跟块头齐平或更深 -> 不补；唯一的例外是【块头在模块级（缩进 0）】，
+        那里"齐平"的只可能是下一个声明/过程头，收尾该补；
       * 下方根本没有非空行（文件到底了）-> 补。
     空行一律跳过（下方可能隔着一堆空行才挂着真正的收尾）。
 
     不传 kind/lines_above（旧式调用）时，"更浅的同类收尾"一律按【不补】处理 ——
     这是最保守的一档，与 v79b 完全一致。
+
+    ★v80a 变更：传了 kind 时，"同级"一档不再是"只有模块级（缩进 0）才补"，
+    改成问一句 `_own_closer_below` —— "下面到底有没有本块自己的收尾"。
+    别的分档一律不动。
     """
     if not closer:
         return False
     base = int(base_indent)
+    first = None
     for raw in (lines_below or ()):
-        s = (raw or "").strip()
-        if not s:
-            continue                           # 空行：下面还可能挂着收尾
-        w = _indent_width(raw)
-        if _is_closer_text(raw, closer):
-            if w >= base:
-                return False                   # 本块的收尾已经挂在下面了
-            # 比块头浅：要么是外层块的收尾（本块该补），要么是用户写歪的
-            return _closer_owner_above(lines_above, kind, w)
-        if w != base:
-            return w < base
-        # 同级、且不是本块的收尾：模块级 -> 本块还没内容，补；过程内 -> 维持
-        # v79b 老口径（不补），免得把用户正在写的块体顶开。
-        return base == 0
-    return True
+        if (raw or "").strip():
+            first = raw
+            break
+    if kind is not None:
+        # 【v80a 口径】下面挂着本块自己的收尾 -> 不补；没有 -> 补。
+        # 这一问把"同级代码"分成三类：同类嵌套块头（配平）、本块的收尾、
+        # 以及"本块早就结束了"的边界 —— 详见 _own_closer_below。
+        if _own_closer_below(lines_below, closer, kind, base):
+            return False
+        if first is not None:
+            w = _indent_width(first)
+            if _is_closer_text(first, closer) and w < base:
+                # 更浅的同类收尾：可能是【外层块】的（双层 For 的 `Next`），
+                # 也可能是用户自己写歪的 —— 分这一下的活交给它（v79c）。
+                return _closer_owner_above(lines_above, kind, w)
+        return True
+    # 【老口径】kind 没传（v79b 那套调用方式）：一个字不动，第 58.9 节钉着。
+    if first is None:
+        return True
+    w = _indent_width(first)
+    if _is_closer_text(first, closer):
+        if w >= base:
+            return False                       # 本块的收尾已经挂在下面了
+        # 比块头浅：要么是外层块的收尾（本块该补），要么是用户写歪的
+        return _closer_owner_above(lines_above, kind, w)
+    if w != base:
+        return w < base
+    # 同级、且不是本块的收尾：模块级 -> 本块还没内容，补；过程内 -> 维持
+    # v79b 老口径（不补），免得把用户正在写的块体顶开。
+    return base == 0
 
 
 def next_line_indent(cur_line, lines_above=(), unit="    "):
@@ -1052,9 +1136,18 @@ try:
 except Exception:
     pass
 
-# 缓存：命中的窗口句柄列表 + 上次枚举时刻（找不到时限流重扫）
+# 缓存：命中的窗口句柄列表 + 上次枚举时刻。
+# v80b 起这是【周期性重扫】的间隔（不再是"只缓存为空时才扫"）：VBE 的提示窗
+# 可能是用到才建的，一旦第一次枚举时它还没出现，旧口径会让它永远进不了缓存。
+# 想更省（或排障时想更灵敏）：set VBECOMPLETE_VBE_POPUP_RESCAN=2.0
 _vbe_popup_state = {"hwnds": [], "at": 0.0}
-_VBE_POPUP_RESCAN_SEC = 1.0
+try:
+    _VBE_POPUP_RESCAN_SEC = float(
+        os.environ.get("VBECOMPLETE_VBE_POPUP_RESCAN", "").strip() or 1.0)
+except Exception:
+    _VBE_POPUP_RESCAN_SEC = 1.0
+if not (0.05 < _VBE_POPUP_RESCAN_SEC < 60.0):
+    _VBE_POPUP_RESCAN_SEC = 1.0
 
 # ---------------------------------------------------------------------------
 # v65：让位只针对【成员列表】，不针对【参数信息】
@@ -1203,20 +1296,33 @@ def _popup_details_now(hwnds):
 def _vbe_popup_hwnds():
     """取（并维护）VBE 提示窗的句柄缓存；返回当前可用的句柄列表。
 
-    只在"缓存为空"或"句柄失效（Excel/VBE 重启过）"时重新枚举，且限流 ——
-    枚举全量顶层窗口 1.75ms/次，命中缓存后只查 IsWindowVisible，快三个数量级。
+    枚举全量顶层窗口约 1.75ms —— 每轮轮询都枚举不可取（轮询约 20 次/秒），
+    所以缓存句柄、平时只查 IsWindowVisible（快三个数量级）。
+
+    ★v80b：缓存必须能【长出】新句柄。原来只在"缓存为空"时重扫，于是只要第一次
+    枚举时某个提示窗还没建出来（VBE 的部分提示窗是【用到才建】的），它就永远进
+    不了缓存 —— 表现是"我们探不到那个窗"，于是既不让位的兜底、避让也拿不到矩形，
+    候选窗就一直压着它（用户报的"我们的弹窗遮挡 VBE 的形参提示列表"，还"不是每次
+    都能复现"—— 取决于工具启动那一刻那个窗建出来了没有）。
+    现在按 _VBE_POPUP_RESCAN_SEC（默认 1s）周期性重扫，句柄集合变了就换掉；
+    代价是每秒一次 EnumWindows（约 0.2% CPU）。
     """
     cached = _vbe_popup_state["hwnds"]
     hs = [h for h in cached if _hwnd_alive(h)]
     if len(hs) != len(cached):
         _vbe_popup_state["hwnds"] = hs         # 有句柄失效 -> 作废重找
-    if not hs:
-        now = time.time()
-        if now - _vbe_popup_state["at"] < _VBE_POPUP_RESCAN_SEC:
-            return []
+    now = time.time()
+    if now - _vbe_popup_state["at"] >= _VBE_POPUP_RESCAN_SEC:
         _vbe_popup_state["at"] = now
-        hs = [h for h, _cls in _enum_vbe_popup_windows()]
-        _vbe_popup_state["hwnds"] = hs
+        found = [h for h, _cls in _enum_vbe_popup_windows()]
+        if set(found) != set(hs):
+            # 句柄集合变化只在"提示窗被建出来 / 被销毁"时发生，很少 —— 值得记一行，
+            # 它一眼能分清"探不到 VBE 提示窗"到底是【窗没建出来】还是【别的判据】。
+            _log("vbe-popup: 提示窗句柄集合 %d -> %d 个 %r"
+                 % (len(hs), len(found), [_window_class_name(h)
+                                          for h in found]))
+            _vbe_popup_state["hwnds"] = found
+        hs = found
     return hs
 
 

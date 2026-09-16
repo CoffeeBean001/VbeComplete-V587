@@ -62,6 +62,31 @@ except Exception:
 if not (0.0 < YIELD_GRACE < 5.0):
     YIELD_GRACE = 0.25
 
+# 【v80b】"此处 VBE 不会弹列表、已放弃让位"标记的【有效期】（秒）。
+#
+# 这个标记原来的口径是"按 (模块, 行号) 记，一旦记上，整行永久不再让位"。
+# 可"宽限期内没弹"经常只是【慢了一拍】—— 自定义类模块 / 工程内过程的名字要
+# 现场解析工程符号（VBAProject 的类型表），比内建类型慢；一旦慢过 YIELD_GRACE，
+# 我们就把这一行记成"VBE 不会弹"，随后自己弹窗，正好压在 VBE 迟到的那个列表上
+# （用户报的"变量类型是自定义类模块时，我们的弹窗盖住 VBE 的形参提示列表"，
+# 之所以"不是每次都能复现"，就是因为它是时序竞态）。
+#
+# 现在标记带有效期：
+#   * 连续打字期间（键间隔远小于它）照样不抖 —— 这是它当初存在的理由；
+#   * 过了这段时间再回到同一处，语法判据重新生效（再给 VBE 一次机会）；
+#   * 同一行里【换到另一个槽位】（`Dim a As X, b As Y` 的第二个 `As`、
+#     `a.Value + b.Value` 的第二个 `.`）也不再被别人的失败连累 —— 见
+#     list_slot_anchor。
+#   set VBECOMPLETE_YIELD_TTL=0.5  调小（更积极让位）
+#   set VBECOMPLETE_YIELD_TTL=0    干脆不记这个标记（每次触发都让位）
+try:
+    YIELD_GIVEN_UP_TTL = float(
+        os.environ.get("VBECOMPLETE_YIELD_TTL", "").strip() or 1.5)
+except Exception:
+    YIELD_GIVEN_UP_TTL = 1.5
+if not (0.0 <= YIELD_GIVEN_UP_TTL <= 30.0):
+    YIELD_GIVEN_UP_TTL = 1.5
+
 # 标识符（含中文）：首字符为字母/下划线，其后可跟字母/数字/下划线。
 # [^\W\d] = 非“非单词字符”且非数字 = 字母或下划线（Unicode 感知，含中文）。
 _IDENT = re.compile(r"[^\W\d]\w*$")
@@ -362,6 +387,62 @@ def vbe_list_expected(line_text, caret_col):
     """
     return (vbe_member_list_expected(line_text, caret_col)
             or _in_type_list_position(line_text, caret_col))
+
+
+def _type_list_anchor(line_text, caret_col):
+    """`As ` / `New ` 之后填类型名时的【槽位起点列】（1-based）；不在那儿返回 None。
+
+    与 _in_type_list_position 同一套判据（"光标左边去掉正在输入的词之后以 `as` /
+    `new` 收尾"），只是额外把"类型名该从哪一列开始"算出来 —— 供
+    list_slot_anchor 用。纯函数。
+    """
+    if not line_text or not caret_col or caret_col < 1:
+        return None
+    i = min(int(caret_col) - 1, len(line_text))
+    j = i - 1
+    while j >= 0 and (line_text[j].isalnum() or line_text[j] == "_"):
+        j -= 1
+    head = line_text[:j + 1].rstrip().lower()
+    if not (head.endswith(" as") or head.endswith(" new")):
+        return None
+    if _in_comment_or_string(line_text, j + 2):
+        return None
+    return j + 2
+
+
+def list_slot_anchor(line_text, caret_col):
+    """光标所在的 VBE 列表位置是【哪一个槽位】？返回槽位起点列（1-based，纯函数）。
+
+    槽位 = VBE 会为它单独弹一次列表的那个位置：
+      * 成员访问（`标识符.` 之后，含 With 块的 `.成员`）-> 成员名该开始的那一列；
+      * 类型位置（`As ` / `New ` 之后）-> 类型名该开始的那一列。
+    不在列表位置返回 None。语法与 vbe_list_expected 同源，只是多回答一句
+    "是哪一个位置"。
+
+    为什么要它（v80b）：让位状态原来按 (模块名, 行号) 记 —— 同一行里【任何一处】
+    让位失败过一次，整行的语法判据就永久失效。而一行里有多个槽位是常态：
+      * `Dim a As 类1, b As 类2`     —— 两个类型槽位；
+      * `x = a.Value + b.Value`      —— 两个成员槽位；
+      * `Private m_d As Dictionary`  —— 声明行与使用行常常挤在一处。
+    第一个槽位上让位失败（VBE 那次恰好没在宽限期内弹出来）会把第二个槽位一起
+    拖下水，于是"偶尔"才复现。按槽位记就互不影响：同一个槽位内连续打字锚点不变
+    （不会抖），换到另一个槽位锚点就变（重新判定一次让位）。
+    """
+    if not line_text or not caret_col or caret_col < 1:
+        return None
+    a = _type_list_anchor(line_text, caret_col)
+    if a is not None:
+        return a
+    i = min(int(caret_col) - 1, len(line_text))
+    j = i - 1
+    while j >= 0 and (line_text[j].isalnum() or line_text[j] == "_"):
+        j -= 1
+    k = j
+    while k >= 0 and line_text[k] in " \t":
+        k -= 1
+    if k >= 0 and line_text[k] == ".":
+        return k + 2
+    return None
 
 
 def replace_word(line_text, word_start_col, caret_col, completion):
@@ -675,9 +756,14 @@ class Completer:
         #   confirm_yield() 裁决。
         # yield_given_up = 位置签名 —— 已经确认过"这个位置 VBE 根本不会弹"，
         #   于是不再让位（免得"让开-补上-再让开-再补上"来回抖）。
-        # 位置签名取 (模块名, 行号)：同一行内只判定一次，换行自动失效。
+        # 位置签名取 (模块名, 行号, 槽位列)：同一行里换到另一个 `As` / 另一个
+        # 点号就是另一个槽位，互不连累（v80b；槽位见 list_slot_anchor）。
+        # ★v80b 还加了有效期 YIELD_GIVEN_UP_TTL（默认 1.5s）：上面那句"不弹"
+        #   经常只是【慢了一拍】（工程内类型要现场解析符号），过期后再回到同一处
+        #   会重新给 VBE 一次机会 —— 否则我们的窗会一直压着它迟到的列表。
         self.yield_pending = None
         self.yield_given_up = None
+        self.yield_given_up_at = 0.0
 
     def _clamp_top(self):
         """把窗口起点夹到合法区间（不能越过列表末尾）。"""
@@ -1071,12 +1157,19 @@ class Completer:
             ctx = None
         if not ctx:
             return True
-        if (ctx.get("module_name"), ctx.get("line_no")) != pend[1]:
+        if (ctx.get("module_name"), ctx.get("line_no")) != tuple(pend[1])[:2]:
             return True
         if not vbe_list_expected(ctx.get("line_text"), ctx.get("caret_col")):
             return True
-        # 记下来：这一处 VBE 不会弹 -> 本次输入期间不再让位
+        # 记下来：这一处 VBE 不会弹 -> 这段时间内不再让位（v80b 起会过期）
+        if YIELD_GIVEN_UP_TTL <= 0.0:
+            # 用户把有效期设成 0 = 不要这个标记：每次都先让位（宁可多让）
+            _log("yield: VBE 没弹列表 -> 有效期=0，不记标记（每次都让位）")
+            return False
         self.yield_given_up = pend[1]
+        self.yield_given_up_at = time.time()
+        _log("yield: VBE 没弹列表 -> 记「已放弃让位」%r（%.1fs 后过期）"
+             % (pend[1], YIELD_GIVEN_UP_TTL))
         return False
 
     def _vbe_popup_desc(self):
@@ -1136,14 +1229,30 @@ class Completer:
             # 现在：先让，再由 main.py 的轮询在 YIELD_GRACE 之后调
             # confirm_yield() 裁决 —— VBE 的列表真出现就认这个让位；没出现就
             # 把候选窗补回来。两种情形都对。
-            _ysig = (ctx.get("module_name"), ctx.get("line_no"))
-            if _ysig == self.yield_given_up:
-                # 这个位置刚让过、VBE 并没弹 -> 别再让，照常出我们自己的候选
-                _log("trigger: 此处已放弃让位（VBE 没弹）-> 照常出候选")
+            _ysig = (ctx.get("module_name"), ctx.get("line_no"),
+                     list_slot_anchor(ctx.get("line_text"),
+                                      ctx.get("caret_col")))
+            # ★v80b：标记按【槽位】记 + 会过期。
+            #   * 槽位（_ysig[2]）把"同一行的另一处 `As` / 另一个点号"分开 ——
+            #     否则第一个槽位上的一次失败会让整行都不再让位；
+            #   * 有效期（YIELD_GIVEN_UP_TTL）兜住"VBE 只是慢了一拍"：工程内的
+            #     类模块 / 过程要现场解析符号，慢过 YIELD_GRACE 是常事，过期后
+            #     重新让它一次，就不会出现"我们的窗一直压着它迟到的列表"。
+            _gu_fresh = (_ysig == self.yield_given_up
+                         and (time.time() - self.yield_given_up_at)
+                         < YIELD_GIVEN_UP_TTL)
+            if _gu_fresh:
+                # 这个槽位刚让过、VBE 并没弹 -> 别再让，照常出我们自己的候选
+                _log("trigger: 此处已放弃让位（VBE 没弹，%.2fs 前）-> 照常出候选"
+                     % (time.time() - self.yield_given_up_at))
                 self.yield_pending = None
             else:
-                _log("trigger: VBE 自带列表位置 -> 待定让位(%dms)"
-                     % int(YIELD_GRACE * 1000))
+                if self.yield_given_up is not None:
+                    # 过期了（或换了槽位）：把这个标记作废，重新给 VBE 一次机会
+                    _log("trigger: 「已放弃让位」标记已过期/换槽位 -> 作废")
+                    self.yield_given_up = None
+                _log("trigger: VBE 自带列表位置 -> 待定让位(%dms) 槽位=%r"
+                     % (int(YIELD_GRACE * 1000), _ysig[2]))
                 self.hide()
                 # 每次让位都续期：用户还在打这一处，就别急着替他补
                 self.yield_pending = (time.time() + YIELD_GRACE, _ysig)
