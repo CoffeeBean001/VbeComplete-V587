@@ -342,6 +342,27 @@ _MOD_FIRST_WORDS = ("public", "private", "friend", "static")
 # 行尾就是 Then（前面得有分隔，别把 `Something` 认成 Then）
 _RE_TAIL_THEN = re.compile(r"(?:^|\s)then\s*$")
 
+# 块结构【收尾】（v79b 用户新要求：写 `If i = 1 Then` 按回车，后面自动补 `End If`）。
+# 键是 _block_kind 认出来的规范化类型名，值是补在下一行（缩进回到块头同级）的收尾。
+#   * 只有"真需要收尾"的块才在这儿 —— Else / ElseIf…Then / Case 是块【内】的分支，
+#     往下一行只是同级的分支体，不该替用户写收尾；
+#   * For 用 Next（VBA 允许不带变量名）、Do 用 Loop、While 用 Wend；其余统一 End Xxx；
+#   * 条件编译（#If / #Else）刻意不在表里：它必须配 `#End If`，替用户写个裸的
+#     `End If` 反而把代码写错，宁可让用户自己敲。
+_BLOCK_CLOSERS = {
+    "sub": "End Sub",
+    "function": "End Function",
+    "property": "End Property",
+    "type": "End Type",
+    "enum": "End Enum",
+    "if": "End If",
+    "with": "End With",
+    "select": "End Select",
+    "for": "Next",
+    "do": "Loop",
+    "while": "Wend",
+}
+
 
 def _code_part(line_text):
     """一行代码里"去掉字符串与注释之后"的部分（行尾空白也去掉）。纯函数。
@@ -374,6 +395,45 @@ def _is_comment_only(line_text):
     return low == "rem" or low.startswith("rem ") or low.startswith("rem\t")
 
 
+def _block_kind(line_text):
+    """这一行是【哪一种】块结构的开头？返回规范化的类型名；不是块头返回 None。
+
+    返回值的三种含义：
+      * `"branch"`    —— Else / ElseIf…Then / Case：要缩进一级，但**没有收尾**；
+      * `"directive"` —— #If / #Else 条件编译：要缩进一级，收尾必须由用户写
+                        `#End If`，我们不代劳（见 _BLOCK_CLOSERS 的说明）；
+      * 其余（sub / function / property / type / enum / if / with / select /
+        for / do / while）—— 都在 _BLOCK_CLOSERS 里有对应的收尾行。
+    """
+    code = _code_part(line_text)
+    if not code:
+        return None
+    if code.endswith("_"):
+        # 续行符：这条语句还没写完，下一行是它的延续，不是"块里的第一行"。
+        return None
+    low = " ".join(code.lower().split())
+    hashed = low.startswith("#")
+    words = low.split(" ")
+    i = 0
+    while i < len(words) and words[i] in _MOD_FIRST_WORDS:
+        i += 1
+    first = words[i].lstrip("#") if i < len(words) else ""
+    if first in ("else", "elseif", "case"):
+        if first == "elseif" and not _RE_TAIL_THEN.search(low):
+            return None                    # 只写 `ElseIf x` 没写 Then —— 不算块头
+        return "directive" if hashed else "branch"
+    if _RE_TAIL_THEN.search(low):
+        # `If x Then` / `ElseIf x Then` / `#If VBA7 Then`：行尾就是 Then。
+        # 单选 If（`If x Then y = 1`）以别的词结尾，天然被排除在外。
+        return "directive" if hashed else "if"
+    if first == "select":
+        ok = len(words) > i + 1 and words[i + 1] == "case"
+        return ("directive" if hashed else "select") if ok else None
+    if first in _BLOCK_FIRST_WORDS:
+        return "directive" if hashed else first
+    return None
+
+
 def opens_block(line_text):
     """这一行是不是"块结构的开头"——回车换行后新行该缩进一级。纯函数。
 
@@ -385,25 +445,61 @@ def opens_block(line_text):
     `x = 1`、`Exit For`、`DoEvents`、`foo(1, 2)`、`Debug.Print x`、
     以续行符 `_` 结尾的行 -> False。
     """
-    code = _code_part(line_text)
-    if not code:
+    return _block_kind(line_text) is not None
+
+
+def block_closer(line_text):
+    """块头那行【该补的收尾】；不需要收尾时返回 None。纯函数。
+
+    `Sub Foo()` -> "End Sub"、`If x Then` -> "End If"、`With rng` -> "End With"、
+    `Select Case x` -> "End Select"、`For i = 1 To 10` -> "Next"、`Do` -> "Loop"、
+    `While x` -> "Wend"、`Private Function F()` -> "End Function"；
+    `ElseIf y Then` / `Else` / `Case 1` / `#If VBA7 Then` / 整行注释 /
+    普通行 -> None（它们要么是块内的分支、要么该由用户自己写收尾）。
+    """
+    return _BLOCK_CLOSERS.get(_block_kind(line_text))
+
+
+def _indent_width(raw):
+    """行首空白占几个字符位（Tab 按 4 列算）。纯函数。"""
+    n = 0
+    for ch in (raw or ""):
+        if ch == " ":
+            n += 1
+        elif ch == "\t":
+            n += 4
+        else:
+            break
+    return n
+
+
+def closer_needed(lines_below, closer, base_indent):
+    """下面到底要不要补 closer（v79b，纯函数）。
+
+    lines_below: 光标行【下方】各行的文本（越靠近它的越靠前）
+    closer:      block_closer 算出来的收尾文本（空 / None -> 不补）
+    base_indent: 块头那行的行首缩进【宽度】
+
+    只看"下方第一个非空行"，免得把用户已经写好的代码顶开：
+      * 它已经是这个收尾（`End If` / `Next i` / `Loop While x`…）-> 不补（重复了）；
+      * 它比块头缩进得【更浅】-> 补：说明本块还没内容就该结束了，收尾正该落在这儿；
+      * 它跟块头齐平或更深 -> 不补：说明这块的下文/收尾已经在写了，别硬塞；
+      * 下方根本没有非空行（文件到底了）-> 补。
+    空行一律跳过（下方可能隔着一堆空行才挂着真正的收尾）。
+    """
+    if not closer:
         return False
-    if code.endswith("_"):
-        # 续行符：这条语句还没写完，下一行是它的延续，不是"块里的第一行"。
-        return False
-    low = " ".join(code.lower().split())
-    if _RE_TAIL_THEN.search(low):
-        return True
-    words = low.split(" ")
-    i = 0
-    while i < len(words) and words[i] in _MOD_FIRST_WORDS:
-        i += 1
-    if i >= len(words):
-        return False
-    first = words[i].lstrip("#")
-    if first == "select":
-        return len(words) > i + 1 and words[i + 1] == "case"
-    return first in _BLOCK_FIRST_WORDS
+    want = closer.strip().lower()
+    for raw in (lines_below or ()):
+        s = (raw or "").strip()
+        if not s:
+            continue                           # 空行：下面还可能挂着收尾
+        low = s.lower()
+        if (low == want or low.startswith(want + " ")
+                or low.startswith(want + "'")):
+            return False                       # 收尾已经在下面了
+        return _indent_width(raw) < int(base_indent)
+    return True
 
 
 def next_line_indent(cur_line, lines_above=(), unit="    "):
@@ -2846,7 +2942,31 @@ class VbeBackend:
             lines.pop()                    # Lines() 末尾带回车，会多一个空元素
         return [l.rstrip("\r") for l in lines]
 
-    def new_line_below(self, smart=False):
+    def _lines_below(self, cm, line_no, limit=None):
+        """取第 line_no 行【下方】的各行文本（最近的在最前）。
+
+        v79b 补收尾时用：得知道下面是不是已经挂着 `End If` / `Next` 了，
+        免得替用户补出一个重复的收尾。同样只读、行数封顶 _INDENT_LOOKBACK。
+        """
+        n = self._INDENT_LOOKBACK if limit is None else int(limit)
+        try:
+            total = int(cm.CountOfLines)
+        except Exception:
+            return []
+        start = int(line_no) + 1
+        cnt = min(n, total - start + 1)
+        if cnt <= 0:
+            return []
+        try:
+            text = cm.Lines(start, cnt)
+        except Exception:
+            return []
+        lines = str(text).split("\n")
+        if lines and lines[-1] == "":
+            lines.pop()                    # Lines() 末尾带回车，会多一个空元素
+        return [l.rstrip("\r") for l in lines]
+
+    def new_line_below(self, smart=False, auto_close=False):
         """在光标所在行的【下方】新起一行，光标落在缩进之后。
 
         等价于"先把光标移到本行末尾，再按回车"，但一步到位 —— 而且当前行
@@ -2869,6 +2989,13 @@ class VbeBackend:
             排好的缩进较劲；
           * 本行引号没闭合：VBE 原生回车会替用户补上右引号，别抢这个活。
 
+        auto_close=True（回车自动补收尾，v79b）—— 仅对 smart 模式生效：
+        块头是 `If x Then` / `With rng` / `Sub Foo()` 这类【真需要收尾】的，
+        再在其后补一行同级的 `End If` / `End With` / `End Sub`…，光标停在中间
+        那行（缩进正好），用户直接在块里写内容。要不要补由纯函数
+        block_closer + closer_needed 决定：下面已经挂着同一个收尾、或者这块的
+        下文已经在写了（下一行缩进 >= 本行）—— 都不补，免得顶开已有代码。
+
         成功返回 True；不在代码窗 / 取不到 COM / 出任何异常都返回 False ——
         调用方据此把这一下按键原样还给系统（回车绝不能吞掉）。
         """
@@ -2882,6 +3009,7 @@ class VbeBackend:
             cm = cp.CodeModule
             sl, sc, el, ec = cp.GetSelection()
             line_text = None
+            closer_text = None             # 要补的块收尾（smart + auto_close 才可能有）
             if smart:
                 if int(sl) != int(el) or int(sc) != int(ec):
                     return False           # 有选区：不接管
@@ -2900,6 +3028,15 @@ class VbeBackend:
                 above = self._lines_above(cm, anchor)
                 indent = next_line_indent(
                     line_text, above, _indent_unit_for(above + [line_text]))
+                if auto_close:
+                    # 块头才谈得上收尾；"要不要真的补"交给纯函数判（下面可能
+                    # 已经挂着同一个收尾、或者这块的下文已经在写了）。
+                    _close = block_closer(line_text)
+                    if _close:
+                        base = _leading_ws(line_text)
+                        if closer_needed(self._lines_below(cm, anchor),
+                                         _close, _indent_width(base)):
+                            closer_text = base + _close
             else:
                 # 有选区时以选区【末行】为基准（正常情况下 sl == el）。
                 anchor = max(int(sl), int(el))
@@ -2909,6 +3046,10 @@ class VbeBackend:
             # InsertLines 在 anchor+1 处插入（anchor == CountOfLines 时即追加到末尾），
             # 已有行自动下移 —— 正是"在本行下方新起一行"。
             cm.InsertLines(anchor + 1, indent)
+            if closer_text:
+                # 收尾插在"新起的空行"下面：块头下面留出缩进好了的一行给用户写
+                # 内容，收尾再往下、缩进回到块头同级。原有行整体再下移一行。
+                cm.InsertLines(anchor + 2, closer_text)
             col = _indent_end_col(indent)
             cp.SetSelection(anchor + 1, col, anchor + 1, col)
             return True

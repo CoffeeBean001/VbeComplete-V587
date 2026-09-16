@@ -323,6 +323,21 @@ except Exception:
 # 一律不接管：宁可这一次不做缩进，也绝不拿旧行文本去赌用户正在敲的那一行。
 ENTER_CTX_MAX_AGE = 0.8
 
+# ---- v79b：块头那行按回车，顺手把【块收尾】也补出来 ----
+# 用户的追加要求：「写 if i=1 then，按回车之后，能自动帮我补全后面的 end if，
+# 而且光标缩进；with 语句块也是这样，自动补全 end with」。
+# 只对"真需要收尾"的块生效（Sub / Function / Property / Type / Enum / If…Then /
+# With / Select Case -> End Xxx；For -> Next、Do -> Loop、While -> Wend）；
+# Else / ElseIf…Then / Case 是块【内】的分支，条件编译 #If 要配 #End If —— 都不补。
+# 下面已经挂着同一个收尾、或这块的下文已经在写了（下一行缩进不比块头浅）也不补，
+# 见 vbe_bridge.closer_needed —— 免得把用户已有的代码顶开。
+# 想关掉（只留缩进、不补收尾）：set VBECOMPLETE_NO_AUTOCLOSE=1
+try:
+    AUTO_CLOSE_BLOCK = (os.environ.get("VBECOMPLETE_NO_AUTOCLOSE",
+                                       "0").strip() != "1")
+except Exception:
+    AUTO_CLOSE_BLOCK = True
+
 # 弹窗可见时这些键由 win32_filter 接管（↑/↓ 导航、Tab 确认、Esc 取消），
 # 且会被 suppress_event() 吞掉。on_press 里绝不能抢先收起弹窗，否则"按方向键
 # 选词"会退化成"按方向键弹窗消失"。
@@ -709,10 +724,15 @@ def main():
             send_vk(VK_RETURN)
 
     def _enter_indent_here():
-        """回车自动缩进（v79）：收起弹窗 -> 按代码结构算出缩进、代出新行。
+        """回车自动缩进（v79）+ 自动补块收尾（v79b）：收起弹窗 -> 算出缩进、代出新行。
 
         与 _new_line_here 的区别只在"缩进怎么来"：这里是 smart 模式 ——
         整行注释则忽略它、跟上方第一个非注释行对齐，块结构开头则缩进一级。
+
+        块头（If…Then / With / Sub …）还会在后面补一行同级的收尾（End If /
+        End With / End Sub…），光标停在中间那行 —— 用户直接写块内容就行。
+        要不要补由后端按 vbe_bridge.block_closer + closer_needed 决定（下面已经
+        挂着同一个收尾、或这块的下文已经在写 -> 不补）。
 
         后端返回 False（光标不在行尾 / 空行 / 引号没闭合 / COM 抽风…）就把
         这一下回车【原样还给系统】—— 绝不让用户"按了回车却没换行"。
@@ -723,7 +743,8 @@ def main():
             pass
         _ok = False
         try:
-            _ok = backend.new_line_below(smart=True)
+            _ok = backend.new_line_below(smart=True,
+                                         auto_close=AUTO_CLOSE_BLOCK)
         except Exception:
             _ok = False
         if not _ok:

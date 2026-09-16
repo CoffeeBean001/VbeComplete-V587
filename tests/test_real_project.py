@@ -7780,7 +7780,7 @@ def main():
         _i56_pair = _src56.index("elif (_pair_ch")
         _i56_vis = _src56.index("elif completer.is_visible():")
         _i56_fn = _src56.index("def _enter_indent_here():")
-        _i56_call = _src56.index("backend.new_line_below(smart=True)")
+        _i56_call = _src56.index("backend.new_line_below(smart=True")
         check("56.10 ★接线护栏：回车分支在自动配对之前、在「弹窗可见」之前；"
               "先收窗再写；COM 没落成要 send_vk(VK_RETURN) 兜底；"
               "判据只在钩子线程读快照（不吃 COM）",
@@ -7838,6 +7838,223 @@ def main():
               [M56.ENTER_INDENT], expect_contain=[True])
     except Exception as _e56:
         check("第 56 节异常: %s" % _e56, [True], expect_contain=[False])
+
+    # ---- 57. v79b：块头那行回车，自动补出块收尾 ----
+    #
+    # 用户的追加要求：「写 if i=1 then，按回车之后，能自动帮我补全后面的 end if，
+    # 而且光标缩进；对于其他的结构语句也是这样，比如 with 语句块，就能自动补全
+    # end with。」
+    print("\n=== 57. 块头回车自动补收尾（v79b）===")
+    try:
+        import main as M57
+        import vbe_bridge as VB57
+        _orig57 = VB57._get_vbe_cached
+
+        # ---- 57.1 块头 -> 收尾 ----
+        check("57.1 block_closer：Sub/Function/Property/Type/Enum/If…Then/With/"
+              "Select Case -> End Xxx；For -> Next；Do -> Loop；While -> Wend",
+              [VB57.block_closer("Sub Foo()"),
+               VB57.block_closer("Private Function Bar() As Long"),
+               VB57.block_closer("Static Property Get X()"),
+               VB57.block_closer("Type Foo"),
+               VB57.block_closer("Enum Color"),
+               VB57.block_closer("If x Then"),
+               VB57.block_closer("    If x = 1 Then '注释"),
+               VB57.block_closer("With rng"),
+               VB57.block_closer("Select Case x"),
+               VB57.block_closer("For i = 1 To 10"),
+               VB57.block_closer("For Each c In rng"),
+               VB57.block_closer("Do"),
+               VB57.block_closer("Do While x < 5"),
+               VB57.block_closer("While x")],
+              expect_contain=["End Sub", "End Function", "End Property",
+                              "End Type", "End Enum", "End If", "End If",
+                              "End With", "End Select", "Next", "Next",
+                              "Loop", "Loop", "Wend"])
+
+        # ---- 57.2 不该补收尾的一个都不许补 ----
+        _N57 = ["ElseIf y Then", "Else", "Case 1, 2", "Case Else",
+                "#If VBA7 Then", "#Else", "If x Then y = 1", "'注释",
+                "Rem 说明", "x = 1", "End If", "Next i", "Loop", "Wend",
+                "End Sub", "    "]
+        check("57.2 block_closer：Else / ElseIf…Then / Case（块【内】的分支）、"
+              "#If / #Else（必须配 #End If）、单选 If、注释、闭合行 -> 全 None",
+              [[t for t in _N57 if VB57.block_closer(t) is not None]],
+              expect_contain=[[]])
+
+        # ---- 57.3 到底该不该补：只看"下方第一个非空行" ----
+        check("57.3 closer_needed：下面没内容 -> 补；下面已挂着同一个收尾"
+              "（含隔空行/带缩进/`Next i`/`Loop While x`）-> 不补；"
+              "缩进不比块头浅 -> 不补；比块头浅 -> 补",
+              [VB57.closer_needed([], "End If", 0),
+               VB57.closer_needed(["End If"], "End If", 0),
+               VB57.closer_needed(["    End If"], "End If", 0),
+               VB57.closer_needed(["", "", "End If"], "End If", 0),
+               VB57.closer_needed(["Next i"], "Next", 4),
+               VB57.closer_needed(["Loop While x"], "Loop", 4),
+               VB57.closer_needed(["End Sub"], "End If", 4),
+               VB57.closer_needed(["    MsgBox 1"], "End If", 4),
+               VB57.closer_needed(["        MsgBox 1"], "End If", 4),
+               VB57.closer_needed(["End If"], None, 0)],
+              expect_contain=[True, False, False, False, False, False,
+                              True, False, False, False])
+
+        # ---- 57.3b _indent_width：空格 1 列 / Tab 4 列 ----
+        check("57.3b _indent_width：空格按 1 列、Tab 按 4 列",
+              [VB57._indent_width("    x"), VB57._indent_width("\tx"),
+               VB57._indent_width(""), VB57._indent_width("\t  x")],
+              expect_contain=[4, 4, 0, 6])
+
+        # ---- 57.4 ★集成：真能多写出一行收尾，光标停在中间那行 ----
+        class _CM57(object):
+            def __init__(self, lines):
+                self.lines = list(lines)
+                self.Name = "Module1"
+
+            @property
+            def CountOfLines(self):
+                return len(self.lines)
+
+            def Lines(self, start, count):
+                s0 = max(0, int(start) - 1)
+                return "".join(l + "\n"
+                               for l in self.lines[s0:s0 + int(count)])
+
+            def InsertLines(self, start, text):
+                i = min(max(0, int(start) - 1), len(self.lines))
+                for k, ln in enumerate(str(text).split("\n")):
+                    self.lines.insert(i + k, ln)
+
+        class _Pane57(object):
+            def __init__(self, cm, sel):
+                self.CodeModule = cm
+                self.sel = sel
+
+            def GetSelection(self):
+                return self.sel
+
+            def SetSelection(self, sl, sc, el, ec):
+                self.sel = (sl, sc, el, ec)
+
+        class _VBE57(object):
+            def __init__(self, pane):
+                self.ActiveCodePane = pane
+
+        def _nl57(lines, line_no, col, auto_close=True):
+            cm57 = _CM57(lines)
+            pane57 = _Pane57(cm57, (line_no, col, line_no, col))
+            VB57._get_vbe_cached = lambda: _VBE57(pane57)
+            ok57 = VB57.VbeBackend().new_line_below(smart=True,
+                                                    auto_close=auto_close)
+            return ok57, cm57.lines, pane57.sel
+
+        # 用户原话的场景：写 `Sub Foo()` 回车 -> 中间留出缩进好的一行 + 补 `End Sub`
+        check("57.4 ★集成：`Sub Foo()` 行尾回车 -> 中间一行缩进 4 空格（光标在这儿）、"
+              "下一行补 `End Sub`",
+              [_nl57(["Sub Foo()"], 1, 10)],
+              expect_contain=[(True, ["Sub Foo()", "    ", "End Sub"],
+                               (2, 5, 2, 5))])
+
+        # 用户原话的场景：`If i = 1 Then` 回车 -> 补 `End If`
+        check("57.4b ★集成：`If x = 1 Then` 行尾回车 -> 中间一行缩进、下一行补 `End If`",
+              [_nl57(["If x = 1 Then"], 1, 14)],
+              expect_contain=[(True, ["If x = 1 Then", "    ", "End If"],
+                               (2, 5, 2, 5))])
+
+        check("57.4c ★集成：`With rng` 回车 -> 补 `End With`",
+              [_nl57(["With rng"], 1, 9)],
+              expect_contain=[(True, ["With rng", "    ", "End With"],
+                               (2, 5, 2, 5))])
+
+        # ★最常见的真实场景：在 Sub 里写 If，下面还压着 `End Sub`
+        check("57.4d ★集成：Sub 里写 `If x = 1 Then`（下面压着 End Sub）-> "
+              "中间一行 8 空格、补的 `    End If` 插在 `End Sub` 之前、"
+              "`Sub Foo()` 与 `End Sub` 一个字没动",
+              [_nl57(["Sub Foo()", "    x = 1", "    If x = 1 Then", "End Sub"],
+                     3, 19)],
+              expect_contain=[(True,
+                               ["Sub Foo()", "    x = 1", "    If x = 1 Then",
+                                "        ", "    End If", "End Sub"],
+                               (4, 9, 4, 9))])
+
+        # 下面已经挂着同一个收尾（含隔着空行）-> 绝不补出重复的
+        check("57.4e ★集成：下面已经有 `End Sub` / 隔着空行的 `End Sub` -> "
+              "只缩进、不补重复的收尾",
+              [_nl57(["Sub Foo()", "End Sub"], 1, 10),
+               _nl57(["Sub Foo()", "", "End Sub"], 1, 10),
+               _nl57(["Sub Foo()", "    Do", "    Loop", "End Sub"], 2, 7)],
+              expect_contain=[(True, ["Sub Foo()", "    ", "End Sub"],
+                               (2, 5, 2, 5)),
+                              (True, ["Sub Foo()", "    ", "", "End Sub"],
+                               (2, 5, 2, 5)),
+                              (True, ["Sub Foo()", "    Do", "        ",
+                                      "    Loop", "End Sub"], (3, 9, 3, 9))])
+
+        # 块【内】的分支（Else / Case）与条件编译（#If）都不许补
+        check("57.4f ★集成：`Else` 只缩进不补（它是分支）；`#If … Then` 也不补"
+              "（那要配 #End If）",
+              [(_nl57(["Sub Foo()", "    If x = 1 Then", "    Else"], 3, 9)[1],
+                _nl57(["#If VBA7 Then"], 1, 14)[1])],
+              expect_contain=[(["Sub Foo()", "    If x = 1 Then", "    Else",
+                                "        "],
+                               ["#If VBA7 Then", "    "])])
+
+        # auto_close=False（或开关关掉）-> 回到 v79 老口径：只缩进
+        check("57.4g auto_close=False -> 只缩进、不补收尾（v79 老口径不变）",
+              [_nl57(["Sub Foo()"], 1, 10, auto_close=False),
+               _nl57(["If x = 1 Then"], 1, 14, auto_close=False)],
+              expect_contain=[(True, ["Sub Foo()", "    "], (2, 5, 2, 5)),
+                              (True, ["If x = 1 Then", "    "], (2, 5, 2, 5))])
+
+        # Shift+Enter 那条路（smart=False）任何情况下都不许补收尾
+        _cm57s = _CM57(["Sub Foo()"])
+        _pane57s = _Pane57(_cm57s, (1, 2, 1, 2))
+        VB57._get_vbe_cached = lambda: _VBE57(_pane57s)
+        _ok57s = VB57.VbeBackend().new_line_below()
+        check("57.4h Shift+Enter（smart=False）不补收尾：不改老行为",
+              [(_ok57s, _cm57s.lines)],
+              expect_contain=[(True, ["Sub Foo()", ""])])
+
+        VB57._get_vbe_cached = lambda: None
+        check("57.4i 取不到 VBE -> False（调用方把回车原样还给系统）",
+              [VB57.VbeBackend().new_line_below(smart=True, auto_close=True)],
+              expect_contain=[False])
+        VB57._get_vbe_cached = _orig57
+
+        # ---- 57.5 ★接线护栏 ----
+        _src57 = io.open(os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "main.py"), encoding="utf-8").read()
+        _fn57 = _src57[_src57.index("def _enter_indent_here():"):
+                       _src57.index("def _move_caret_here(delta):")]
+        check("57.5 ★接线护栏：开关走环境变量、_enter_indent_here 把开关交给后端；"
+              "先收窗 -> 再写 -> 写不成 send_vk(VK_RETURN) 兜底",
+              ['os.environ.get("VBECOMPLETE_NO_AUTOCLOSE"' in _src57,
+               "AUTO_CLOSE_BLOCK" in _src57,
+               "auto_close=AUTO_CLOSE_BLOCK" in _fn57,
+               "backend.new_line_below(smart=True" in _fn57,
+               "completer.hide()" in _fn57,
+               _fn57.index("completer.hide()") < _fn57.index("new_line_below"),
+               "send_vk(VK_RETURN)" in _fn57],
+              expect_contain=[True] * 7)
+
+        # 后端里也必须真的走那两个纯函数（别绕过判定硬写收尾）
+        _vbsrc57 = io.open(os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "vbe_bridge.py"), encoding="utf-8").read()
+        check("57.5b 后端补收尾前必须过 block_closer + closer_needed 判定，"
+              "并读下方各行（_lines_below）",
+              ["block_closer(line_text)" in _vbsrc57,
+               "closer_needed(self._lines_below(" in _vbsrc57,
+               "if closer_text:" in _vbsrc57],
+              expect_contain=[True] * 3)
+
+        # ---- 57.6 出厂默认：开着 ----
+        check("57.6 ★出厂默认：块头回车自动补收尾开着"
+              "（VBECOMPLETE_NO_AUTOCLOSE 未设）",
+              [M57.AUTO_CLOSE_BLOCK], expect_contain=[True])
+    except Exception as _e57:
+        check("第 57 节异常: %s" % _e57, [True], expect_contain=[False])
 
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))
