@@ -9400,6 +9400,282 @@ def main():
     except Exception as _e62:
         check("第 62 节异常: %s" % _e62, [True], expect_contain=[False])
 
+    print("\n=== 63. 补收尾的边界：分支行 / 注释不算『本块已结束』（v82）===")
+    try:
+        import vbe_bridge as VB63
+
+        _ocb63 = VB63._own_closer_below
+        _cn63 = VB63.closer_needed
+
+        # ---- 63.1 纯函数：同级压着分支行 / 注释，本块收尾仍在下面 ----
+        check("63.1 _own_closer_below（v82）：同级的 `Else` / `ElseIf…Then` / "
+              "`Case` / `#Else` / 整行注释都不是『本块到此为止』的边界 —— "
+              "扫描跳过它们继续往下找；对照组（同级是普通代码 / 别的块头）"
+              "仍然算边界",
+              [[_ocb63(["    Else", "        ", "    End If"], "End If", "if", 4),
+                _ocb63(["    ElseIf y = 2 Then", "    End If"], "End If", "if", 4),
+                _ocb63(["    Case 1", "        y = 1", "    End Select"],
+                       "End Select", "select", 4),
+                _ocb63(["    #Else", "    End If"], "End If", "if", 4),
+                _ocb63(["    ' 说明", "    End If"], "End If", "if", 4),
+                _ocb63(["    Rem 说明", "    End If"], "End If", "if", 4),
+                _ocb63(["    x = 1", "    End If"], "End If", "if", 4),
+                _ocb63(["    For i = 1 To 3", "    Next", "    End If"],
+                       "End If", "if", 4)]],
+              expect_contain=[[True, True, True, True, True, True,
+                               False, False]])
+
+        # ---- 63.2 closer_needed（kind 给定）同口径 ----
+        check("63.2 closer_needed（kind 给定，v82）：下面压着同级分支行 / 注释"
+              " -> 本块收尾还在下面 -> 【不补】；同级是普通代码 -> 本块已结束"
+              " -> 补（v80a 口径不退化）",
+              [[_cn63(["    Else", "        ", "    End If"], "End If", 4,
+                      kind="if", lines_above=["Sub Test()", "    If x = 1 Then"]),
+                _cn63(["    Else", "    End If"], "End If", 4, kind="if",
+                      lines_above=["Sub Test()", "    If x = 1 Then"]),
+                _cn63(["    Case 1", "        y = 1", "    End Select"],
+                      "End Select", 4, kind="select",
+                      lines_above=["Sub Test()", "    Select Case x"]),
+                _cn63(["    ' 注释", "    End If"], "End If", 4, kind="if",
+                      lines_above=["Sub Test()", "    If x = 1 Then"]),
+                _cn63(["    x = 1", "    End If"], "End If", 4, kind="if",
+                      lines_above=["Sub Test()", "    If x = 1 Then"])]],
+              expect_contain=[[False, False, False, False, True]])
+
+        # ---- 集成骨架（要 ReplaceLine：分支行对齐会改本行行首空白）----
+        class _CM63(object):
+            def __init__(self, lines):
+                self.lines = list(lines)
+                self.Name = "Module1"
+
+            @property
+            def CountOfLines(self):
+                return len(self.lines)
+
+            def Lines(self, start, count):
+                s0 = max(0, int(start) - 1)
+                return "".join(l + "\n"
+                               for l in self.lines[s0:s0 + int(count)])
+
+            def InsertLines(self, start, text):
+                i = min(max(0, int(start) - 1), len(self.lines))
+                for k, ln in enumerate(str(text).split("\n")):
+                    self.lines.insert(i + k, ln)
+
+            def ReplaceLine(self, line, text):
+                self.lines[int(line) - 1] = str(text)
+
+        class _Pane63(object):
+            def __init__(self, cm, sel):
+                self.CodeModule = cm
+                self.sel = sel
+
+            def GetSelection(self):
+                return self.sel
+
+            def SetSelection(self, sl, sc, el, ec):
+                self.sel = (sl, sc, el, ec)
+
+        class _VBE63(object):
+            def __init__(self, pane):
+                self.ActiveCodePane = pane
+
+        _orig63 = VB63._get_vbe_cached
+
+        def _nl63(lines, line_no):
+            """光标落在第 line_no 行【行尾】，回车走 smart + auto_close。"""
+            cm63 = _CM63(lines)
+            col = len(lines[line_no - 1]) + 1
+            pane63 = _Pane63(cm63, (line_no, col, line_no, col))
+            VB63._get_vbe_cached = lambda: _VBE63(pane63)
+            ok63 = VB63.VbeBackend().new_line_below(smart=True,
+                                                    auto_close=True)
+            return ok63, cm63.lines, pane63.sel
+
+        # ---- 63.3 ★集成：用户报的场景 ----
+        check("63.3 ★集成（用户报的场景，v82）：`If … Then` 回车已经补过一次 "
+              "`End If`，下面还压着同级的 `Else` —— 回到 `Then` 那行行尾再按"
+              "回车，只插一行缩进好的空行，【不再】多补一个 `End If`",
+              [_nl63(["Sub Test()",
+                      "    If x = 1 Then",
+                      "    Else",
+                      "        ",
+                      "    End If",
+                      "End Sub"], 2),
+               _nl63(["Sub Test()",
+                      "    If x = 1 Then",
+                      "    Else",
+                      "    End If",
+                      "End Sub"], 2)],
+              expect_contain=[(True,
+                               ["Sub Test()",
+                                "    If x = 1 Then",
+                                "        ",
+                                "    Else",
+                                "        ",
+                                "    End If",
+                                "End Sub"],
+                               (3, 9, 3, 9)),
+                              (True,
+                               ["Sub Test()",
+                                "    If x = 1 Then",
+                                "        ",
+                                "    Else",
+                                "    End If",
+                                "End Sub"],
+                               (3, 9, 3, 9))])
+
+        # ---- 63.4 ★集成：ElseIf 与 Select Case 的 Case 同理 ----
+        check("63.4 ★集成：`ElseIf … Then` 压在同级、`Select Case` 里的 "
+              "`Case` 压在同级 —— 同样只插一行、不再多补 `End If` / "
+              "`End Select`",
+              [_nl63(["Sub Test()",
+                      "    If x = 1 Then",
+                      "        MsgBox 1",
+                      "    ElseIf y = 2 Then",
+                      "        MsgBox 2",
+                      "    End If",
+                      "End Sub"], 2),
+               _nl63(["Sub Test()",
+                      "    Select Case x",
+                      "    Case 1",
+                      "        y = 1",
+                      "    Case 2",
+                      "        y = 2",
+                      "    End Select",
+                      "End Sub"], 2)],
+              expect_contain=[(True,
+                               ["Sub Test()",
+                                "    If x = 1 Then",
+                                "        ",
+                                "        MsgBox 1",
+                                "    ElseIf y = 2 Then",
+                                "        MsgBox 2",
+                                "    End If",
+                                "End Sub"],
+                               (3, 9, 3, 9)),
+                              (True,
+                               ["Sub Test()",
+                                "    Select Case x",
+                                "        ",
+                                "    Case 1",
+                                "        y = 1",
+                                "    Case 2",
+                                "        y = 2",
+                                "    End Select",
+                                "End Sub"],
+                               (3, 9, 3, 9))])
+
+        # ---- 63.5 ★集成：同级夹着一行注释 ----
+        check("63.5 ★集成：`If` 同级夹着一行注释时同理（注释不参与块结构，"
+              "不算『本块到此为止』）—— 只插一行",
+              [_nl63(["Sub Test()",
+                      "    If x = 1 Then",
+                      "    ' 说明",
+                      "    End If",
+                      "End Sub"], 2)],
+              expect_contain=[(True,
+                               ["Sub Test()",
+                                "    If x = 1 Then",
+                                "        ",
+                                "    ' 说明",
+                                "    End If",
+                                "End Sub"],
+                               (3, 9, 3, 9))])
+
+        # ---- 63.6 ★端到端：从零走完用户那三步 ----
+        def _flow63():
+            cm63 = _CM63(["Sub Test()", "    If x = 1 Then", "End Sub"])
+            pane63 = _Pane63(cm63, (2, 18, 2, 18))
+            VB63._get_vbe_cached = lambda: _VBE63(pane63)
+
+            def key(line_no, text=None):
+                if text is not None:
+                    cm63.lines[line_no - 1] = text
+                cur = cm63.lines[line_no - 1]
+                pane63.sel = (line_no, len(cur) + 1, line_no, len(cur) + 1)
+                return VB63.VbeBackend().new_line_below(smart=True,
+                                                        auto_close=True)
+
+            r1 = key(2)
+            s1 = list(cm63.lines)               # 补出 `End If`、光标停中间行
+            r2 = key(3, "        Else")
+            s2 = list(cm63.lines)               # `Else` 拉回同级、新行深一级
+            r3 = key(2)                         # ★回到 `Then` 行行尾再回车
+            return r1, s1, r2, s2, r3, list(cm63.lines)
+
+        check("63.6 ★端到端（用户那条路径，v82）：①写 `If … Then` 回车 -> "
+              "补出 `End If` ②在块体行写 `Else` 回车 -> 拉回 `If` 同级、新行"
+              "深一级 ③回到 `Then` 行行尾再回车 -> 只插一行空行，`End If` "
+              "【没有】变成两条",
+              [_flow63()],
+              expect_contain=[(True,
+                               ["Sub Test()", "    If x = 1 Then", "        ",
+                                "    End If", "End Sub"],
+                               True,
+                               ["Sub Test()", "    If x = 1 Then", "    Else",
+                                "        ", "    End If", "End Sub"],
+                               True,
+                               ["Sub Test()", "    If x = 1 Then", "        ",
+                                "    Else", "        ", "    End If",
+                                "End Sub"])])
+
+        # ---- 63.7 回归护栏 ----
+        check("63.7 回归护栏：①嵌套里内层 `Else` 缩进更深时不误判；"
+              "②结构完好、没有分支行 -> 照旧只插一行；③v79c/v80a 老口径不许"
+              "退化（模块级 `Type` 下面紧邻过程头 -> 仍补 `End Type`）",
+              [_nl63(["Sub Test()",
+                      "    If x = 1 Then",
+                      "        If y = 2 Then",
+                      "        Else",
+                      "        End If",
+                      "    End If",
+                      "End Sub"], 2)[1],
+               _nl63(["Sub Test()",
+                      "    If x = 1 Then",
+                      "        MsgBox 1",
+                      "    End If",
+                      "End Sub"], 2)[1],
+               _nl63(["Type Foo", "Sub Bar()", "End Sub"], 1)[1]],
+              expect_contain=[["Sub Test()",
+                               "    If x = 1 Then",
+                               "        ",
+                               "        If y = 2 Then",
+                               "        Else",
+                               "        End If",
+                               "    End If",
+                               "End Sub"],
+                              ["Sub Test()",
+                               "    If x = 1 Then",
+                               "        ",
+                               "        MsgBox 1",
+                               "    End If",
+                               "End Sub"],
+                              ["Type Foo", "    ", "End Type", "Sub Bar()",
+                               "End Sub"]])
+
+        VB63._get_vbe_cached = _orig63
+
+        # ---- 63.8 ★接线护栏 ----
+        _root63 = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        _vbsrc63 = io.open(os.path.join(_root63, "vbe_bridge.py"),
+                           encoding="utf-8").read()
+        _fn63 = _vbsrc63.split("def _own_closer_below")[1].split(
+            "def closer_needed")[0]
+        check("63.8 ★接线护栏：`_own_closer_below` 里确实把【注释】与"
+              "【块内分支行】跳过，而且这一跳必须发生在缩进判定【之前】"
+              "（放后面就等于没跳）",
+              [[("_is_comment_only(raw) or _branch_word(raw) is not None"
+                 in _fn63),
+                ("w = _indent_width(raw)" in _fn63),
+                (_fn63.index("_branch_word(raw) is not None")
+                 < _fn63.index("w = _indent_width(raw)")),
+                "_branch_word" in _vbsrc63]],
+              expect_contain=[[True, True, True, True]])
+
+    except Exception as _e63:
+        check("第 63 节异常: %s" % _e63, [True], expect_contain=[False])
+
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))
     if FAILURES:

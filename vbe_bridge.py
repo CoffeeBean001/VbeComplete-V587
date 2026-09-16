@@ -543,17 +543,28 @@ def _own_closer_below(lines_below, closer, kind, base):
       * 缩进比块头浅的行 -> 已经出了这一层，收尾不在下面；
       * 缩进更深的行 -> 属于嵌套块，与"本块的收尾在哪"无关，跳过；更深的
         同类块头 / 收尾另用 deeper 配平（免得把内层的 `Next` 当成"用户写歪
-        的收尾"而少补一条）。
+        的收尾"而少补一条）；
+      * 空行 / 整行注释 / 块内分支行（`Else` / `ElseIf…Then` / `Case…`，
+        含 `#Else` / `#ElseIf…Then`）-> 都不是"本块到此为止"的边界，跳过。
 
     为什么要这一问（v80a，用户报的）：先写了一个 `For`（回车自动补了 `Next`），
     再回到它【上面】补一个新的 `For` 并回车 —— 新 `For` 下面压着的正是原来那个
     `For`（同级）。旧口径"同级一律不补（只有模块级缩进 0 才补）"，于是新 `For`
     的 `Next` 永远补不出来，用户看到的就是"只换行缩进、不补 `Next`"。
+
+    ★v82（用户报的"`If…Then` 补过一次 `End If`，写完 `Else` 再回到 `Then` 那行
+    回车又补一个"）：`Else` / `Case` 这类**分支行**本来就在本块【里面】，可 v81
+    起分支行会被拉回块头【同级】—— 于是它长得跟"同级的别的代码"一模一样，旧判据
+    一眼认定"本块已结束了"，收尾就当没看见，回车再补一条。注释同理（注释根本不
+    参与块结构）。这两类行现在一律跳过，扫描继续往下走。
     """
     depth = 0        # 同缩进的同类块头（本块下面嵌着的同类块）
     deeper = 0       # 真正嵌套（缩进更深）的同类块头
     for raw in (lines_below or ()):
         if not (raw or "").strip():
+            continue
+        if _is_comment_only(raw) or _branch_word(raw) is not None:
+            # ★v82：注释 / 块内分支行都不是"本块到此为止"的边界（详见 docstring）。
             continue
         w = _indent_width(raw)
         if w < base:
@@ -594,7 +605,7 @@ def closer_needed(lines_below, closer, base_indent, kind=None, lines_above=()):
     传了 kind（生产路径上一定会传）时的口径：
       * 下方【没有】本块自己的收尾 -> 补（怎么算"没有"，见 _own_closer_below：
         它按缩进分类扫下方各行，同级同类块头配平、同级别的东西算边界、
-        更深的行跳过）；
+        空行 / 注释 / 分支行跳过、更深的行跳过）；
       * 下方第一个非空行就是本块的同类收尾、且缩进比块头【更浅】-> 再问一句
         `_closer_owner_above`："那是外层块的收尾（本块该补）还是用户写歪的
         （不补）"；
@@ -613,6 +624,13 @@ def closer_needed(lines_below, closer, base_indent, kind=None, lines_above=()):
     ★v80a 变更：传了 kind 时，"同级"一档不再是"只有模块级（缩进 0）才补"，
     改成问一句 `_own_closer_below` —— "下面到底有没有本块自己的收尾"。
     别的分档一律不动。
+
+    ★v82 变更（不再多补一条收尾）：`_own_closer_below` 现在把【整行注释】和
+    【块内分支行】也跳过 —— `Else` / `ElseIf…Then` / `Case…` 是块内的分支，
+    不是"本块已结束"的边界。旧判据把它们当边界，于是 `If…Then` 补过一次
+    `End If`、写完 `Else` 后再回到 `Then` 那行回车，会【再补一个】`End If`
+    （用户报的正是这个；`Select Case` 里的 `Case` 完全同理）。这条只让"补"
+    更保守，别的分档一字未动。
     """
     if not closer:
         return False
