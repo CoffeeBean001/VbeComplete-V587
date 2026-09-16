@@ -473,32 +473,97 @@ def _indent_width(raw):
     return n
 
 
-def closer_needed(lines_below, closer, base_indent):
-    """下面到底要不要补 closer（v79b，纯函数）。
+def _is_closer_text(line_text, closer):
+    """这一行是不是 closer 那一行（`End If` / `Next i` / `Loop While x`…）。纯函数。
+
+    先用 _code_part 去掉注释：`Next  '下一个` 也算 `Next`。
+    """
+    if not closer:
+        return False
+    s = _code_part(line_text).strip().lower()
+    if not s:
+        return False
+    want = closer.strip().lower()
+    return s == want or s.startswith(want + " ")
+
+
+def _closer_owner_above(lines_above, kind, indent):
+    """上方有没有一个【同类、仍未闭合】的块头，正好缩进在 indent 列？（纯函数）
+
+    lines_above: 块头行【上方】各行的文本（越靠近它的越靠后）
+    kind:        _block_kind 认出来的类型名（for / if / with / do / while /
+                 select / type / enum / sub / function / property）
+    indent:      待判定的收尾行缩进宽度
+
+    只干一件事：回答"下面那个更浅的同类收尾，是外层块（嵌套的 For/If/Do/With…）
+    的还是本块的"。从近到远扫，用"同类收尾 +1 / 同类块头 -1"的括号配对法，
+    遇到一个"还开着"的同类块头时，看它缩进是不是正好等于那个收尾的缩进
+    —— 是，就说明那个收尾属于它。
+
+    为什么需要（v79c，用户报的双层 For）：内层 `For` 下面压着的是【外层】的
+    `Next`，缩进比内层浅。单看缩进"比块头浅就补"是对的，但用户自己把收尾写歪
+    一级的情形也长这样 —— 再补一条就成 `Next` 双份（编译报错）。加上这一问，
+    两种情形就分开了：外层真有一个同类块头在那一列 -> 补；没有 -> 不补。
+    """
+    closer = _BLOCK_CLOSERS.get(kind or "")
+    if not closer:
+        return False
+    depth = 0
+    for raw in reversed(list(lines_above or ())):
+        if not (raw or "").strip():
+            continue
+        if _is_closer_text(raw, closer):
+            depth += 1                         # 更近处已经闭合了一层
+            continue
+        if _block_kind(raw) != kind:
+            continue
+        if depth == 0:
+            return _indent_width(raw) == int(indent)
+        depth -= 1
+    return False
+
+
+def closer_needed(lines_below, closer, base_indent, kind=None, lines_above=()):
+    """下面到底要不要补 closer（v79b；嵌套判定 v79c，纯函数）。
 
     lines_below: 光标行【下方】各行的文本（越靠近它的越靠前）
     closer:      block_closer 算出来的收尾文本（空 / None -> 不补）
     base_indent: 块头那行的行首缩进【宽度】
+    kind:        块头类型（可选；给了才能判"更浅的同类收尾是不是外层块的"）
+    lines_above: 块头行上方各行（可选，同上）
 
     只看"下方第一个非空行"，免得把用户已经写好的代码顶开：
-      * 它已经是这个收尾（`End If` / `Next i` / `Loop While x`…）-> 不补（重复了）；
-      * 它比块头缩进得【更浅】-> 补：说明本块还没内容就该结束了，收尾正该落在这儿；
-      * 它跟块头齐平或更深 -> 不补：说明这块的下文/收尾已经在写了，别硬塞；
+      * 它比块头缩进得【更浅】-> 说明本块还没内容就该结束了，收尾正该落在这儿；
+        但若它就是本块的收尾（同类），先问一句"是不是外层块的收尾"（见
+        _closer_owner_above）—— 是外层的才补，否则那是用户自己写歪了的收尾；
+      * 它跟块头齐平或更深 -> 不补：这块的下文/收尾已经在写了，别硬塞；
+        唯一的例外是【块头在模块级（缩进 0）】：那里"齐平"的只可能是下一个
+        声明/过程头，说明本块还没写内容，收尾该补 —— Type / Enum 正是靠这条
+        才补得出来（它们只出现在模块级）；
       * 下方根本没有非空行（文件到底了）-> 补。
     空行一律跳过（下方可能隔着一堆空行才挂着真正的收尾）。
+
+    不传 kind/lines_above（旧式调用）时，"更浅的同类收尾"一律按【不补】处理 ——
+    这是最保守的一档，与 v79b 完全一致。
     """
     if not closer:
         return False
-    want = closer.strip().lower()
+    base = int(base_indent)
     for raw in (lines_below or ()):
         s = (raw or "").strip()
         if not s:
             continue                           # 空行：下面还可能挂着收尾
-        low = s.lower()
-        if (low == want or low.startswith(want + " ")
-                or low.startswith(want + "'")):
-            return False                       # 收尾已经在下面了
-        return _indent_width(raw) < int(base_indent)
+        w = _indent_width(raw)
+        if _is_closer_text(raw, closer):
+            if w >= base:
+                return False                   # 本块的收尾已经挂在下面了
+            # 比块头浅：要么是外层块的收尾（本块该补），要么是用户写歪的
+            return _closer_owner_above(lines_above, kind, w)
+        if w != base:
+            return w < base
+        # 同级、且不是本块的收尾：模块级 -> 本块还没内容，补；过程内 -> 维持
+        # v79b 老口径（不补），免得把用户正在写的块体顶开。
+        return base == 0
     return True
 
 
@@ -1548,12 +1613,35 @@ def _classify(line_text, caret_col):
     return in_str, (not in_str and comment_pos != -1)
 
 
+def _proc_owns_line(cm, name, line_no):
+    """过程 name 是否真的把第 line_no 行圈在里面（归属校验）。"""
+    try:
+        return vba_parser.proc_owns_line(cm.Lines(1, line_no), line_no, name)
+    except Exception:
+        return False
+
+
 def _proc_of_line(cm, line_no):
     """返回该行所在的过程名；不在任何过程内（模块声明区）则返回 None。
 
     优先用「代码文本往上找最近的 Sub/Function/Property」（纯 Python，
     行为确定、可单测）；COM 的 ProcOfLine 只作兜底——它在 pywin32 下
     的 byref 参数（ProcKind）常常抛异常而拿不到值。
+
+    ⚠️ v79c 修两处（都在兜底那一支，但都直接影响"作用域"判断）：
+      1. pywin32 下 `ProcOfLine` 返回的是【元组】(名字, ProcKind)（ProcKind 是
+         byref 出参），旧代码直接 `str(name)` 得到的是 `"('插入工分', 0)"` 这种
+         垃圾字符串。它不是 None，于是 ctx["proc_name"] 在【模块级/End Sub 行】
+         上变成一个既非空、又不等于任何真实过程名的值 —— 作用域过滤里
+         `scope_only` 会被它误判成 True（本该按 v37 口径"模块级声明不受限"），
+         过滤阈值也跟着错位。
+      2. 更要命的是【不能盲信 VBE】：实测它会把手伸到过程外 —— `End Sub`
+         那一行、以及它下面直到下一个过程头之间的所有行，都归给【前一个】
+         过程；模块声明区里第一个过程头【之前】的行，归给【第一个】过程。
+         照单全收就等于：在模块级 / 新起一个函数的位置上，前一个函数的局部
+         变量全部变成"当前过程的"——正是用户报的"别的函数的变量泄漏到本
+         位置"。所以拿到名字后必须做一次归属校验（proc_owns_line）：该过程头
+         在光标上方、且两者之间没有它的收尾行，才算真的在里面。
     """
     # 1) 文本扫描：取 1..line_no 行，从光标行往上找最近的过程头
     try:
@@ -1568,10 +1656,15 @@ def _proc_of_line(cm, line_no):
     for kind in (0, 1, 2, 3):
         try:
             name = cm.ProcOfLine(line_no, kind)
-            if name:
-                return str(name)
         except Exception:
             continue
+        if isinstance(name, (tuple, list)):
+            name = name[0] if name else ""      # (名字, ProcKind)
+        name = str(name or "").strip()
+        if not name:
+            continue
+        if _proc_owns_line(cm, name, line_no):  # 归属校验：别信"邻居过程"
+            return name
     return None
 
 
@@ -2989,12 +3082,17 @@ class VbeBackend:
             排好的缩进较劲；
           * 本行引号没闭合：VBE 原生回车会替用户补上右引号，别抢这个活。
 
-        auto_close=True（回车自动补收尾，v79b）—— 仅对 smart 模式生效：
-        块头是 `If x Then` / `With rng` / `Sub Foo()` 这类【真需要收尾】的，
-        再在其后补一行同级的 `End If` / `End With` / `End Sub`…，光标停在中间
-        那行（缩进正好），用户直接在块里写内容。要不要补由纯函数
-        block_closer + closer_needed 决定：下面已经挂着同一个收尾、或者这块的
-        下文已经在写了（下一行缩进 >= 本行）—— 都不补，免得顶开已有代码。
+        auto_close=True（回车自动补收尾，v79b；嵌套判定 v79c）—— 仅对 smart 模式生效：
+        块头是 `If x Then` / `With rng` / `Sub Foo()` / `Type Foo` / `Enum E` 这类
+        【真需要收尾】的，再在其后补一行同级的 `End If` / `End With` / `Next` /
+        `End Type`…，光标停在中间那行（缩进正好），用户直接在块里写内容。要不要补
+        由纯函数 block_closer + closer_needed 决定：下面已经挂着本块的收尾、或者
+        这块的下文已经在写了 —— 都不补，免得顶开已有代码。
+
+        ⚠️ v79c：内层块下面压着的往往是【外层】的收尾（双层 `For` 里的 `Next`），
+        它的缩进正好比内层块头浅一格 —— 单看缩进会误判成"已经有收尾了"。所以
+        closer_needed 还会查"上方有没有一个同类、未闭合、缩进正好对上它的块头"，
+        有就说明那个收尾属于外层，本块照样得补。
 
         成功返回 True；不在代码窗 / 取不到 COM / 出任何异常都返回 False ——
         调用方据此把这一下按键原样还给系统（回车绝不能吞掉）。
@@ -3031,11 +3129,15 @@ class VbeBackend:
                 if auto_close:
                     # 块头才谈得上收尾；"要不要真的补"交给纯函数判（下面可能
                     # 已经挂着同一个收尾、或者这块的下文已经在写了）。
+                    # v79c：把块头类型与上方各行一并交给它 —— 判"更浅的同类收尾
+                    # 是不是外层块的"（双层 For 的 `Next` 就长这样）要用。
                     _close = block_closer(line_text)
                     if _close:
                         base = _leading_ws(line_text)
-                        if closer_needed(self._lines_below(cm, anchor),
-                                         _close, _indent_width(base)):
+                        if closer_needed(self._lines_below(cm, anchor), _close,
+                                         _indent_width(base),
+                                         kind=_block_kind(line_text),
+                                         lines_above=above):
                             closer_text = base + _close
             else:
                 # 有选区时以选区【末行】为基准（正常情况下 sl == el）。

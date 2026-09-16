@@ -1124,6 +1124,42 @@ def proc_at_line(code, line_no):
     return None
 
 
+def proc_owns_line(code, line_no, name):
+    """过程 name 是否真的把第 line_no 行（1-based）圈在里面。纯函数。
+
+    与 proc_at_line 的分工：
+      * proc_at_line 答"从这一行往上，最近的过程头是谁"；
+      * 本函数答"这个名字的过程是不是真的包含这一行" —— 从该行往上找，先遇到
+        它的过程头 -> True；先遇到任何过程收尾（End Sub/Function/Property）
+        -> False（说明这一行其实在过程【外】：`End Sub` 那行本身、过程之间的
+        空行、模块声明区）。
+    name 为空 / 找不到它的过程头 -> False（宁可不认，也不认错）。
+
+    为什么需要它（v79c）：VBE 的 CodeModule.ProcOfLine 会把手伸到过程外 ——
+    实测 `End Sub` 及其下方直到下一个过程头之间的行都归给【前一个】过程，
+    声明区里第一个过程头之前的行归给【第一个】过程。盲信它，就会出现"在模块级
+    / 新函数的位置上，前一个函数的局部变量全被当成当前过程的" —— 也就是
+    "别的函数的变量泄漏到本位置"。
+    """
+    if not code or not line_no or line_no < 1 or not name:
+        return False
+    want = str(name).strip().lower()
+    if not want:
+        return False
+    lines = _mask_strings_and_comments(code).split("\n")
+    idx = min(int(line_no), len(lines)) - 1
+    while idx >= 0:
+        line = lines[idx].strip()
+        if line:
+            m = _RE_SUB.match(line) or _RE_PROP.match(line)
+            if m and m.group(1).lower() == want:
+                return True
+            if _RE_ANY_PROC_END.match(line):
+                return False
+        idx -= 1
+    return False
+
+
 def extract_identifiers(code):
     """返回模块中所有可补全标识符名（去重，保留首次出现顺序）。"""
     out = []

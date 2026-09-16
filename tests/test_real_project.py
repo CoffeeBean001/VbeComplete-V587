@@ -8056,6 +8056,323 @@ def main():
     except Exception as _e57:
         check("第 57 节异常: %s" % _e57, [True], expect_contain=[False])
 
+    # ---- 58. v79c：嵌套块各自补收尾 + 模块级 Type/Enum + 过程归属校验 ----
+    #
+    # 用户报的三件事：
+    #   1) "我在一个函数里定义了一个变量 targetsheet，在定义另一个函数时输入 tes，
+    #      会提示出 targetsheet"（跨过程泄漏）；
+    #   2) "双层 for 只能自动补全外层 for，内层的 for 不会自动补 next"；
+    #   3) "type、enum 这种结构语句不能自动补全"。
+    print("\n=== 58. 嵌套收尾 / 模块级 Type·Enum / 过程归属（v79c）===")
+    try:
+        import vbe_bridge as VB58
+        import parser as P58
+        _orig58 = VB58._get_vbe_cached
+
+        class _CM58(object):
+            def __init__(self, lines):
+                self.lines = list(lines)
+                self.Name = "Module1"
+
+            @property
+            def CountOfLines(self):
+                return len(self.lines)
+
+            def Lines(self, start, count):
+                s0 = max(0, int(start) - 1)
+                return "".join(l + "\n"
+                               for l in self.lines[s0:s0 + int(count)])
+
+            def InsertLines(self, start, text):
+                i = min(max(0, int(start) - 1), len(self.lines))
+                for k, ln in enumerate(str(text).split("\n")):
+                    self.lines.insert(i + k, ln)
+
+        class _Pane58(object):
+            def __init__(self, cm, sel):
+                self.CodeModule = cm
+                self.sel = sel
+
+            def GetSelection(self):
+                return self.sel
+
+            def SetSelection(self, sl, sc, el, ec):
+                self.sel = (sl, sc, el, ec)
+
+        class _VBE58(object):
+            def __init__(self, pane):
+                self.ActiveCodePane = pane
+
+        def _nl58(lines, line_no, col, auto_close=True):
+            cm58 = _CM58(lines)
+            pane58 = _Pane58(cm58, (line_no, col, line_no, col))
+            VB58._get_vbe_cached = lambda: _VBE58(pane58)
+            ok58 = VB58.VbeBackend().new_line_below(smart=True,
+                                                    auto_close=auto_close)
+            return ok58, cm58.lines, pane58.sel
+
+        # ---- 58.1 ★集成：用户报的双层 For ----
+        #
+        # 场景：外层 For 的回车已经走过（下面补出了 `    Next`），现在光标移到
+        # 内层 For 那行再按回车。下面第一个非空行是【外层】的 `    Next`，
+        # 缩进比内层块头（8）浅 —— 内层该补的 `        Next` 必须在它上面。
+        check("58.1 ★集成：双层 For —— 内层 `For j` 回车也要补 `Next`，"
+              "且补在外层 `Next` 之前、光标停在中间那行",
+              [_nl58(["Sub Foo()",
+                      "    For i = 1 To 10",
+                      "        For j = 1 To 10",
+                      "    Next",
+                      "End Sub"], 3, 27)],
+              expect_contain=[(True,
+                               ["Sub Foo()",
+                                "    For i = 1 To 10",
+                                "        For j = 1 To 10",
+                                "            ",
+                                "        Next",
+                                "    Next",
+                                "End Sub"],
+                               (4, 13, 4, 13))])
+
+        # 内层 If 下面压着外层的 End If 同理
+        check("58.2 ★集成：双层 If —— 内层 `If b Then` 补 `        End If`，"
+              "外层 `    End If` 一个字没动",
+              [_nl58(["Sub Foo()",
+                      "    If a Then",
+                      "        If b Then",
+                      "    End If",
+                      "End Sub"], 3, 20)],
+              expect_contain=[(True,
+                               ["Sub Foo()",
+                                "    If a Then",
+                                "        If b Then",
+                                "            ",
+                                "        End If",
+                                "    End If",
+                                "End Sub"],
+                               (4, 13, 4, 13))])
+
+        # 双层 Do / With（各自的收尾不同名，同一个规则管）
+        check("58.3 ★集成：双层 Do -> `Loop`、双层 With -> `End With` 都补在对的层级",
+              [_nl58(["Sub Foo()", "    Do", "        Do While x", "    Loop",
+                      "End Sub"], 3, 24),
+               _nl58(["Sub Foo()", "    With a", "        With b", "    End With",
+                      "End Sub"], 3, 18)],
+              expect_contain=[(True, ["Sub Foo()", "    Do", "        Do While x",
+                                      "            ", "        Loop", "    Loop",
+                                      "End Sub"], (4, 13, 4, 13)),
+                              (True, ["Sub Foo()", "    With a", "        With b",
+                                      "            ", "        End With",
+                                      "    End With", "End Sub"],
+                               (4, 13, 4, 13))])
+
+        # ---- 58.4 ★集成：模块级 Type / Enum（用户报的"不能自动补全"）----
+        #
+        # 根因：收尾判据里"下面那行比块头【更浅】才补"。Type/Enum 只出现在
+        # 模块级（缩进 0），而 0 是最浅的 —— 下面的声明/过程头永远不可能更浅，
+        # 于是永远不补。现在补上"模块级 + 下面同级"这一档。
+        check("58.4 ★集成：模块级 `Type Foo` / `Enum Color` 回车 -> "
+              "下面即使还有别的过程，也补 `End Type` / `End Enum`",
+              [_nl58(["Type Foo", "Sub Bar()", "End Sub"], 1, 9),
+               _nl58(["Enum Color", "Sub Bar()", "End Sub"], 1, 11),
+               _nl58(["Public Type T1", "Sub Bar()", "End Sub"], 1, 15),
+               _nl58(["Private Enum E2", "Sub Bar()", "End Sub"], 1, 16)],
+              expect_contain=[(True, ["Type Foo", "    ", "End Type",
+                                      "Sub Bar()", "End Sub"], (2, 5, 2, 5)),
+                              (True, ["Enum Color", "    ", "End Enum",
+                                      "Sub Bar()", "End Sub"], (2, 5, 2, 5)),
+                              (True, ["Public Type T1", "    ", "End Type",
+                                      "Sub Bar()", "End Sub"], (2, 5, 2, 5)),
+                              (True, ["Private Enum E2", "    ", "End Enum",
+                                      "Sub Bar()", "End Sub"], (2, 5, 2, 5))])
+
+        # 下面已经挂着同一个收尾 / 紧跟着另一个 Type -> 只缩进，不重复
+        check("58.5 ★集成：模块级 Type/Enum 下面已挂着 `End Type` / `End Enum`"
+              "（含紧跟下一个 Type）-> 不补重复的",
+              [_nl58(["Type Foo", "End Type"], 1, 9)[1],
+               _nl58(["Enum e", "End Enum"], 1, 7)[1],
+               _nl58(["Type Foo", "Type B", "End Type"], 1, 9)[1]],
+              expect_contain=[["Type Foo", "    ", "End Type"],
+                              ["Enum e", "    ", "End Enum"],
+                              ["Type Foo", "    ", "End Type",
+                               "Type B", "End Type"]])
+
+        # ---- 58.6 纯函数：_is_closer_text / _closer_owner_above ----
+        check("58.6 _is_closer_text：`Next i` / `Next  '注释` / `Loop While x` 都算收尾；"
+              "`NextLoop` / 注释行 / 空 -> 不算",
+              [[VB58._is_closer_text("Next i", "Next"),
+                VB58._is_closer_text("Next  '下一个", "Next"),
+                VB58._is_closer_text("Loop While x", "Loop"),
+                VB58._is_closer_text("End If", "End If"),
+                VB58._is_closer_text("NextLoop", "Next"),
+                VB58._is_closer_text("'    Next", "Next"),
+                VB58._is_closer_text("", "Next"),
+                VB58._is_closer_text("Next", None)]],
+              expect_contain=[[True, True, True, True,
+                               False, False, False, False]])
+
+        check("58.7 _closer_owner_above：只有【同类、未闭合、缩进正好对上】的"
+              "外层块头才算收尾的主人（配平过的那一层不算）",
+              [[VB58._closer_owner_above(["Sub Foo()", "    For i = 1 To 10"],
+                                         "for", 4),
+                VB58._closer_owner_above(["Sub Foo()"], "for", 0),
+                VB58._closer_owner_above(["    For i = 1 To 10"], "for", 8),
+                VB58._closer_owner_above([], "for", 0),
+                VB58._closer_owner_above(["If a Then"], "if", 0),
+                VB58._closer_owner_above(["If a Then", "    End If"], "if", 4),
+                VB58._closer_owner_above(None, None, 0)]],
+              expect_contain=[[True, False, False, False,
+                               True, False, False]])
+
+        check("58.8 closer_needed：更浅的同类收尾 —— 有同类外层块头 -> 补，"
+              "没有（用户自己写歪的收尾）-> 不补（免得 `Next` 双份）",
+              [[VB58.closer_needed(["    Next"], "Next", 8, kind="for",
+                                   lines_above=["Sub Foo()",
+                                                "    For i = 1 To 10"]),
+                VB58.closer_needed(["Next"], "Next", 4, kind="for",
+                                   lines_above=["Sub Foo()"]),
+                VB58.closer_needed(["    End If"], "End If", 8, kind="if",
+                                   lines_above=["Sub Foo()",
+                                                "    If a Then"]),
+                VB58.closer_needed(["End If"], "End If", 4, kind="if",
+                                   lines_above=["Sub Foo()"]),
+                VB58.closer_needed(["End Type"], "End Type", 0, kind="type",
+                                   lines_above=["Type A", "End Type"])]],
+              expect_contain=[[True, False, True, False, False]])
+
+        # 旧式调用（不传 kind/lines_above）必须保持 v79b 口径：更浅 -> 不补
+        check("58.9 closer_needed 老口径不变（不传 kind/lines_above 时，"
+              "更浅的同类收尾一律不补）",
+              [[VB58.closer_needed(["Next i"], "Next", 4),
+                VB58.closer_needed(["Loop While x"], "Loop", 4),
+                VB58.closer_needed(["    End If"], "End If", 0),
+                VB58.closer_needed([], "End If", 0)]],
+              expect_contain=[[False, False, False, True]])
+
+        # ---- 58.10 ★纯函数：过程归属校验（用户报的"泄漏"那一侧的护栏）----
+        _mod58 = "\n".join([
+            "Enum e",                      # 1
+            "",                            # 2
+            "Sub test()",                  # 3
+            "    x = 1",                   # 4
+            "End Sub",                     # 5
+            "",                            # 6
+            "Sub tes()",                   # 7
+            "",                            # 8
+            "End Sub"])                    # 9
+        check("58.10 proc_owns_line：只有真的被那个过程圈住的行才算它是主人；"
+              "`End Sub` 行 / 过程之间的空行 / 第一个过程头之前的声明区都不算",
+              [[P58.proc_owns_line(_mod58, 4, "test"),
+                P58.proc_owns_line(_mod58, 3, "test"),
+                P58.proc_owns_line(_mod58, 5, "test"),
+                P58.proc_owns_line(_mod58, 6, "test"),
+                P58.proc_owns_line(_mod58, 2, "test"),
+                P58.proc_owns_line(_mod58, 1, "test"),
+                P58.proc_owns_line(_mod58, 4, "tes"),
+                P58.proc_owns_line(_mod58, 8, "tes"),
+                P58.proc_owns_line(_mod58, 4, None),
+                P58.proc_owns_line(_mod58, 0, "test"),
+                P58.proc_owns_line("", 1, "test")]],
+              expect_contain=[[True, True, False, False, False, False,
+                               False, True, False, False, False]])
+
+        # 真机回归：VBE 的 ProcOfLine 会把过程外的行归给【邻居过程】
+        # （`End Sub` 行、它下面到下一个过程头之间的行 -> 前一个过程；
+        #   声明区里第一个过程头之前的行 -> 第一个过程）。_proc_of_line
+        # 必须校验归属，否则"模块级 / 新函数的位置"上会冒出别的过程的局部变量
+        # —— 正是用户报的"我在一个函数里定义的 targetsheet，在另一个函数里
+        # 输入 tes 却被提示出来"。
+        class _CMVbe58(object):
+            """假 CodeModule：文本扫描正常，COM 兜底故意返回【邻居过程】。"""
+            def __init__(self, lines, com_proc):
+                self.lines = list(lines)
+                self.Name = "Module1"
+                self._com = com_proc
+
+            @property
+            def CountOfLines(self):
+                return len(self.lines)
+
+            def Lines(self, start, count):
+                s0 = max(0, int(start) - 1)
+                return "".join(l + "\n"
+                               for l in self.lines[s0:s0 + int(count)])
+
+            def ProcOfLine(self, line_no, kind):
+                return (self._com, int(kind))     # 学 VBE：返回 (名字, ProcKind)
+
+        _lives58 = ["Sub Foo()", "    Dim targetsheet As Long", "End Sub", ""]
+        _lives58b = ["", "Sub Foo()", "    Dim targetsheet As Long", "End Sub"]
+        check("58.11 ★护栏：文本扫描答不出来时，绝不采信 VBE 的 ProcOfLine "
+              "（它把 `End Sub` 行、过程之间的空行、声明区里第一个过程头之前"
+              "的行都归给邻居过程）；这些位置必须回到 None —— 否则就是『另一个"
+              "函数的局部变量泄漏到本位置』。过程内那两行仍要正常认出 Foo",
+              [[VB58._proc_of_line(_CMVbe58(_lives58, "Foo"), 3),
+                VB58._proc_of_line(_CMVbe58(_lives58, "Foo"), 4),
+                VB58._proc_of_line(_CMVbe58(_lives58, "Foo"), 1),
+                VB58._proc_of_line(_CMVbe58(_lives58, "Foo"), 2),
+                VB58._proc_of_line(_CMVbe58(_lives58b, "Foo"), 1),
+                isinstance(VB58._proc_of_line(_CMVbe58(_lives58, "Foo"), 3),
+                           str)]],
+              expect_contain=[[None, None, "Foo", "Foo", None, False]])
+
+        # ---- 58.12 ★接线护栏 ----
+        _vbsrc58 = io.open(os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "vbe_bridge.py"), encoding="utf-8").read()
+        check("58.12 ★接线护栏：new_line_below 把块头类型与上方各行交给 "
+              "closer_needed（嵌套判定要用）；_proc_of_line 走归属校验；"
+              "parser 提供 proc_owns_line",
+              ["kind=_block_kind(line_text)" in _vbsrc58,
+               "lines_above=above" in _vbsrc58,
+               "_proc_owns_line(cm, name, line_no)" in _vbsrc58,
+               "def proc_owns_line(code, line_no, name):" in io.open(
+                   os.path.join(os.path.dirname(os.path.dirname(
+                       os.path.abspath(__file__))), "parser.py"),
+                   encoding="utf-8").read()],
+              expect_contain=[True] * 4)
+
+        # ---- 58.13 收尾清单完整性：VBA 里"首尾都有明确标志"的块必须全覆盖
+        #             （#If/#Else 条件编译除外：它要配 `#End If`，替用户写个裸的
+        #             `End If` 反而把代码写错）----
+        _pairs58 = [("Sub Foo()", "End Sub"),
+                    ("Private Function F() As Long", "End Function"),
+                    ("Property Get X()", "End Property"),
+                    ("Static Property Let Y(v As Long)", "End Property"),
+                    ("Type Foo", "End Type"),
+                    ("Public Enum Color", "End Enum"),
+                    ("If x Then", "End If"),
+                    ("With rng", "End With"),
+                    ("Select Case x", "End Select"),
+                    ("For i = 1 To 10", "Next"),
+                    ("For Each c In rng", "Next"),
+                    ("Do", "Loop"),
+                    ("Do While x < 5", "Loop"),
+                    ("Do Until x > 5", "Loop"),
+                    ("While x", "Wend")]
+        check("58.13 收尾清单：VBA 里首尾都有明确标志的块 15 例全覆盖"
+              "（Sub/Function/Property/Type/Enum/If/With/Select Case/"
+              "For/For Each/Do·While/Do·Until/While）",
+              [[VB58.block_closer(_t) for _t, _ in _pairs58]],
+              expect_contain=[[_w for _, _w in _pairs58]])
+
+        # 没有收尾的语句一个都不许认（否则会替用户写出错的结构）。
+        # `ElseIf … Then` 只是 If 块【内】的分支：它要的收尾是与 `If` 共用的那
+        # 个 `End If`，不能在这儿再补一条。
+        _noc58 = ["Else", "ElseIf y Then", "Case 1", "Case Else",
+                  "#If VBA7 Then", "#Else",
+                  "Next i", "End If", "Loop", "Wend", "End Type",
+                  "x = 1", "Exit For", "foo(1, 2)", "For i = 1 To 10 _"]
+        check("58.14 不该补收尾的：Else / ElseIf…Then / Case / #If / #Else"
+              "（分支与条件编译）、以及所有收尾行本身 / 普通语句 / "
+              "以续行符结尾的块头",
+              [[VB58.block_closer(_t) for _t in _noc58
+                if VB58.block_closer(_t) is not None]],
+              expect_contain=[[]])
+
+        VB58._get_vbe_cached = _orig58
+    except Exception as _e58:
+        check("第 58 节异常: %s" % _e58, [True], expect_contain=[False])
+
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))
     if FAILURES:
