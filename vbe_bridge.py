@@ -1650,6 +1650,11 @@ def _proc_of_line(cm, line_no):
          变量全部变成"当前过程的"——正是用户报的"别的函数的变量泄漏到本
          位置"。所以拿到名字后必须做一次归属校验（proc_owns_line）：该过程头
          在光标上方、且两者之间没有它的收尾行，才算真的在里面。
+
+    ⚠️ v79e：返回的是【作用域键】，正常情况下就是过程名；同一模块里存在同名
+    过程时带 `#序号`（见 parser._proc_scope_key）。那种状态下"过程名"不足以把
+    两个过程分开 —— 记录侧也是这么写键的，两边必须一致，否则第二个过程里会
+    提示出第一个过程的局部变量（用户报的"过程级的变量都泄露到其他过程"）。
     """
     # 0) v79d：光标这一行自己就是过程头 -> 不在任何 procedure body 里
     try:
@@ -1679,6 +1684,14 @@ def _proc_of_line(cm, line_no):
         if not name:
             continue
         if _proc_owns_line(cm, name, line_no):  # 归属校验：别信"邻居过程"
+            # v79e：同名过程（模块里两个 `Sub test`）的键带 `#序号`，与记录侧
+            # 保持一致；文本扫描取不到键就退回裸名（宁可少提示，也不乱提示）。
+            try:
+                key = vba_parser.proc_at_line(cm.Lines(1, line_no), line_no)
+                if key:
+                    return str(key)
+            except Exception:
+                pass
             return name
     return None
 
@@ -2255,7 +2268,14 @@ class VbeBackend:
         except Exception:
             return None
         try:
-            src = vba_parser._blank_ident_at(code, line_no, col)
+            # blank_decl=True：这里**必须**把光标处的词抹掉 —— 哪怕它是这一行正在
+            # 声明的名字（v79e）。本函数的语义是"抹掉光标处的词之后，模块里还剩
+            # 哪些名字"，那个词自己不能当证据；而 _blank_ident_at 默认会放过
+            # "正在声明的名字"（为了不改动文本、不破坏行结构），所以在这一路要
+            # 显式要求抹掉。不加这个参数会怎样：光标停在 `Sub zzq` 上（zzq 别处
+            # 都没有）时，zzq 把自己算成"别处出现过"的铁证，回声防护放行，
+            # 弹窗把用户正在敲的字原样提示回来 —— 第 21.4 节钉的正是这条。
+            src = vba_parser._blank_ident_at(code, line_no, col, True)
             src = vba_parser._mask_strings_and_comments(src)
         except Exception:
             src = code

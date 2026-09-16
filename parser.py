@@ -189,9 +189,10 @@ def extract_records(code, module=None, is_std_module=True, caret=None):
     module 为 None 时仍可调用（用于单元测试/旧逻辑），priv 会按默认规则计算，
     但引擎侧把 module=None 的记录当作"旧式全局可见"处理。
 
-    caret=(line_no, col)：光标位置。若光标正处在变量/常量声明行上，该行声明的
-    名字会被排除——它们尚未定义完成，否则会出现"输入 g 就提示 gCounter 本身"
-    的自我提示（显式声明路径此前一直缺少光标排除，只有隐式变量路径有）。
+    caret=(line_no, col)：光标位置。解析层【不】据此排除任何名字 —— 名字一律
+    收录，交给引擎按"正在输入的词"决定是否剔除（ctx["decl_names"] 精确剔除光标
+    处那一个词、前缀照常提示；幻影词由回声防护剔除）。见下面那段注释与
+    _blank_ident_at 的 v79e 说明。
     """
     masked = _mask_strings_and_comments(code)
     # 合并行继续符
@@ -202,13 +203,25 @@ def extract_records(code, module=None, is_std_module=True, caret=None):
     # 就再也提示不出来（bug：输入 num 只能提醒 num、不提醒 numArr）。正确的语义是
     # "精确匹配自己才隐藏、前缀照常提示"，而这由引擎层 in_decl_position 的精确
     # 自我剔除负责（输入完整 numArr 才隐藏，输入前缀 num 仍正常提示 numArr）。
-    # 因此解析层不再做任何 caret 排除，名字一律收录，交给引擎按"正在输入的词"
+    # 因此解析层不做任何 caret 排除，名字一律收录，交给引擎按"正在输入的词"
     # 决定是否剔除——这样既修好了前缀补全，又没丢"定义变量时不提示自己"。
+    # （v79d 曾把光标压着的声明名抹成下划线来"顺手"排除掉它，反而破坏了行结构，
+    #   见 _blank_ident_at 的 v79e 说明；那件事本来就该由引擎那两道防线做。）
 
     result = []
     seen = set()
-    cur_proc = None      # 当前所在过程名（None = 模块声明区）
+    cur_proc = None      # 当前所在过程【的作用域键】（None = 模块声明区）
     in_block = None      # 'Type' / 'Enum'
+
+    # v79e：同名过程会让"过程名"失去区分度（作用域过滤就是拿它比对的），
+    # 因此按出现次序生成作用域键：第 1 次用原名，第 2 次起带 `#序号`。
+    _lines = masked.split("\n")
+    _occ = {}            # 小写过程名 -> 已出现的次数
+
+    # v79e：光标正压在"这条声明正在声明的名字"上时，文本【一个字都不动】
+    # （见 _blank_ident_at）—— 动它会让这一行不再是声明行，紧随其后的整个过程体
+    # 失去过程归属，局部/隐式变量降级成模块级、全模块到处可见。这个"打什么提示
+    # 什么"的防护由引擎那两道防线负责，解析层不掺和。
 
     def add(name, proc, priv):
         if not name:
@@ -218,7 +231,13 @@ def extract_records(code, module=None, is_std_module=True, caret=None):
             seen.add(key)
             result.append((name, module, proc, priv))
 
-    for raw in masked.split("\n"):
+    def proc_key(name):
+        """刚看到的过程头名字 -> 作用域键（第 2 次同名起带序号）。"""
+        k = str(name).lower()
+        _occ[k] = _occ.get(k, 0) + 1
+        return _proc_scope_key(name, _occ[k])
+
+    for raw in _lines:
         line = raw.strip()
         if not line:
             continue
@@ -275,11 +294,11 @@ def extract_records(code, module=None, is_std_module=True, caret=None):
             proc = m_sub.group(1)
             priv = _is_private(KIND_PROC, has_priv_kw, has_pub_kw, is_std_module)
             add(proc, None, priv)
-            cur_proc = proc
+            cur_proc = proc_key(proc)      # 第 2 次同名起带 `#序号`
             pm = re.search(r"\((.*)\)", line)
             if pm:
                 for p in _params_inside(pm.group(1)):
-                    add(p, proc, False)
+                    add(p, cur_proc, False)
             continue
 
         # Property Get/Let/Set
@@ -288,11 +307,11 @@ def extract_records(code, module=None, is_std_module=True, caret=None):
             proc = m_prop.group(1)
             priv = _is_private(KIND_PROC, has_priv_kw, has_pub_kw, is_std_module)
             add(proc, None, priv)
-            cur_proc = proc
+            cur_proc = proc_key(proc)
             pm = re.search(r"\((.*)\)", line)
             if pm:
                 for p in _params_inside(pm.group(1)):
-                    add(p, proc, False)
+                    add(p, cur_proc, False)
             continue
 
         # Const 常量：作用域取决于声明位置
@@ -761,10 +780,12 @@ def _struct_decl_name_span(line):
     """若 line 是 Sub/Function/Property/Event/Type/Enum/Declare 声明行，
     返回它正在声明的那个【名字】在行内的 (start, end)；否则 None。
 
-    v79d：这些名字是解析器的**语法锚点**。抹掉它，整行就不再被认作一条声明，
-    后果不是"少提示一个名字"，而是这条声明【之后】的代码全部失去归属 ——
-    该过程/块里的局部变量、隐式变量统统降级成"模块级"，表现为
-    "整个模块到处都能提示出别的过程的变量"（详见 _blank_ident_at）。
+    v79d/v79e：这些名字是解析器的**语法锚点**。让这一行继续被认作"声明行"
+    比"少收一个名字"重要得多 —— 一旦它不再是声明行，这条声明【之后】的代码
+    全部失去过程归属，局部变量与隐式变量统统降级成"模块级"，表现就是
+    "整个模块到处都能提示出别的过程的变量"。
+    所以 v79e 的口径是：**文本一个字都不动**，只在记录层把这一个名字排除
+    （见 caret_decl_name_at / extract_records）。
     """
     for rx in (_RE_SUB, _RE_PROP, _RE_EVENT, _RE_TYPE, _RE_ENUM):
         try:
@@ -780,7 +801,42 @@ def _struct_decl_name_span(line):
     return None
 
 
-def _blank_ident_at(text, line_no, col):
+def caret_decl_name_at(text, line_no, col):
+    """光标处的标识符【恰好是这一行正在声明的名字】时返回它（原文），否则 ""。
+
+    v79e：判"哪个标识符盖住了光标"的规则与 _blank_ident_at / ident_at_caret
+    完全一致（含"列号越界钳到行尾"），只是额外要求它落在
+    `_struct_decl_name_span` 给出的那个名字区间上。
+
+    用途：收集时把"用户正在敲的那个声明名"从候选池里排除。排除放在【记录层】
+    而不是【文本层】—— 见 _blank_ident_at 的 v79e 说明。
+    """
+    if not text or not line_no or not col:
+        return ""
+    try:
+        line_no = int(line_no)
+        col = int(col)
+    except Exception:
+        return ""
+    lines = text.split("\n")
+    if not (1 <= line_no <= len(lines)):
+        return ""
+    line = lines[line_no - 1]
+    c = col - 1
+    if c < 0:
+        return ""
+    if c > len(line):
+        c = len(line)
+    anchor = _struct_decl_name_span(line)
+    if not anchor:
+        return ""
+    for m in re.finditer(_IDENT, line):
+        if m.start() <= c <= m.end():
+            return m.group(0) if m.start() == anchor[0] else ""
+    return ""
+
+
+def _blank_ident_at(text, line_no, col, blank_decl=False):
     """把 (line_no, col) 处（均为 1-based）的标识符抹成等长空格。
 
     用途：排除"用户此刻正在输入的那个词"。它还没写完、此前也从未被使用过，
@@ -788,26 +844,40 @@ def _blank_ident_at(text, line_no, col):
     尤其是单字母（i）或单字（我）这类短词，表现最明显。
     抹成空格而非删除，是为了保持所有字符偏移不变。
 
-    ⚠️ v79d 例外：光标处的词若是这一行**正在声明的名字**（`Sub xxx`、`Type xxx`、
-    `Enum xxx` …），**不抹成空格**，改抹成**等长的下划线**。原因：这些名字是解析器
-    的语法锚点，抹成空格这一行就不再是声明行了 ——
-      * 过程头被抹废 -> 紧随其后的整个过程体失去过程归属，局部/隐式变量全部
-        降级成模块级 -> "在 A 过程里能提示出 B 过程的变量"（用户报的泄漏，
-        第二条路径，实测：把 `Sub bar()` 的 bar 抹掉，bar 里的 other 变成
-        模块级，在 test 里也能提示出来）；
-      * `Enum e` 被抹废 -> 成员行不再被当作块成员，`Red = 1` 这种成员被当成
-        隐式变量收进来（v61 记过同一类事故）。
-    为什么是下划线而不是"不抹"：
-      * "不抹"会让用户此刻正在敲的过程名/类型名作为一个【真名字】进池（`Sub zzq`
-        一敲下去池子里就有 zzq），弹窗随即把它原样提示回来 —— 正是第 21.4 节
-        钉住的"幻影词绝不提示自己"；
-      * 下划线占位符（`Sub ___`）同样保持行长度与偏移不变，但这个名字既不可能与
-        任何真实名字撞车、也永远匹配不上用户输入，于是它只承担"让这一行继续被
-        认作声明"的职责，不会作为候选冒出来。
-    自我提示的两道防线（vbe_bridge 的 caret_decl / 引擎的 decl_at_caret）不受影响：
-    它们读的是【未抹】的原文。
+    ⚠️ v79e：光标处的词若是这一行**正在声明的名字**（`Sub xxx` / `Type xxx` /
+    `Enum xxx` …），**一个字都不动**，直接原样返回（`blank_decl=True` 时例外，
+    见下）。
+
+    v79d 那版把它抹成**等长下划线**（想让这一行继续被认作声明行）。方向没错，
+    做法有害，两个后果都是真机实测出来的：
+      1. **单字符名字会变成行继续符**：`Sub t` 被抹成 `Sub _` 之后，行尾正好是
+         "空格 + 下划线 + 换行"——而 _RE_CONTINUATION 就是这个形状（它要求
+         `_` 前面是空白、后面到行尾只有空白）⇒ 这一行被当成续行，把【下一行】
+         吞进同一行。合并后的文本既不再是过程头（`Sub` 后面跟的是别的东西），
+         后面整段过程体也失去归属 ⇒ 那些隐式变量降级成【模块级】，模块里
+         任何位置都能提示出来（用户报的"过程级的变量都泄露到其他过程"）。
+         实测：`Sub t` 那一行 + 下一行被合并，模块行数 3 -> 2。
+      2. 光标停在过程头上时，该过程的记录会挂到占位符名下（`Sub ____`），
+         与光标回到过程体内时用的真实名字对不上，变量忽隐忽现。
+    所以"正在声明的名字"这一支不再改文本 —— 行结构、过程归属完全不动。
+    "打什么不提示什么"由引擎那两道现成防线负责：`ctx["decl_names"]`
+    （decl_at_caret 精确剔除光标处那个词）+ 回声防护（拿"现场证据"判它是不是
+    真名字）。⚠️ 与之配套的一处必须同步：names_outside_caret（现场证据扫描）
+    要传 `blank_decl=True` 强制抹词 —— 否则那个词会把自己算成"别处也出现过"
+    的证据，幻影词（第 21.4 节）又会被提示回来。
+
+    其余情形（普通变量 / 赋值目标 / 形参名 / 表达式里的词）照旧抹等长空格。
+    自我提示的两道防线（vbe_bridge 的 caret_decl / 引擎的 decl_at_caret）读的是
+    【未抹】的原文，不受影响。
     """
     if not line_no or not col:
+        return text
+    if not blank_decl and caret_decl_name_at(text, line_no, col):
+        return text                    # 正在声明的名字：文本一个字不动（v79e）
+    try:
+        line_no = int(line_no)
+        col = int(col)
+    except Exception:
         return text
     lines = text.split("\n")
     if not (1 <= line_no <= len(lines)):
@@ -821,15 +891,8 @@ def _blank_ident_at(text, line_no, col):
     # 也可能是"已打完且后面有空格"，无法区分，猜就会误抹已有标识符。
     if c > len(line):
         c = len(line)
-    anchor = _struct_decl_name_span(line)
     for m in re.finditer(_IDENT, line):
         if m.start() <= c <= m.end():
-            if anchor and m.start() == anchor[0]:
-                # 正在声明的"语法锚点"名字：抹成等长下划线（不能抹成空格，
-                # 否则这一行就不再是声明行；也不能不动，否则会提示自己）。
-                fill = "_" * (m.end() - m.start())
-                lines[line_no - 1] = line[:m.start()] + fill + line[m.end():]
-                break
             lines[line_no - 1] = (line[:m.start()]
                                   + " " * (m.end() - m.start())
                                   + line[m.end():])
@@ -954,6 +1017,12 @@ def extract_implicit_records(code, module=None, is_std_module=True,
     # 枚举成员名当成隐式变量收回来（详见 _blank_type_enum_blocks）。
     masked = _blank_type_enum_blocks(masked)
 
+    # v79e：同名过程（用户正在敲一个与既有过程同名的过程头）—— 记录里必须能把
+    # 两次出现分开，否则第二个过程会提示出第一个过程的隐式变量。
+    _occ = {}                # 小写过程名 -> 已出现次数
+    # 光标正压着的"正在声明"的名字照样收（见 extract_records 的说明）：
+    # 防自我提示由引擎的 decl_names + 回声防护负责，解析层不动文本、也不排除。
+
     # 已声明名字。支持两种传法：
     #   - 名称序列（旧式）：视为全模块可见，一律排除；
     #   - 记录序列 [(name, module, proc, priv), ...]：按作用域精确排除。
@@ -1027,7 +1096,10 @@ def extract_implicit_records(code, module=None, is_std_module=True,
             continue
         m_sub = _RE_SUB.match(line) or _RE_PROP.match(line)
         if m_sub:
-            cur_proc = m_sub.group(1)
+            _n59 = m_sub.group(1)
+            _k59 = str(_n59).lower()
+            _occ[_k59] = _occ.get(_k59, 0) + 1
+            cur_proc = _proc_scope_key(_n59, _occ[_k59])
             continue
         if _RE_TYPE.match(line) or _RE_ENUM.match(line):
             in_block = True
@@ -1051,7 +1123,8 @@ def extract_implicit_records(code, module=None, is_std_module=True,
 
         for stmt in stmts:
             for name in _implicit_names_in_stmt(stmt):
-                if _already_declared(name, cur_proc) or name.lower() in _IMPLICIT_STOPWORDS:
+                if (_already_declared(name, cur_proc)
+                        or name.lower() in _IMPLICIT_STOPWORDS):
                     continue
                 # 按"名字+所在过程"去重：同一名字在不同过程里各算各的局部变量
                 # （VBA 未声明变量的作用域是"首次出现的过程"），不再跨过程合并，
@@ -1080,12 +1153,17 @@ def _line_proc_map(masked):
 
     行号必须在【续行合并之后】的文本上算：_RE_CONTINUATION 会把 ` _\\n` 压成
     空格，行数与原始文本已经不同，直接用原始行号会整体错位。
+    v79e：过程名同样按 _proc_scope_key 变成作用域键（第 2 次同名起带 `#序号`），
+    必须与 extract_implicit_records 主循环里的键一致 —— 否则"只读用法"扫出来
+    的名字会挂到对不上的过程键上（表现为变量忽隐忽现）。
     """
+    lines = masked.split("\n")
+    _occ = {}
     offsets = []
     line_proc = []
     off = 0
     cur = None
-    for raw in masked.split("\n"):
+    for raw in lines:
         offsets.append(off)
         off += len(raw) + 1
         line = raw.strip()
@@ -1093,7 +1171,10 @@ def _line_proc_map(masked):
             cur = None
         m_sub = _RE_SUB.match(line) or _RE_PROP.match(line)
         if m_sub:
-            cur = m_sub.group(1)
+            _n = m_sub.group(1)
+            _k = str(_n).lower()
+            _occ[_k] = _occ.get(_k, 0) + 1
+            cur = _proc_scope_key(_n, _occ[_k])
         line_proc.append(cur)
     return offsets, line_proc
 
@@ -1172,11 +1253,96 @@ def is_proc_header_line(line_text):
         return False
 
 
+def _proc_header_name(line):
+    """行是过程头（Sub / Function / Property Get|Let|Set）则返回其名字，否则 None。
+
+    与 proc_at_line / proc_owns_line 用的是同一对正则（_RE_SUB / _RE_PROP），
+    保证"数次数"与"找最近的过程头"两处认的是同一批行。
+    """
+    if not line:
+        return None
+    s = str(line).strip()
+    if not s:
+        return None
+    m = _RE_SUB.match(s) or _RE_PROP.match(s)
+    return m.group(1) if m else None
+
+
+def _proc_scope_key(name, occurrence):
+    """过程在【作用域过滤】里用的键。
+
+    VBA 不允许同一模块里出现两个同名过程（编译期报"二义性名称"），但用户
+    正在敲新过程头时会短暂处于这种状态（真实案例：模块里已有 `Sub test()`，
+    用户又敲了一个 `Sub test()` 做试验）。记录里只存"过程名"的话，这两个过程
+    的局部变量在过滤时无法区分 —— 第二个过程的体内就会提示出第一个过程的
+    局部变量，表现正是"过程级的变量泄漏到其他过程"。
+
+    口径：**该名字在模块里第 1 次出现时用原名，第 2 次及以后写成 `名字#序号`**
+    （序号 = 第几次出现，按过程头从上到下数，从 1 起）。
+
+    为什么第 1 次不带序号（而不是"重名才全部带序号"）：
+      * 名字唯一时（正常代码）键必须与旧版完全一致 —— 既有记录、测试、日志
+        都不受影响；
+      * 更要紧的是两侧的文本范围不同：记录侧拿的是【整个模块】，而光标侧
+        （vbe_bridge._proc_of_line）为了省开销只读【光标以上】的那一段文本。
+        "重名才带序号"会让第一段文本数不到下面的重名，两侧对不上键，把第一个
+        过程的变量一起挡掉（实测踩到）。"第 1 次用原名"则对前缀截断天然稳定：
+        第 1 次出现的前缀里永远只有它自己。
+      * 真机验证（模块2，两个 `Sub test`）：第 1 个过程内 proc='test'、
+        第 2 个过程内 proc='test#2'，记录侧 targetSheet 归 'test' -> 第 2 个
+        过程不再提示它，第 1 个过程照常提示。
+    """
+    if not name:
+        return name
+    try:
+        occ = int(occurrence)
+    except Exception:
+        occ = 1
+    if occ <= 1:
+        return name
+    return "%s#%d" % (name, occ)
+
+
+def proc_key_plain(name):
+    """把 `名字#序号` 拆回名字本身；本来就没有序号则原样返回。
+
+    给"只要名字"的地方用：COM 兜底（ProcOfLine 给的是裸名）与 proc_owns_line
+    的比对。
+    """
+    s = str(name or "")
+    i = s.rfind("#")
+    if i > 0 and s[i + 1:].isdigit():
+        return s[:i]
+    return s
+
+
+def _proc_key_at(lines, idx, name):
+    """过程头位于第 idx 行（0-based）、名字为 name 时，返回它的作用域键。
+
+    序号按【本次扫描到的文本】里"这个名字第几次出现"算（见 _proc_scope_key）：
+    记录侧扫整个模块、光标侧只扫光标以上那一段，第 1 次出现两边都数得到 1，
+    因此即使文本范围不同也稳定一致。
+    """
+    if not name:
+        return name
+    occ = 0
+    last = min(int(idx), len(lines) - 1)
+    for j in range(0, last + 1):
+        n = _proc_header_name(lines[j])
+        if n and n.lower() == str(name).lower():
+            occ += 1
+    return _proc_scope_key(name, max(occ, 1))
+
+
 def proc_at_line(code, line_no):
-    """返回第 line_no 行（1-based）所属的过程名；在模块声明区则返回 None。
+    """返回第 line_no 行（1-based）所属过程【的作用域键】；在模块声明区则返回 None。
 
     做法：从该行往上扫描，遇到最近的 Sub/Function/Property 头就返回其名字；
     若先遇到 End Sub/Function/Property/Type/Enum，说明在模块声明区，返回 None。
+
+    返回值通常是过程名；只有当同一模块里存在【同名过程】时才带 `#序号`
+    后缀（见 _proc_scope_key）—— 那种状态下"过程名"不足以区分两个过程，
+    作用域过滤必须能分开，否则第二个过程会提示出第一个过程的局部变量。
 
     ⚠️ 本函数回答的是"这一行归哪个过程"（过程头那一行归它自己，这是"归属"的
     自然口径，proc_owns_line 也据此回答）。**作用域判定不要直接用它** ——
@@ -1188,6 +1354,10 @@ def proc_at_line(code, line_no):
     """
     if not code or not line_no or line_no < 1:
         return None
+    try:
+        line_no = int(line_no)
+    except Exception:
+        return None
     lines = _mask_strings_and_comments(code).split("\n")
     idx = min(line_no, len(lines)) - 1
     while idx >= 0:
@@ -1195,7 +1365,7 @@ def proc_at_line(code, line_no):
         if line:
             m = _RE_SUB.match(line) or _RE_PROP.match(line)
             if m:
-                return m.group(1)
+                return _proc_key_at(lines, idx, m.group(1))
             if _RE_ANY_PROC_END.match(line):
                 return None
         idx -= 1
@@ -1212,6 +1382,7 @@ def proc_owns_line(code, line_no, name):
         -> False（说明这一行其实在过程【外】：`End Sub` 那行本身、过程之间的
         空行、模块声明区）。
     name 为空 / 找不到它的过程头 -> False（宁可不认，也不认错）。
+    name 允许带 `#序号` 后缀（作用域键），比对时只看名字部分。
 
     为什么需要它（v79c）：VBE 的 CodeModule.ProcOfLine 会把手伸到过程外 ——
     实测 `End Sub` 及其下方直到下一个过程头之间的行都归给【前一个】过程，
@@ -1221,11 +1392,15 @@ def proc_owns_line(code, line_no, name):
     """
     if not code or not line_no or line_no < 1 or not name:
         return False
-    want = str(name).strip().lower()
+    want = proc_key_plain(name).strip().lower()
     if not want:
         return False
+    try:
+        line_no = int(line_no)
+    except Exception:
+        return False
     lines = _mask_strings_and_comments(code).split("\n")
-    idx = min(int(line_no), len(lines)) - 1
+    idx = min(line_no, len(lines)) - 1
     while idx >= 0:
         line = lines[idx].strip()
         if line:

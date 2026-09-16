@@ -8484,22 +8484,25 @@ def main():
                 "targetSheet" in _vis59(_USER59, 2, 3)[1]]],
               expect_contain=[["test", "test", None, True]])
 
-        # ---- 59.4 _blank_ident_at：语法锚点抹成【等长下划线】 ----
+        # ---- 59.4 _blank_ident_at：声明名【文本一个字不动】（v79e 改口径）----
         _b59 = P59._blank_ident_at
-        check("59.4 _blank_ident_at：过程名 / Type 名 / Enum 名抹成【等长下划线】"
-              "（行仍是声明行 -> is_proc_header_line 依然为 True）；"
-              "普通变量 / 赋值目标 / 形参名照旧抹成空格；两者都不改变行长",
+        check("59.4 _blank_ident_at：过程名 / Type 名 / Enum 名【原样保留】"
+              "（行仍是声明行 -> is_proc_header_line 依然为 True、过程归属不受影响）；"
+              "普通变量 / 赋值目标 / 形参名照旧抹成等长空格；"
+              "只有显式要求 blank_decl=True（现场证据扫描那一路）才肯抹声明名",
               [[_b59("Sub bar()", 1, 7),
                 _b59("Type Foo", 1, 7),
                 _b59("Enum Color", 1, 8),
                 P59.is_proc_header_line(_b59("Sub bar()", 1, 7)),
                 _b59("Set other = 1", 1, 7),
                 _b59("total = 1", 1, 4),
-                len(_b59("Sub bar()", 1, 7)) == len("Sub bar()"),
-                len(_b59("Set other = 1", 1, 7)) == len("Set other = 1")]],
-              expect_contain=[["Sub ___()", "Type ___", "Enum _____", True,
+                _b59("Sub bar()", 1, 7, True),
+                _b59("Enum Color", 1, 8, True)]],
+              expect_contain=[["Sub bar()", "Type Foo", "Enum Color", True,
                                "Set" + " " * 7 + "= 1",
-                               " " * 6 + "= 1", True, True]])
+                               " " * 6 + "= 1",
+                               "Sub" + " " * 4 + "()",
+                               "Enum" + " " * 6]])
 
         # ---- 59.5 ★第二条路径：光标停在过程头的【名字】里 ----
         _mid59 = ["Sub test()", "Set targetSheet = Worksheets(1)", "End Sub",
@@ -8515,7 +8518,7 @@ def main():
                                                scope="proc", caret=(4, _c))
             _rec = dict((str(x[0]).lower(), x) for x in _r)
             _v = E59.filter_identifiers_by_scope(_r, "test", "Module1")
-            # 过程名此刻是下划线占位符（名字正被输入、不参与归属），
+            # v79e：声明名不再被抹（文本一个字不动），`Sub bar()` 的过程归属照旧；
             # 要害是【它不能是 None】—— None 就等于降级成模块级、全模块可见。
             _rows59.append((_rec.get("other") is not None
                             and _rec["other"][2] is not None,
@@ -8560,6 +8563,202 @@ def main():
 
     except Exception as _e59:
         check("第 59 节异常: %s" % _e59, [True], expect_contain=[False])
+
+    # ------------------------------------------------------------------
+    # 60. v79e：同名过程各自成域 + 声明名不再改文本
+    #
+    #   用户报："你改的更糟糕了，现在过程级的变量，都泄露到其他过程了"。
+    #   真机（模块2）复现出两条真因：
+    #   A) 模块里【两个过程同名】（用户在既有 `Sub test()` 下面又敲了一个
+    #      `Sub test()`）—— 记录只存过程名，两个过程的局部/隐式变量在过滤时
+    #      无法区分，第二个过程的体内能提示出第一个过程的 targetSheet。
+    #   B) v79d 把"正在声明的名字"抹成等长下划线：名字只有 1 个字符时
+    #      （`Sub t`），行尾正好是"空格 + 下划线 + 换行"，被 _RE_CONTINUATION
+    #      当成行继续符，把下一行吞进同一行 —— 过程头消失、其后整段过程体失去
+    #      归属，隐式变量降级成模块级，全模块到处可见。
+    # ------------------------------------------------------------------
+    print("\n=== 60. 同名过程各自成域 / 声明名不改文本（v79e）===")
+    try:
+        import vbe_bridge as VB60
+        import parser as P60
+        import engine as E60
+
+        _USER60 = [
+            "Sub test()",                            # 1
+            "    Set targetSheet = Worksheets(1)",   # 2
+            "    For i = 1 To 100",                  # 3
+            "    Next",                              # 4
+            "End Sub",                               # 5
+            "",                                      # 6
+            "Sub test()",                            # 7
+            "    For i = 1 To 2",                    # 8
+            "    Next",                              # 9
+            "    m = 3",                             # 10
+            "End Sub",                               # 11
+        ]
+
+        class _CM60(object):
+            """假 CodeModule：文本扫描正常；COM 兜底故意学 VBE 返回邻居过程名。"""
+
+            def __init__(self, lines, com_proc="test"):
+                self.lines = list(lines)
+                self.Name = "Module1"
+                self._com = com_proc
+
+            @property
+            def CountOfLines(self):
+                return len(self.lines)
+
+            def Lines(self, start, count):
+                s0 = max(0, int(start) - 1)
+                return "".join(l + "\n"
+                               for l in self.lines[s0:s0 + int(count)])
+
+            def ProcOfLine(self, line_no, kind):
+                return (self._com, int(kind))     # 学 VBE：(名字, ProcKind)
+
+        def _recs60(lines, caret=None):
+            code = "\n".join(lines)
+            r = list(P60.extract_records(code, module="Module1",
+                                         is_std_module=True, caret=caret))
+            r += P60.extract_implicit_records(code, module="Module1",
+                                              is_std_module=True, declared=r,
+                                              scope="proc", caret=caret)
+            return code, r
+
+        def _vis60(lines, line_no, caret=None):
+            _code, _r = _recs60(lines, caret)
+            _proc = VB60._proc_of_line(_CM60(lines), line_no)
+            return _proc, sorted(set(E60.filter_identifiers_by_scope(
+                _r, _proc, "Module1")))
+
+        _code60, _r60 = _recs60(_USER60)
+
+        # ---- 60.1 记录侧：同名过程的键（第 1 次用原名，第 2 次起带序号）----
+        check("60.1 ★同名过程：模块里两个 `Sub test()` 时，记录键必须是 "
+              "第 1 个 `test`、第 2 个 `test#2` —— 两个过程的隐式变量各挂各的"
+              "（targetSheet 归 test、m 归 test#2；i 两边各有一份）",
+              [sorted((str(a[0]).lower(), str(a[2])) for a in _r60)],
+              expect_contain=[[("i", "test"), ("i", "test#2"), ("m", "test#2"),
+                               ("targetsheet", "test"), ("test", "None")]])
+
+        # ---- 60.2 ★用户场景端到端：第二个过程体内不得出现第一个过程的变量 ----
+        _p60_1, _v60_1 = _vis60(_USER60, 2)
+        _p60_2, _v60_2 = _vis60(_USER60, 8)
+        _p60_3, _v60_3 = _vis60(_USER60, 10)
+        check("60.2 ★用户场景：模块里两个 `Sub test()` —— 第 1 个体内"
+              "（L2）照常提示 targetSheet、不提示 m；第 2 个体内"
+              "（L8 / L10）**绝不提示 targetSheet**、照常提示自己的 m",
+              [[_p60_1, "targetSheet" in _v60_1, "m" in _v60_1,
+                _p60_2, "targetSheet" in _v60_2, "m" in _v60_2,
+                _p60_3, "targetSheet" in _v60_3, "m" in _v60_3]],
+              expect_contain=[["test", True, False,
+                               "test#2", False, True,
+                               "test#2", False, True]])
+
+        # ---- 60.3 光标停在第二个过程头上：仍按模块级（v79d 口径不退化）----
+        _p60_h, _v60_h = _vis60(_USER60, 7)
+        check("60.3 光标停在第二个 `Sub test()` 那一行（L7）：当前过程必须是 None"
+              "（过程头那一行是声明、不是过程体），targetSheet 与 m 都不得出现",
+              [[_p60_h, "targetSheet" in _v60_h, "m" in _v60_h]],
+              expect_contain=[[None, False, False]])
+
+        # ---- 60.4 异名过程：键保持裸名（与旧版行为完全一致）----
+        _diff60 = list(_USER60)
+        _diff60[6] = "Sub otherProc()"
+        _code60d, _r60d = _recs60(_diff60)
+        check("60.4 名字不重复时（把第二个过程改名 otherProc）：记录键必须还是"
+              "裸名 —— 既有行为、既有测试、日志输出一律不变",
+              [sorted(set(str(a[2]) for a in _r60d), key=str)],
+              expect_contain=[["None", "otherProc", "test"]])
+
+        # ---- 60.5 纯函数：_proc_scope_key / proc_key_plain ----
+        check("60.5 _proc_scope_key：第 1 次出现用原名，第 2 次起 `名字#序号`；"
+              "proc_key_plain 把序号拆掉（没有序号 / 非数字后缀则原样返回）",
+              [[P60._proc_scope_key("test", 1), P60._proc_scope_key("test", 2),
+                P60._proc_scope_key("test", 3), P60._proc_scope_key("test", 0),
+                P60.proc_key_plain("test#2"), P60.proc_key_plain("test"),
+                P60.proc_key_plain("a#b"), P60.proc_key_plain(None)]],
+              expect_contain=[["test", "test#2", "test#3", "test",
+                               "test", "test", "a#b", ""]])
+
+        # ---- 60.6 proc_at_line / proc_owns_line 的分工 ----
+        check("60.6 proc_at_line：同名模块里第 1 个过程内是 `test`、第 2 个内是"
+              "`test#2`；异名模块里都是裸名。proc_owns_line 只认名字部分："
+              "`test#2` 与 `test` 都算『这个名字的过程包含该行』（COM 给的是裸名），"
+              "而 `End Sub` 行与过程之间的空行一律 False",
+              [[P60.proc_at_line(_code60, 2), P60.proc_at_line(_code60, 8),
+                P60.proc_at_line(_code60d, 8),
+                P60.proc_owns_line(_code60, 8, "test#2"),
+                P60.proc_owns_line(_code60, 8, "test"),
+                P60.proc_owns_line(_code60, 5, "test"),
+                P60.proc_owns_line(_code60, 6, "test"),
+                P60.proc_owns_line(_code60, 1, "test")]],
+              expect_contain=[["test", "test#2", "otherProc",
+                               True, True, False, False, True]])
+
+        # ---- 60.7 caret_decl_name_at：只认"这一行正在声明的那个名字" ----
+        check("60.7 caret_decl_name_at：`Sub bar()` 的光标落在 bar 上 -> 返回 bar；"
+              "落在 `Sub` 关键字 / 括号后 -> 空；`Dim x`、赋值语句、"
+              "非声明行一律空（它们走『抹空格』那条路）",
+              [[P60.caret_decl_name_at("Sub bar()", 1, 7),
+                P60.caret_decl_name_at("Sub bar()", 1, 4),
+                P60.caret_decl_name_at("Sub bar()", 1, 10),
+                P60.caret_decl_name_at("Type Foo", 1, 7),
+                P60.caret_decl_name_at("Enum Color", 1, 8),
+                P60.caret_decl_name_at("Dim bar As Long", 1, 6),
+                P60.caret_decl_name_at("total = 1", 1, 3),
+                P60.caret_decl_name_at("", 1, 1)]],
+              expect_contain=[["bar", "", "", "Foo", "Color",
+                               "", "", ""]])
+
+        # ---- 60.8 ★v79d 回归护栏：1 字符名字不再被当成行继续符 ----
+        _one60 = "Sub t\n    Set targetSheet = 1\nEnd Sub"
+        _blanked60 = P60._blank_ident_at(_one60, 1, 6)
+        _masked60 = P60._RE_CONTINUATION.sub(
+            " ", P60._mask_strings_and_comments(_blanked60))
+        _one_r60 = []
+        _one_c60 = list(P60.extract_records(_blanked60, module="M",
+                                            is_std_module=True))
+        _one_c60 += list(P60.extract_implicit_records(
+            _blanked60, module="M", is_std_module=True, declared=_one_c60,
+            scope="proc"))
+        _one_r60 = [a for a in _one_c60
+                    if str(a[0]).lower() == "targetsheet"]
+        check("60.8 ★v79d 回归护栏（用户说『更糟糕了』的真因）：1 个字符的过程名"
+              "（`Sub t`）下，抹词后首行【原样不动】、行继续符合并后行数不变"
+              "（`Sub t` 没被当成续行吞掉下一行）、该行仍是过程头；"
+              "过程体里 targetSheet 仍归 `t`（绝不是 None=模块级）",
+              [[_blanked60.split("\n")[0],
+                len(_masked60.split("\n")),
+                P60.is_proc_header_line(_masked60.split("\n")[0]),
+                _one_r60]],
+              expect_contain=[["Sub t", 3, True,
+                               [("targetSheet", "M", "t", True)]]])
+
+        # ---- 60.9 ★接线护栏 ----
+        _root60 = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        _vbsrc60 = io.open(os.path.join(_root60, "vbe_bridge.py"),
+                           encoding="utf-8").read()
+        _psrc60 = io.open(os.path.join(_root60, "parser.py"),
+                          encoding="utf-8").read()
+        check("60.9 ★接线护栏：现场证据扫描（names_outside_caret）必须显式要求"
+              "抹掉光标处的词（blank_decl=True），否则幻影词会把自己当证据；"
+              "声明名的处理只在记录/文本两处留痕；_proc_dup_counts 这类已被"
+              "『第 1 次用原名』取代的旧辅助不得残留",
+              [["vba_parser._blank_ident_at(code, line_no, col, True)" in _vbsrc60,
+                "def _blank_ident_at(text, line_no, col, blank_decl=False):"
+                in _psrc60,
+                "def caret_decl_name_at(text, line_no, col):" in _psrc60,
+                "def _proc_scope_key(name, occurrence):" in _psrc60,
+                "cur_proc = proc_key(proc)" in _psrc60,
+                "return _proc_scope_key(name, max(occ, 1))" in _psrc60,
+                "_proc_dup_counts" not in _psrc60,
+                "fill = \"_\" * " not in _psrc60]],
+              expect_contain=[[True] * 8])
+
+    except Exception as _e60:
+        check("第 60 节异常: %s" % _e60, [True], expect_contain=[False])
 
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))
