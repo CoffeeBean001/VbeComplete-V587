@@ -554,9 +554,11 @@ def _own_closer_below(lines_below, closer, kind, base):
 
     ★v82（用户报的"`If…Then` 补过一次 `End If`，写完 `Else` 再回到 `Then` 那行
     回车又补一个"）：`Else` / `Case` 这类**分支行**本来就在本块【里面】，可 v81
-    起分支行会被拉回块头【同级】—— 于是它长得跟"同级的别的代码"一模一样，旧判据
-    一眼认定"本块已结束了"，收尾就当没看见，回车再补一条。注释同理（注释根本不
-    参与块结构）。这两类行现在一律跳过，扫描继续往下走。
+    起分支行会被拉回块头那一带（`Else` 与 `If` 齐平；`Case` 从 v83 起比 `Select
+    Case` 深一级）—— 齐平的那种长得跟"同级的别的代码"一模一样，旧判据一眼认定
+    "本块已结束了"，收尾就当没看见，回车再补一条。注释同理（注释根本不参与块
+    结构）。这两类行现在一律跳过，扫描继续往下走 —— 跳过是**先跳后判缩进**，
+    所以分支行放在哪一级都不影响这一问（第 63.8 节钉着）。
     """
     depth = 0        # 同缩进的同类块头（本块下面嵌着的同类块）
     deeper = 0       # 真正嵌套（缩进更深）的同类块头
@@ -707,12 +709,26 @@ def next_line_indent(cur_line, lines_above=(), unit="    "):
 # 为什么会歪：`Else` 是 _block_kind 认的块头（要缩进一级），所以这一下回车被我们
 # 接管了 —— 而 VBE 原生回车【会】把刚敲完的那一行拉回它该在的层级，我们一接管，
 # 那个自动对齐就没机会跑。于是 `Else` 一直停在"块体那一级"（上面自动补完 End If 后
-# 光标停的那一行）。这里补的正是这一下：回车时先把分支行拉回【它所属块头】的缩进，
+# 光标停的那一行）。这里补的正是这一下：回车时先把分支行拉回它该在的层级，
 # 再让新行深一级 —— 就是 VBE 原生会做的那件事。
 #
 # 归属关系在 VBA 里没有歧义：Else / ElseIf…Then 属于最近的还开着的 `If … Then`，
 # Case… 属于最近的还开着的 `Select Case`，#Else / #ElseIf 属于最近的还开着的 `#If … Then`。
 _BRANCH_OWNER = {"else": "if", "elseif": "if", "case": "select"}
+
+# ★v83：分支行对齐到【块头往下第几级】。归属者一样，但层级不一样 ——
+#     If x Then
+#         ...
+#     Else                      <- 与 `If` 【齐平】（0）
+#     End If
+#     Select Case x
+#         Case 1                <- 比 `Select Case` 【深一级】（1）
+#             ...
+#     End Select
+# 这是 VBA 的惯用缩进，也正是 VBE 原生回车会整理成的样子。v81 把 `Case` 也拉到
+# `Select Case` 同级了（用户报的："case 应该是相对于 select 缩进的"）；`#Else` /
+# `#ElseIf` 与 `#If … Then` 齐平、不分深浅，所以条件编译这一档同样是 0。
+_BRANCH_OWNER_DEPTH = {"else": 0, "elseif": 0, "case": 1}
 # 条件编译的收尾。_BLOCK_CLOSERS 里刻意没收 `#If`（那个收尾必须由用户自己写），
 # 但"往上找还开着的 #If"这一步照样要用到它，所以单独放在这里。
 _DIRECTIVE_CLOSER = "#End If"
@@ -797,7 +813,7 @@ def _unclosed_owner_above(lines_above, kind):
 
 
 def branch_align(line_text, lines_above, unit="    "):
-    """块内分支行该对齐到哪里（v81，纯函数）。
+    """块内分支行该对齐到哪里（v81；层级按分支分档 v83，纯函数）。
 
     line_text:   光标所在行的文本（正在写的那一行，光标在行尾）
     lines_above: 它上方各行的文本（越靠近它的越靠后）
@@ -807,6 +823,14 @@ def branch_align(line_text, lines_above, unit="    "):
     所属的块头（`If x Then y = 1` 这种单选 If、`Else` 敲在 `If` 前面、`Case` 敲在
     `Select Case` 前面…）-> 返回 None，调用方维持原行为（新行 = 本行缩进 + 一级）。
     **绝不猜**：找不到归属者就当没这回事，宁可不对齐也不要挪错。
+
+    层级由 `_BRANCH_OWNER_DEPTH` 定（v83）：
+      * `Else` / `ElseIf … Then` -> 与 `If … Then` 齐平，新行深一级；
+      * `Case …` / `Case Else` / `Case Is …` -> 比 `Select Case` **深一级**，
+        新行（块体）再深一级；
+      * `#Else` / `#ElseIf … Then` -> 与 `#If … Then` 齐平，新行深一级。
+    缩进单位是 `"    "` 时就是 0 / 4 / 8 格与 4 / 8 / 12 格的区别；用 Tab 或
+    2 空格缩进的工程跟着 `unit` 走（`unit * 1`）。
     """
     word = _branch_word(line_text)
     if not word:
@@ -818,7 +842,8 @@ def branch_align(line_text, lines_above, unit="    "):
     owner = _unclosed_owner_above(lines_above, kind)
     if owner is None:
         return None
-    return owner, owner + unit
+    mine = owner + unit * _BRANCH_OWNER_DEPTH.get(word, 0)
+    return mine, mine + unit
 
 
 def _indent_unit_for(lines):
@@ -3371,10 +3396,11 @@ class VbeBackend:
         由纯函数 block_closer + closer_needed 决定：下面已经挂着本块的收尾、或者
         这块的下文已经在写了 —— 都不补，免得顶开已有代码。
 
-        align_branch=True（分支行自动对齐，v81）—— 仅对 smart 模式生效：
+        align_branch=True（分支行自动对齐，v81；层级分档 v83）—— 仅对 smart 模式生效：
         本行是块【内】的分支（`Else` / `ElseIf … Then` / `Case …`，含条件编译的
-        `#Else` / `#ElseIf`）时，先把它【自己】拉回所属块头那一级（`Else` 对齐 `If … Then`、
-        `Case` 对齐 `Select Case`、`#Else` 对齐 `#If … Then`），新行再深一级。
+        `#Else` / `#ElseIf`）时，先把它【自己】拉回该在的层级（`Else` / `ElseIf` 与
+        `If … Then` 齐平、`#Else` / `#ElseIf` 与 `#If … Then` 齐平、**`Case` 比
+        `Select Case` 深一级**），新行再深一级。
         要不要对齐、对齐到哪，由纯函数 branch_align 决定：上方找不到那个"还开着的块头"
         就什么都不做（宁可不对齐，也不要挪错）。**只改行首空白**，行内一个字符都不碰。
 
@@ -3444,7 +3470,8 @@ class VbeBackend:
                     return False
                 indent = _leading_ws(cm.Lines(anchor, 1))
             if fixed_line is not None:
-                # v81：分支行（Else / ElseIf…Then / Case…）先拉回它所属块头的缩进。
+                # v81：分支行（Else / ElseIf…Then / Case…）先拉回它该在的层级
+                # （v83：Case 比 Select Case 深一级，其余与块头齐平）。
                 # 只动【行首空白】，行内一个字符都不碰；写不成就不动、也不插新行，
                 # 让调用方把这一下回车原样还给系统。
                 _raw = str(line_text).rstrip("\r\n")

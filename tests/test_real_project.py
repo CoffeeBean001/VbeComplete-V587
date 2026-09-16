@@ -9164,7 +9164,8 @@ def main():
 
         # ---- 62.3 branch_align：算得对不对 ----
         check("62.3 branch_align：Else 对齐最近的 `If … Then`（块体再深一级）；"
-              "Case 对齐 `Select Case`；上方没有归属者（单选 If `If x Then y = 1` / "
+              "Case 比 `Select Case` 【深一级】（v83，块体再深一级）；"
+              "#Else 与 `#If` 齐平；上方没有归属者（单选 If `If x Then y = 1` / "
               "先敲了 Else 还没写 If）-> None（绝不猜）；非分支行 -> None",
               [[_ba62("        Else", ["Sub Test()", "    If x = 1 Then"], "    "),
                 _ba62("            Case 1",
@@ -9176,7 +9177,7 @@ def main():
                 _ba62("    Case 1", ["Sub Test()", "    x = 1"], "    "),
                 _ba62("    x = 1", ["Sub Test()", "    If x = 1 Then"], "    ")]],
               expect_contain=[[("    ", "        "),
-                               ("    ", "        "),
+                               ("        ", "            "),
                                ("    ", "        "),
                                None, None, None, None]])
 
@@ -9252,8 +9253,8 @@ def main():
                                1)])
 
         # ---- 62.5 ★集成：Select Case 里的 Case ----
-        check("62.5 ★集成：`Select Case` 里同样处理 —— `Case 1` 对齐 `Select Case`、"
-              "块体深一级；`End Select` 不动",
+        check("62.5 ★集成：`Select Case` 里的 `Case 1` 比 `Select Case` 【深一级】"
+              "（v83）、块体再深一级；`End Select` 不动",
               [_nl62(["Sub Test()",
                       "    Select Case x",
                       "            Case 1",
@@ -9262,11 +9263,11 @@ def main():
               expect_contain=[(True,
                                ["Sub Test()",
                                 "    Select Case x",
-                                "    Case 1",
-                                "        ",
+                                "        Case 1",
+                                "            ",
                                 "    End Select",
                                 "End Sub"],
-                               (4, 9, 4, 9),
+                               (4, 13, 4, 13),
                                1)])
 
         # ---- 62.6 集成：ElseIf ----
@@ -9675,6 +9676,281 @@ def main():
 
     except Exception as _e63:
         check("第 63 节异常: %s" % _e63, [True], expect_contain=[False])
+
+    print("\n" + "=" * 60)
+    print("=== 64. 分支对齐的层级分档：Case 比 Select Case 深一级（v83）===")
+    try:
+        import vbe_bridge as VB64
+
+        _ba64 = VB64.branch_align
+        _dep64 = VB64._BRANCH_OWNER_DEPTH
+
+        # ---- 64.1 档位表 ----
+        check("64.1 `_BRANCH_OWNER_DEPTH`：Else / ElseIf 与 If 齐平（0）、"
+              "`#Else` / `#ElseIf` 与 #If 齐平（0）、Case 比 Select Case 深一级（1）",
+              [[_dep64.get("else"), _dep64.get("elseif"), _dep64.get("case")]],
+              expect_contain=[[0, 0, 1]])
+
+        # ---- 64.2 纯函数：Case 深一级；Else / #Else 维持齐平（v81 不退化）----
+        check("64.2 branch_align（v83）：`Case 1` / `Case Else` / `Case Is > 3` "
+              "都比 `Select Case` 【深一级】（本行 owner+1 级、新行 owner+2 级）；"
+              "Else / ElseIf / #Else / #ElseIf 一律维持齐平",
+              [[_ba64("        Case 1",
+                      ["Sub Test()", "    Select Case x"], "    "),
+                _ba64("    Case Else",
+                      ["Sub Test()", "    Select Case x"], "    "),
+                _ba64("            Case Is > 3",
+                      ["Sub Test()", "    Select Case x"], "    "),
+                _ba64("        Else",
+                      ["Sub Test()", "    If x = 1 Then"], "    "),
+                _ba64("          ElseIf y Then",
+                      ["Sub Test()", "    If x = 1 Then"], "    "),
+                _ba64("    #Else", ["    #If VBA7 Then"], "    "),
+                _ba64("    #ElseIf VBA64 Then",
+                      ["    #If VBA7 Then"], "    ")]],
+              expect_contain=[[("        ", "            "),
+                               ("        ", "            "),
+                               ("        ", "            "),
+                               ("    ", "        "),
+                               ("    ", "        "),
+                               ("    ", "        "),
+                               ("    ", "        ")]])
+
+        # ---- 64.3 缩进单位跟着工程走（2 空格 / Tab）----
+        check("64.3 缩进单位跟着工程走：2 个空格缩进 -> Case 只深 2 格；"
+              "Tab 缩进 -> Case 深一个 Tab（`unit * 1`，不是硬写 4 个空格）",
+              [[_ba64("    Case 1", ["Sub Test()", "  Select Case x"], "  "),
+                _ba64("\t\tCase 1", ["Sub Test()", "\tSelect Case x"], "\t")]],
+              expect_contain=[[("    ", "      "), ("\t\t", "\t\t\t")]])
+
+        # ---- 64.4 归属者：内层 Select 闭合后，外面的 Case 归外层（不被内层抢走）----
+        check("64.4 `_unclosed_owner_above` 配平：内层 `Select Case` 已经用 "
+              "`End Select` 闭合 -> 后面的 `Case 2` 归【外层】那个（深一级 = 8 格）",
+              [[_ba64("        Case 2",
+                      ["Sub Test()",
+                       "    Select Case x",
+                       "        Case 1",
+                       "            Select Case y",
+                       "            End Select"], "    "),
+                _ba64("    Case 2", ["Sub Test()", "    x = 1"], "    "),
+                _ba64("    Case 2", ["Sub Test()"], "    ")]],
+              expect_contain=[[("        ", "            "), None, None]])
+
+        # ---- 集成骨架（要 ReplaceLine：分支行对齐会改本行行首空白）----
+        class _CM64(object):
+            def __init__(self, lines):
+                self.lines = list(lines)
+                self.Name = "Module1"
+                self.replace_calls = 0
+
+            @property
+            def CountOfLines(self):
+                return len(self.lines)
+
+            def Lines(self, start, count):
+                s0 = max(0, int(start) - 1)
+                return "".join(l + "\n"
+                               for l in self.lines[s0:s0 + int(count)])
+
+            def InsertLines(self, start, text):
+                i = min(max(0, int(start) - 1), len(self.lines))
+                for k, ln in enumerate(str(text).split("\n")):
+                    self.lines.insert(i + k, ln)
+
+            def ReplaceLine(self, line, text):
+                self.replace_calls += 1
+                self.lines[int(line) - 1] = str(text)
+
+        class _Pane64(object):
+            def __init__(self, cm, sel):
+                self.CodeModule = cm
+                self.sel = sel
+
+            def GetSelection(self):
+                return self.sel
+
+            def SetSelection(self, sl, sc, el, ec):
+                self.sel = (sl, sc, el, ec)
+
+        class _VBE64(object):
+            def __init__(self, pane):
+                self.ActiveCodePane = pane
+
+        _orig64 = VB64._get_vbe_cached
+
+        def _nl64(lines, line_no, text=None):
+            """光标落在第 line_no 行【行尾】，回车走 smart + auto_close。"""
+            cm64 = _CM64(lines)
+            if text is not None:
+                cm64.lines[line_no - 1] = text
+            cur = cm64.lines[line_no - 1]
+            pane64 = _Pane64(cm64, (line_no, len(cur) + 1, line_no,
+                                    len(cur) + 1))
+            VB64._get_vbe_cached = lambda: _VBE64(pane64)
+            ok64 = VB64.VbeBackend().new_line_below(smart=True, auto_close=True)
+            return (ok64, cm64.lines, pane64.sel, cm64.replace_calls)
+
+        # ---- 64.5 ★集成（用户报的场景）：Case 已经在正确层级 -> 一个字都不动 ----
+        # v81 的错就在这里：它把已经缩进 8 格的 `Case 1` 拉回 4 格（与 Select 齐平）。
+        check("64.5 ★集成（用户报的场景）：`Case 1` 已经在 `Select Case` 下面"
+              "深一级（8 格）-> 回车【不改本行】（一次 ReplaceLine 都不发）、"
+              "新行（块体）再深一级到 12 格，光标 (4,13)；`End Select` 一个字符没动",
+              [_nl64(["Sub Test()",
+                      "    Select Case x",
+                      "        Case 1",
+                      "    End Select",
+                      "End Sub"], 3)],
+              expect_contain=[(True,
+                               ["Sub Test()",
+                                "    Select Case x",
+                                "        Case 1",
+                                "            ",
+                                "    End Select",
+                                "End Sub"],
+                               (4, 13, 4, 13),
+                               0)])
+
+        # ---- 64.6 ★集成：Case 敲歪了（与 Select 齐平）-> 拉回深一级 ----
+        check("64.6 ★集成：`Case 1` 被敲成与 `Select Case` 齐平（4 格）-> "
+              "回车把它拉回 8 格（深一级），新行 12 格",
+              [_nl64(["Sub Test()",
+                      "    Select Case x",
+                      "    Case 1",
+                      "    End Select",
+                      "End Sub"], 3)],
+              expect_contain=[(True,
+                               ["Sub Test()",
+                                "    Select Case x",
+                                "        Case 1",
+                                "            ",
+                                "    End Select",
+                                "End Sub"],
+                               (4, 13, 4, 13),
+                               1)])
+
+        # ---- 64.7 回归：Else 与 If 齐平、#Else 与 #If 齐平（v81 口径不退化成"深一级"）----
+        check("64.7 回归护栏：`Else` 仍然与 `If` 齐平（4 格、新行 8 格）；"
+              "`#Else` 仍然与 `#If` 齐平（0 格、新行 4 格）—— v83 只动了 Case 那一档",
+              [_nl64(["Sub Test()",
+                      "    If x = 1 Then",
+                      "        Else",
+                      "    End If",
+                      "End Sub"], 3),
+               _nl64(["#If VBA7 Then",
+                      "    x = 1",
+                      "    #Else",
+                      "#End If"], 3)],
+              expect_contain=[(True,
+                               ["Sub Test()",
+                                "    If x = 1 Then",
+                                "    Else",
+                                "        ",
+                                "    End If",
+                                "End Sub"],
+                               (4, 9, 4, 9),
+                               1),
+                              (True,
+                               ["#If VBA7 Then",
+                                "    x = 1",
+                                "#Else",
+                                "    ",
+                                "#End If"],
+                               (4, 5, 4, 5),
+                               1)])
+
+        # ---- 64.8 嵌套 Select：内层 Case 归内层（16 格）----
+        check("64.8 嵌套 `Select Case`：内层 `Case 2` 归【内层】那个 "
+              "（本行 16 格、新行 20 格），外层 Case 与 End Select 都不动",
+              [_nl64(["Sub Test()",
+                      "    Select Case x",
+                      "        Case 1",
+                      "            Select Case y",
+                      "                Case 2",
+                      "            End Select",
+                      "    End Select",
+                      "End Sub"], 5)],
+              expect_contain=[(True,
+                               ["Sub Test()",
+                                "    Select Case x",
+                                "        Case 1",
+                                "            Select Case y",
+                                "                Case 2",
+                                "                    ",
+                                "            End Select",
+                                "    End Select",
+                                "End Sub"],
+                               (6, 21, 6, 21),
+                               0)])
+
+        # ---- 64.9 ★端到端：从零走完 `Select Case` -> `Case 1` -> `Case 2` ----
+        def _flow64():
+            cm64 = _CM64(["Sub Test()", "    Select Case x", "End Sub"])
+            pane64 = _Pane64(cm64, (1, 1, 1, 1))
+            VB64._get_vbe_cached = lambda: _VBE64(pane64)
+
+            def key(line_no, text=None):
+                if text is not None:
+                    cm64.lines[line_no - 1] = text
+                cur = cm64.lines[line_no - 1]
+                pane64.sel = (line_no, len(cur) + 1, line_no, len(cur) + 1)
+                return VB64.VbeBackend().new_line_below(smart=True,
+                                                        auto_close=True)
+
+            r1 = key(2)                       # 写 `Select Case x` 回车 -> 补 End Select
+            s1 = list(cm64.lines)
+            r2 = key(3, "        Case 1")     # 写 `Case 1` 回车
+            s2 = list(cm64.lines)
+            r3 = key(4, "        Case 2")     # 写 `Case 2` 回车
+            return (r1, s1, r2, s2, r3, list(cm64.lines), pane64.sel)
+
+        check("64.9 ★端到端（从零三步）：①写 `Select Case x` 回车 -> 补出 "
+              "`End Select`、光标停在 8 格的块体行；②在那行写 `Case 1` 回车 -> "
+              "它【留在 8 格】、新行 12 格；③再写 `Case 2` 回车 -> 同样留在 8 格、"
+              "新行 12 格（`End Select` 始终只有一条）",
+              [_flow64()],
+              expect_contain=[(True,
+                               ["Sub Test()",
+                                "    Select Case x",
+                                "        ",
+                                "    End Select",
+                                "End Sub"],
+                               True,
+                               ["Sub Test()",
+                                "    Select Case x",
+                                "        Case 1",
+                                "            ",
+                                "    End Select",
+                                "End Sub"],
+                               True,
+                               ["Sub Test()",
+                                "    Select Case x",
+                                "        Case 1",
+                                "        Case 2",
+                                "            ",
+                                "    End Select",
+                                "End Sub"],
+                               (5, 13, 5, 13))])
+
+        VB64._get_vbe_cached = _orig64
+
+        # ---- 64.10 ★接线护栏 ----
+        _root64 = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        _vbsrc64 = io.open(os.path.join(_root64, "vbe_bridge.py"),
+                           encoding="utf-8").read()
+        _fn64 = _vbsrc64.split("def branch_align")[1].split(
+            "def _indent_unit_for")[0]
+        check("64.10 ★接线护栏：`branch_align` 真的走档位表"
+              "（`unit * _BRANCH_OWNER_DEPTH`），不是把 Case 硬写成 0；"
+              "档位表里 `case` 必须是 1、`else` / `elseif` 必须是 0 "
+              "（防止有人「顺手」把它改回 v81 的齐平口径）",
+              [[("_BRANCH_OWNER_DEPTH.get(word, 0)" in _fn64),
+                ("unit *" in _fn64),
+                ('"case": 1' in _vbsrc64),
+                ('"else": 0, "elseif": 0' in _vbsrc64)]],
+              expect_contain=[[True, True, True, True]])
+
+    except Exception as _e64:
+        check("第 64 节异常: %s" % _e64, [True], expect_contain=[False])
 
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))
