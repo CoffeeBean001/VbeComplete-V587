@@ -221,6 +221,31 @@ def _pair_char_for_key(vk, shift_down):
     return None
 
 
+def _is_text_key(vk):
+    """这个键按下去是否【本可能】往代码里写一个字符。纯函数。
+
+    v79 用途：数"按了这类键、文档却没变"的次数 —— 那就是**输入法正在组字**的
+    信号（拼音字母被输入法吃掉、还没上屏）。组字状态下"回车"是**上屏键**，
+    绝不能被我们抢去当换行用（见 state["pending_keys"] / _enter_indent_key_ok）。
+    这是输入法无关的判据：不依赖任何 IME 接口，中/日/韩输入法都一样。
+    """
+    try:
+        vk = int(vk)
+    except Exception:
+        return False
+    if vk == 0x20:                                 # Space
+        return True
+    if 0x30 <= vk <= 0x39:                         # 0-9
+        return True
+    if 0x41 <= vk <= 0x5A:                         # A-Z
+        return True
+    if 0x60 <= vk <= 0x69:                         # 小键盘 0-9
+        return True
+    if 0xBA <= vk <= 0xC0 or 0xDB <= vk <= 0xDE:   # OEM 标点 ;=,.-/`[] 与引号
+        return True
+    return False
+
+
 def _mod_down():
     """Ctrl 或 Alt 是否被按住（组合键不该触发自动配对）。"""
     try:
@@ -275,6 +300,28 @@ try:
                                      "0").strip() != "1")
 except Exception:
     SHIFT_NAV_JUMP = True
+
+# 回车自动缩进（v79）。
+#
+# 用户口径：「写了一整行注释，回车换行后光标落在行首、不缩进 —— 希望能忽略上方
+# 注释行（可能有多行），跟上方第一个非注释行对齐」；「写 For / Do / If / With /
+# Sub / Function / Type / Enum 这些结构时，回车能自动缩进」。
+#
+# 只在【这一下回车确实要改缩进】时才由我们接管换行：判据 enter_indent_wanted
+# 是纯函数，跑在键盘钩子线程里（只读轮询留下的快照，绝不碰 COM）；普通代码行、
+# 空行、光标不在行尾、行内有 Tab —— 一律不接管，原样交给 VBE，风险为零。
+# 万一 COM 没写成，_enter_indent_here 会把这一下回车原样还给系统。
+# 想关掉（回车完全回到 VBE 原生）：set VBECOMPLETE_NO_ENTER_INDENT=1
+try:
+    ENTER_INDENT = (os.environ.get("VBECOMPLETE_NO_ENTER_INDENT",
+                                   "0").strip() != "1")
+except Exception:
+    ENTER_INDENT = True
+
+# 钩子里判"要不要接管回车"时，轮询快照最多允许多旧（秒）。
+# 快照是每轮轮询刷新的（100ms 一次），但空闲时会降频到 2s。超过这个年纪就
+# 一律不接管：宁可这一次不做缩进，也绝不拿旧行文本去赌用户正在敲的那一行。
+ENTER_CTX_MAX_AGE = 0.8
 
 # 弹窗可见时这些键由 win32_filter 接管（↑/↓ 导航、Tab 确认、Esc 取消），
 # 且会被 suppress_event() 吞掉。on_press 里绝不能抢先收起弹窗，否则"按方向键
@@ -579,6 +626,8 @@ def main():
         "raw_focused": None,  # 最近一次原始焦点读数，用于去抖
         "focus_streak": 0,    # 同一读数连续出现的次数
         "last_snap": None,    # 上次轮询到的 (行号, 行文本, 模块名)，用于检测内容变化
+        "cur_ctx": None,      # v79：(时刻, 行号, 行文本, 光标列)，每轮刷新，给回车自动缩进判据用
+        "pending_keys": 0,    # v79：按了"可能写字"的键、文档却还没变的次数（输入法组字中）
         "_popup_sig": None,   # 上次看到的 VBE 提示窗矩形（v66：变了就重摆候选窗）
         "ctrl": False,
         "alt": False,
@@ -642,15 +691,44 @@ def main():
         光标落到新行缩进之后。细节见 VbeBackend.new_line_below。
 
         顺序：先收起弹窗（光标要换行了，列表留着没意义），再动文本。
+        v79 补上兜底：后端没写成（COM 抽风 / 不在代码窗）就把这一下按键原样
+        还给系统 —— 绝不"按了 Shift+Enter 却没换行"（VBE 里 Shift+Enter 与
+        回车同义，所以补一个纯回车即可）。
         """
         try:
             completer.hide()
         except Exception:
             pass
+        _ok = False
         try:
-            backend.new_line_below()
+            _ok = backend.new_line_below()
+        except Exception:
+            _ok = False
+        if not _ok:
+            _log("newline: COM 未落成 -> 按键原样还给系统")
+            send_vk(VK_RETURN)
+
+    def _enter_indent_here():
+        """回车自动缩进（v79）：收起弹窗 -> 按代码结构算出缩进、代出新行。
+
+        与 _new_line_here 的区别只在"缩进怎么来"：这里是 smart 模式 ——
+        整行注释则忽略它、跟上方第一个非注释行对齐，块结构开头则缩进一级。
+
+        后端返回 False（光标不在行尾 / 空行 / 引号没闭合 / COM 抽风…）就把
+        这一下回车【原样还给系统】—— 绝不让用户"按了回车却没换行"。
+        """
+        try:
+            completer.hide()
         except Exception:
             pass
+        _ok = False
+        try:
+            _ok = backend.new_line_below(smart=True)
+        except Exception:
+            _ok = False
+        if not _ok:
+            _log("enterindent: 未接管 -> 回车原样还给系统")
+            send_vk(VK_RETURN)
 
     def _move_caret_here(delta):
         """Shift+↑/↓（候选窗可见时）：收起我们的窗，光标上/下移一行（v78）。
@@ -709,6 +787,39 @@ def main():
             pass
         root.after(10, drain_actions)
 
+    def _enter_indent_key_ok(vk):
+        """这一下回车要不要由我们接管（v79，跑在键盘钩子线程里，绝不碰 COM）。
+
+        钩子线程没有 COM 单元（v56 血泪教训），而"要不要吞这一下按键"必须在
+        按键当场就定下来 —— 所以这里只吃【轮询留下的快照】：
+          * 快照必须够新（ENTER_CTX_MAX_AGE）；过期就一律不接管，宁可这一次不
+            做缩进，也不拿旧行文本去赌用户正在敲的那一行；
+          * 真正"值不值得接管"交给纯函数 vbe_bridge.enter_indent_wanted
+            （整行注释 / 块结构开头 + 光标在行尾 + 行内无 Tab）。
+        其余情况一律返回 False：这一下回车原样交给 VBE，零风险。
+        """
+        try:
+            if not ENTER_INDENT or vk != VK_RETURN:
+                return False
+            if _shift_down() or _mod_down():
+                return False
+            if int(state.get("pending_keys") or 0) > 0:
+                # 有"按下去、却没落到文档里"的按键 —— 多半是输入法正在组字，
+                # 这一下回车是【上屏】用的（打拼音时按回车把字送进文档）。
+                # 抢了它就会变成"字没上屏、反而多出一行"，所以一律不接管。
+                return False
+            if com_backoff_remaining() > 0 or not in_vbe_code_area():
+                return False
+            ctx = state.get("cur_ctx")
+            if not ctx:
+                return False
+            ts, _ln, text, ec = ctx
+            if time.time() - float(ts) > ENTER_CTX_MAX_AGE:
+                return False
+            return bool(vbe_bridge.enter_indent_wanted(text, ec))
+        except Exception:
+            return False
+
     def win32_filter(msg, data):
         """
         Windows 低层键盘钩子的事件过滤器（运行在钩子线程）。
@@ -742,10 +853,24 @@ def main():
                 # 工程窗口 / 窗体设计器里打字时不能把内容写进代码窗格。
                 _pair_ch = (_pair_char_for_key(vk, _shift_down())
                             if AUTO_PAIR else None)
+                # v79：数"按了可能写字的键、文档却没变"的次数 —— 输入法正在组字
+                # 的信号（拼音被输入法吃掉、还没上屏）。组字状态下回车是【上屏
+                # 键】，见 _enter_indent_key_ok：那时绝不接管回车。
+                # 文档一变（轮询看到）就把计数清零，所以正常打字时它总是 0。
+                if _is_text_key(vk) and not _mod_down() and in_vbe_code_area():
+                    state["pending_keys"] = min(
+                        99, int(state.get("pending_keys") or 0) + 1)
                 if (_is_newline_shortcut(vk, _shift_down())
                         and com_backoff_remaining() <= 0
                         and in_vbe_code_area()):
                     action = (_new_line_here, ())
+                    suppress = True
+                elif _enter_indent_key_ok(vk):
+                    # v79 回车自动缩进：只有"整行注释 / 块结构开头 + 光标在行尾
+                    # + 行内无 Tab"才走得到这里（其余一律由上面那个判据挡掉，
+                    # 回车原样交给 VBE）。真正的写入在主线程，写不成会把这一下
+                    # 回车原样还给系统。
+                    action = (_enter_indent_here, ())
                     suppress = True
                 elif (_pair_ch
                         and not _mod_down()
@@ -1020,6 +1145,9 @@ def main():
             if focused:
                 backend._cache = None            # 回到 VBE：强制刷新标识符
                 state["released"] = False
+                # v79：刚切回 VBE，把"按了键却没落到文档里"的计数清零 ——
+                # 那些键是敲在别的程序里的，不该让我们以为输入法在组字。
+                state["pending_keys"] = 0
                 # 上一个“非 VBE”前台窗口已销毁 -> 说明它是被关掉、焦点被甩回
                 # VBE 的（典型如关掉 VSCode/PyCharm）。若此刻立刻挂系统钩子，
                 # 会拖慢那个仍在收尾（写设置、退子进程）的进程，表现为关窗口后
@@ -1232,6 +1360,12 @@ def main():
             except Exception:
                 pass
             snap = backend.snapshot() if _com_allowed() else None
+            if snap is not None and len(snap) > 3:
+                # v79：给"回车自动缩进"留一份【每轮都刷新】的光标上下文
+                # (时刻, 行号, 行文本, 光标列)。刻意不复用 last_snap —— 那份只在
+                # 文本变化时才更新，行号与列可能早就过期（移动光标不算变化），
+                # 拿它判"光标是否在行尾"会误判成"在行尾"而抢走一次拆行。
+                state["cur_ctx"] = (time.time(), snap[0], snap[1], snap[3])
             # 诊断心跳（只在 VBECOMPLETE_LOG=1 时产生，约每 3 秒一行）。
             # 排查"某处输入什么都不弹"时，它一眼分清是【没读到快照】（COM 读到
             # None：多行选区 / 退避 / 不可用）、【焦点不在代码窗格】、还是
@@ -1255,7 +1389,14 @@ def main():
                 last = state.get("last_snap")
                 if last is None:
                     state["last_snap"] = snap      # 首次只记录，不触发
-                elif last != snap:
+                    state["pending_keys"] = 0      # v79：文档状态未知 -> 计数清零
+                elif last[:3] != snap[:3]:
+                    # v79：文档真的变了 -> "按了键却还没落到文档里"的计数清零
+                    # （那些键确实写进去了，输入法没有在组字）。
+                    state["pending_keys"] = 0
+                    # 只比前三个元素（行号 / 行文本 / 模块名）：第 4 个是 v79 加
+                    # 的【光标列】，光标的移动不算"内容变化"—— 否则在代码里点来
+                    # 点去都会被弹窗打扰（这条一直以来的行为必须守住）。
                     state["last_snap"] = snap
                     # v64：换模块（Ctrl+Tab 切代码窗、点工程树换模块）会让
                     # "同一行 + 文本不同"看起来像一次编辑，其实一个字都没敲

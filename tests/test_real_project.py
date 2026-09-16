@@ -7530,6 +7530,315 @@ def main():
     except Exception as _e55:
         check("第 55 节异常: %s" % _e55, [True], expect_contain=[False])
 
+    # ---- 56. v79：配对光标落点（bug）+ 回车自动缩进（新功能） ----
+    #
+    # 用户报的 bug：「录入 targetSheet.Cells(i, "b").Interior.Color = RGB，然后
+    # 再打括号，光标落点会错位，不能正确落在 RGB 后面的括号内。应该是 vba 自动
+    # 格式化的时候，有两个括号，你只判断了一个。」
+    # 用户要的两个功能：
+    #   1) 整行注释后回车，忽略上方注释行（可能多行）、跟上方第一个非注释行对齐；
+    #   2) For / Do / If / With / Sub / Function / Type / Enum 这些结构，回车自动缩进。
+    print("\n=== 56. 配对光标落点 + 回车自动缩进（v79）===")
+    try:
+        import main as M56
+        import vbe_bridge as VB56
+        _orig56 = VB56._get_vbe_cached
+
+        # ---- 56.1 ★bug 修复：VBE 重排整行后，光标仍要落在括号中间 ----
+        _CANON56 = '    targetSheet.Cells(i, "b").Interior.Color = RGB()'
+
+        def _off56(after, col0):
+            return VB56._locate_inserted(after, _CANON56, "(", ")", col0)
+
+        _c56 = _CANON56.index("RGB()") + 3       # 写入时光标的位置（括号之间）
+
+        def _in_pair56(after):
+            _o = _off56(after, _c56)
+            return bool(_o is not None and after[_o - 1:_o + 1] == "()")
+
+        check("56.1 ★bug：VBE 重排整行后仍把光标钉在括号中间"
+              "（逗号后补空格 / 改大小写 / 等号两边补空格 / 括号前后多空格）",
+              [_in_pair56(_CANON56),
+               _in_pair56('    targetSheet.Cells(i, "b").Interior.Color = RGB ()'),
+               _in_pair56('    targetSheet.Cells(i,"b").interior.color = rgb()'),
+               _in_pair56('    targetSheet.Cells( i , "b" ).Interior.Color '
+                          '= RGB(   )'.replace("(   )", "()"))],
+              expect_contain=[True, True, True, True])
+
+        # 用户说的"两个括号"：行里本来还有一对括号，不能认到那一对上去
+        _W56 = '    targetSheet.Cells(i, x()).Interior.Color = RGB()'
+        _o56 = VB56._locate_inserted(_W56, _W56, "(", ")",
+                                     _W56.index("RGB()") + 3)
+        check("56.2 ★bug：一行里有两对括号时，认的是我们刚插的那一对（RGB 后面）",
+              [_o56, _W56[_o56 - 1:_o56 + 1], _o56 > _W56.index("RGB")],
+              expect_contain=[_W56.index("RGB") + 4, "()", True])
+
+        # v58 老场景（引号）：`    w""=4` 被 VBE 重排成 `    w "" = 4`
+        check("56.3 引号那一例（v58 老场景）不许回归",
+              [VB56._locate_inserted('    w "" = 4', '    w""=4', '"', '"', 5)],
+              expect_contain=[7])
+
+        # ---- 56.4 块结构开头（回车后要深一级） ----
+        _BLK56 = ["For i = 1 To 10", "For Each c In rng", "Do", "Do While x < 5",
+                  "Do Until x > 0", "While x", "With rng", "If x Then",
+                  "If x Then '注释", "ElseIf y Then", "Else", "Case 1, 2",
+                  "Case Else", "Select Case x", "Sub Foo()",
+                  "Private Sub Foo()", "Public Function Bar() As Long",
+                  "Static Sub S()", "Property Get X()", "Type Foo",
+                  "Enum Color", "#If VBA7 Then", "#Else",
+                  'If x = "a Then" Then', "    For i = 1 To 10"]
+        _NOBLK56 = ["If x Then y = 1", "Next i", "End If", "End Sub", "End With",
+                    "Loop", "Loop While x", "Wend", "x = 1", "Exit For",
+                    "DoEvents", "foo(1, 2)", "Debug.Print x", "Rem 说明",
+                    "'注释", "Set x = New Collection", "Call Foo",
+                    "Dim x As Long", "    ", "End Select", "Exit Sub",
+                    "Range(\"a1\").Value = 1", "If x Then _", "rem表格"]
+        check("56.4 opens_block：24 个块头全认，24 个非块头全不认",
+              [[t for t in _BLK56 if not VB56.opens_block(t)],
+               [t for t in _NOBLK56 if VB56.opens_block(t)]],
+              expect_contain=[[], []])
+
+        # ---- 56.5 回车后新行的缩进 ----
+        _U56 = "    "
+        _C56 = [VB56.next_line_indent("    x = 1", ["Sub Foo()"], _U56),
+                VB56.next_line_indent("    For i = 1 To 10", [], _U56),
+                VB56.next_line_indent("    Next i", [], _U56),
+                VB56.next_line_indent("'注释", ["Sub Foo()", "    x = 1"], _U56),
+                VB56.next_line_indent("'注释", ["    With rng"], _U56),
+                VB56.next_line_indent("'注释", ["'老注释", ""], _U56)]
+        check("56.5 next_line_indent：普通行齐平 / 块头深一级 / 闭合行齐平 / "
+              "注释跟上方非注释行对齐 / 注释上方是块头则深一级 / 上方全注释"
+              "则维持自身缩进",
+              _C56, expect_contain=["    ", "        ", "    ", "    ",
+                                    "        ", ""])
+
+        # ★用户的实际场景：注释行在第 1 列、上方代码缩进 12，连续多行注释
+        _A56 = ["        Else", "            a = RGB(1, 2)",
+                "'第一行注释", "'第二行注释"]
+        check("56.5b ★用户场景：整行注释后回车，忽略上方连续注释行，"
+              "跟第一个非注释行（缩进 12）对齐",
+              [VB56.next_line_indent("'第三行注释", _A56, _U56),
+               VB56.next_line_indent("'注释",
+                                     ["Sub Foo()", "    For i = 1 To 10"], _U56)],
+              expect_contain=["            ", "        "])
+
+        # ---- 56.6 钩子侧判据：只在这两种情形接管回车 ----
+        _W56b = [("整行注释+行尾", "'注释", 20, True),
+                 ("块头+行尾", "    For i = 1 To 10", 21, True),
+                 ("普通代码行+行尾", "    x = 1", 10, False),
+                 ("光标在行中间", "    For i = 1 To 10", 12, False),
+                 ("空行", "        ", 9, False),
+                 ("整行空白", "", 1, False),
+                 ("含 Tab 的行", "\tFor i", 9, False),
+                 ("光标列拿不到", "    For i", 0, False)]
+        check("56.6 enter_indent_wanted：注释 / 块头 + 光标在行尾才接管；"
+              "普通行、行中间、空行、含 Tab、拿不到列一律放行给 VBE",
+              [[n for (n, t, c, e) in _W56b
+                if VB56.enter_indent_wanted(t, c) != e]],
+              expect_contain=[[]])
+
+        # ---- 56.7 引号没闭合时不许抢回车（那是 VBE 原生会补右引号的地方） ----
+        check("56.7 _unterminated_string：注释里的引号不算；字符串内 \"\" 转义不算",
+              [VB56._unterminated_string('s = "abc'),
+               VB56._unterminated_string('s = "abc"'),
+               VB56._unterminated_string('x = 1  ' + "'他说\"你好"),
+               VB56._unterminated_string('s = "a""b"')],
+              expect_contain=[True, False, False, False])
+
+        # ---- 56.8 ★集成：smart 模式真能改写缩进；不该管的返回 False ----
+        class _CM56(object):
+            def __init__(self, lines):
+                self.lines = list(lines)
+                self.Name = "Module1"
+
+            @property
+            def CountOfLines(self):
+                return len(self.lines)
+
+            def Lines(self, start, count):
+                s0 = max(0, int(start) - 1)
+                return "".join(l + "\n"
+                               for l in self.lines[s0:s0 + int(count)])
+
+            def InsertLines(self, start, text):
+                i = min(max(0, int(start) - 1), len(self.lines))
+                for k, ln in enumerate(str(text).split("\n")):
+                    self.lines.insert(i + k, ln)
+
+        class _Pane56(object):
+            def __init__(self, cm, sel):
+                self.CodeModule = cm
+                self.sel = sel
+
+            def GetSelection(self):
+                return self.sel
+
+            def SetSelection(self, sl, sc, el, ec):
+                self.sel = (sl, sc, el, ec)
+
+        class _VBE56(object):
+            def __init__(self, pane):
+                self.ActiveCodePane = pane
+
+        def _nl56(lines, line_no, col, smart=True):
+            cm56 = _CM56(lines)
+            pane56 = _Pane56(cm56, (line_no, col, line_no, col))
+            VB56._get_vbe_cached = lambda: _VBE56(pane56)
+            ok56 = VB56.VbeBackend().new_line_below(smart=smart)
+            return ok56, cm56.lines, pane56.sel
+
+        _ok, _ls, _sel = _nl56(["Sub Foo()", "    For i = 1 To 10",
+                                "    Next i", "End Sub"], 2, 21)
+        check("56.8 ★集成：块头那行回车 -> 新行深一级（8 空格）、光标在缩进后、"
+              "块头那一行一个字不动",
+              [(_ok, _ls, _sel)],
+              expect_contain=[(True,
+                               ["Sub Foo()", "    For i = 1 To 10", "        ",
+                                "    Next i", "End Sub"],
+                               (3, 9, 3, 9))])
+
+        _ok, _ls, _sel = _nl56(["Sub Foo()", "    x = 1", "'注释", "End Sub"], 3, 5)
+        check("56.8b ★集成：整行注释那行回车 -> 新行跟上方代码行（4 空格）对齐",
+              [(_ok, _ls[3] if len(_ls) > 3 else None)],
+              expect_contain=[(True, "    ")])
+
+        # 中文注释（显示列语义）也要能对上：'注释 = 1 + 2 + 2 = 5 列
+        _sem56 = VB56._sem_cache.get("info")
+        VB56._sem_cache["info"] = ("disp", 4, True)
+        try:
+            _ok, _ls, _sel = _nl56(["Sub Foo()", "    x = 1", "'注释", "End Sub"],
+                                   3, 5)
+        finally:
+            VB56._sem_cache["info"] = _sem56
+        check("56.8c ★集成：中文整行注释（显示列语义）同样对齐到 4 空格",
+              [(_ok, _ls[3] if len(_ls) > 3 else None)],
+              expect_contain=[(True, "    ")])
+
+        _bad56 = []
+        for _n, _ln, _col, _src in [
+                ("光标在行中间", 2, 12, ["Sub Foo()", "    For i = 1 To 10",
+                                        "End Sub"]),
+                ("空行", 2, 5, ["Sub Foo()", "    ", "End Sub"]),
+                ("引号没闭合", 2, 13, ["Sub Foo()", '    s = "abc', "End Sub"])]:
+            _ok56, _ls56, _s56 = _nl56(_src, _ln, _col)
+            if _ok56 is not False or _ls56 != _src:
+                _bad56.append(_n)
+        # 多行选区：按回车是"删除选区"，语义完全不同 —— 必须原样让 VBE 处理
+        _cm56 = _CM56(["Sub Foo()", "    a = 1", "    b = 2", "End Sub"])
+        _pane56 = _Pane56(_cm56, (2, 1, 3, 1))
+        VB56._get_vbe_cached = lambda: _VBE56(_pane56)
+        _before56 = list(_cm56.lines)
+        _ok56 = VB56.VbeBackend().new_line_below(smart=True)
+        if _ok56 is not False or _cm56.lines != _before56:
+            _bad56.append("多行选区")
+        check("56.8d smart 模式这四种情况必须返回 False 且一个字都不写"
+              "（调用方据此把回车原样还给系统）",
+              [_bad56], expect_contain=[[]])
+
+        # Shift+Enter 老口径不许被改动：不传 smart 时仍然"光标在行中间也照样
+        # 新起一行、缩进照抄本行"
+        _ok, _ls, _sel = _nl56(["Sub Foo()", "    x = 1 + 2", "End Sub"], 2, 11,
+                               smart=False)
+        check("56.8e Shift+Enter 老口径不变（smart 默认 False）",
+              [(_ok, _ls[2], _sel)],
+              expect_contain=[(True, "    ", (3, 5, 3, 5))])
+
+        VB56._get_vbe_cached = lambda: None
+        check("56.8f 取不到 VBE -> False（回车原样还给系统）",
+              [VB56.VbeBackend().new_line_below(smart=True)],
+              expect_contain=[False])
+        VB56._get_vbe_cached = _orig56
+
+        # ---- 56.9 缩进一级有多宽：空格 / Tab / 环境变量覆盖 ----
+        check("56.9 _indent_unit_for：默认 4 空格；工程用 Tab 就跟着用 Tab；"
+              "环境变量可覆盖（VBECOMPLETE_INDENT_UNIT=2）",
+              [VB56._indent_unit_for(["Sub Foo()", "    x = 1"]),
+               VB56._indent_unit_for(["Sub Foo()", "\tx = 1"])],
+              expect_contain=["    ", "\t"])
+        _env56 = os.environ.get("VBECOMPLETE_INDENT_UNIT")
+        try:
+            os.environ["VBECOMPLETE_INDENT_UNIT"] = "2"
+            check("56.9b 环境变量 VBECOMPLETE_INDENT_UNIT=2 -> 一级 2 个空格",
+                  [VB56._indent_unit_for([]),
+                   VB56.next_line_indent("    For i = 1", [],
+                                         VB56._indent_unit_for([]))],
+                  expect_contain=["  ", "      "])
+            os.environ["VBECOMPLETE_INDENT_UNIT"] = "tab"
+            check("56.9c 环境变量 =tab -> 一级一个 Tab",
+                  [VB56._indent_unit_for([])], expect_contain=["\t"])
+        finally:
+            if _env56 is None:
+                os.environ.pop("VBECOMPLETE_INDENT_UNIT", None)
+            else:
+                os.environ["VBECOMPLETE_INDENT_UNIT"] = _env56
+
+        # ---- 56.10 ★接线护栏：钩子侧的次序与兜底 ----
+        _src56 = io.open(os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "main.py"), encoding="utf-8").read()
+        _i56_enter = _src56.index("elif _enter_indent_key_ok(vk):")
+        _i56_pair = _src56.index("elif (_pair_ch")
+        _i56_vis = _src56.index("elif completer.is_visible():")
+        _i56_fn = _src56.index("def _enter_indent_here():")
+        _i56_call = _src56.index("backend.new_line_below(smart=True)")
+        check("56.10 ★接线护栏：回车分支在自动配对之前、在「弹窗可见」之前；"
+              "先收窗再写；COM 没落成要 send_vk(VK_RETURN) 兜底；"
+              "判据只在钩子线程读快照（不吃 COM）",
+              [_i56_enter < _i56_pair < _i56_vis,
+               "completer.hide()" in _src56[_i56_fn:_i56_call],
+               _i56_fn < _i56_call,
+               "send_vk(VK_RETURN)" in _src56[_i56_fn:],
+               'os.environ.get("VBECOMPLETE_NO_ENTER_INDENT"' in _src56,
+               "ENTER_CTX_MAX_AGE" in _src56,
+               "ENTER_INDENT" in _src56],
+              expect_contain=[True] * 7)
+
+        _gate56 = _src56[_src56.index("def _enter_indent_key_ok(vk):"):
+                         _src56.index("def win32_filter(msg, data):")]
+        check("56.10b 钩子判据里不许出现任何 COM 调用（钩子线程没有 COM 单元）",
+              [[w for w in ("_get_vbe_cached", "backend.", "VbeBackend")
+                if w in _gate56]],
+              expect_contain=[[]])
+
+        # 快照多带一个光标列；但"内容变化"的判定仍只看前三个元素
+        check("56.10c snapshot 带光标列；变更检测仍只比前三个（光标移动不算"
+              "内容变化，否则点来点去都会弹窗）",
+              ["snap = (sl, cm.Lines(sl, 1), mod, ec)" in
+               io.open(os.path.join(
+                   os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                   "vbe_bridge.py"), encoding="utf-8").read(),
+               "last[:3] != snap[:3]" in _src56,
+               'state["cur_ctx"] = (time.time(), snap[0], snap[1], snap[3])'
+               in _src56],
+              expect_contain=[True, True, True])
+
+        # ---- 56.10d ★输入法护栏：组字中的回车是"上屏键"，绝不能被抢 ----
+        # 判据是"按了可能写字的键、文档却没变"（拼音被输入法吃掉）= 正在组字。
+        # 这是输入法无关的做法，不依赖任何 IME 接口。
+        _TXT56 = [0x41, 0x5A, 0x30, 0x39, 0x20, 0xBA, 0xC0, 0xDB, 0xDE, 0x61]
+        _NOTXT56 = [0x0D, 0x09, 0x1B, 0x25, 0x26, 0x27, 0x28, 0x10, 0x11, 0x12,
+                    0x70, 0x7A, 0xE3, 0xAD, 0xB0]
+        check("56.10d _is_text_key：字母/数字/空格/OEM 标点算「可能写字」；"
+              "回车、Tab、Esc、方向键、修饰键、F 键、多媒体键不算",
+              [[k for k in _TXT56 if not M56._is_text_key(k)],
+               [k for k in _NOTXT56 if M56._is_text_key(k)]],
+              expect_contain=[[], []])
+
+        check("56.10e ★接线护栏：回车判据在组字（pending_keys>0）时一律不接管；"
+              "钩子数「可能写字的键」；文档一变就把计数清零",
+              ["pending_keys" in _gate56,
+               'state["pending_keys"] = min(' in _src56,
+               'state["pending_keys"] = 0' in _src56,
+               _src56.count('state["pending_keys"] = 0') >= 2],
+              expect_contain=[True] * 4)
+
+        # ---- 56.11 出厂默认：回车自动缩进开着 ----
+        check("56.11 ★出厂默认：回车自动缩进开着"
+              "（VBECOMPLETE_NO_ENTER_INDENT 未设）",
+              [M56.ENTER_INDENT], expect_contain=[True])
+    except Exception as _e56:
+        check("第 56 节异常: %s" % _e56, [True], expect_contain=[False])
+
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))
     if FAILURES:

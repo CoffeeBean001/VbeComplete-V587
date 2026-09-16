@@ -313,6 +313,196 @@ def _indent_end_col(indent):
     return len(indent) + 1
 
 
+# ---- 回车后的自动缩进（v79） ----
+#
+# 用户口径两条：
+#   1) "我在一整行写入了注释，然后按回车换行后，光标会默认在行首、不会缩进；
+#      帮我加个能忽略上方注释行（可能有多行注释）、跟上方第一个非注释行对齐的"；
+#   2) "写 for / do / if / with / sub / function / type / enum 这些结构时，
+#      回车能自动缩进"（块的开头行之后，新行要深一级）。
+#
+# 下面几个都是【纯函数】：不碰 COM，因此既能被单测直接钉住，也能在键盘钩子
+# 线程里安全调用 —— 钩子线程不许碰 COM（v56 的教训），而"这一下回车要不要由
+# 我们接管"必须在钩子线程里就定下来（否则要么吞了键才后悔，要么每次都吞）。
+
+# 块结构【开头】：这一行往下的内容都属于新的一级，回车换行后新行要缩进一级。
+#
+# 判定只看两件事，不做语法分析：
+#   * "以 Then 结尾" —— 覆盖 `If x Then` / `ElseIf x Then` / `#If VBA7 Then`；
+#     单选 If（`If x Then y = 1`）以别的词结尾，天然被排除在外；
+#   * "行首关键字在白名单里" —— Sub / Function / Property / Type / Enum /
+#     For / Do / While / With / Else / Case / Select Case。
+# 闭合行（Next / Loop / Wend / End If / End Sub …）刻意不在表里：它们本来就
+# 缩进在正确的层级上，新行跟它们齐平就是对的结果。
+_BLOCK_FIRST_WORDS = ("sub", "function", "property", "type", "enum",
+                      "for", "do", "while", "with", "else", "case")
+# 可以出现在声明关键字前面的修饰词，判断"行首关键字"时要跳过它们
+# （`Private Sub Foo()` / `Public Function Bar()` / `Static Sub`）。
+_MOD_FIRST_WORDS = ("public", "private", "friend", "static")
+# 行尾就是 Then（前面得有分隔，别把 `Something` 认成 Then）
+_RE_TAIL_THEN = re.compile(r"(?:^|\s)then\s*$")
+
+
+def _code_part(line_text):
+    """一行代码里"去掉字符串与注释之后"的部分（行尾空白也去掉）。纯函数。
+
+    用 parser 里那份掩码（字符串字面量 + `'` 注释换成等长空格），因此
+    `If x = "a Then" Then` 里字符串中的 Then 不会被误当成块头，
+    `If x Then  '注释` 尾部的注释也不会破坏"以 Then 结尾"的判定。
+    整行 `Rem ...` 注释按空串处理。
+    """
+    t = line_text or ""
+    if not t.strip():
+        return ""
+    _st = t.lstrip().lower()
+    if _st == "rem" or _st.startswith("rem ") or _st.startswith("rem\t"):
+        return ""
+    try:
+        return vba_parser._mask_strings_and_comments(t).rstrip()
+    except Exception:
+        return t.rstrip()
+
+
+def _is_comment_only(line_text):
+    """整行是不是注释（`'...` 或 `Rem ...`）—— 一行里没有任何代码。纯函数。"""
+    t = (line_text or "").strip()
+    if not t:
+        return False
+    if t.startswith("'"):
+        return True
+    low = t.lower()
+    return low == "rem" or low.startswith("rem ") or low.startswith("rem\t")
+
+
+def opens_block(line_text):
+    """这一行是不是"块结构的开头"——回车换行后新行该缩进一级。纯函数。
+
+    例：`For i = 1 To 10` / `For Each c In rng` / `Do While x` / `If x Then` /
+    `ElseIf y Then` / `Else` / `Case 1` / `Select Case x` / `With rng` /
+    `Sub Foo()` / `Private Function Bar() As Long` / `Property Get X` /
+    `Type Foo` / `Enum Color` / `#If VBA7 Then` / `#Else` -> True；
+    `If x Then y = 1`（单选 If）、`Next i`、`End If`、`Loop`、`Wend`、
+    `x = 1`、`Exit For`、`DoEvents`、`foo(1, 2)`、`Debug.Print x`、
+    以续行符 `_` 结尾的行 -> False。
+    """
+    code = _code_part(line_text)
+    if not code:
+        return False
+    if code.endswith("_"):
+        # 续行符：这条语句还没写完，下一行是它的延续，不是"块里的第一行"。
+        return False
+    low = " ".join(code.lower().split())
+    if _RE_TAIL_THEN.search(low):
+        return True
+    words = low.split(" ")
+    i = 0
+    while i < len(words) and words[i] in _MOD_FIRST_WORDS:
+        i += 1
+    if i >= len(words):
+        return False
+    first = words[i].lstrip("#")
+    if first == "select":
+        return len(words) > i + 1 and words[i + 1] == "case"
+    return first in _BLOCK_FIRST_WORDS
+
+
+def next_line_indent(cur_line, lines_above=(), unit="    "):
+    """回车换行后，新行该有的行首缩进（纯函数）。
+
+    cur_line:    光标所在行的文本
+    lines_above: 它上方各行的文本（越靠近它的越靠后）
+    unit:        一级缩进（默认 4 个空格）
+
+    规则（用户 v79 口径）：
+      * 参考行 = cur_line 自己；但当它是【整行注释】或空行时，往上找第一个
+        既不是整行注释也不是空行的行 —— 这就是"忽略上方注释行（可能有多行），
+        跟上方第一个非注释行对齐"；
+      * 新行缩进 = 参考行的行首空白；参考行若是【块结构开头】，再深一级；
+      * 连参考行都找不到（首行 / 上方全是注释与空行）→ 就用 cur_line 自己的
+        行首空白，也就是 VBE 的原生行为 —— 绝不比原来更差。
+    """
+    ref = None
+    if (cur_line or "").strip() and not _is_comment_only(cur_line):
+        ref = cur_line
+    else:
+        for t in reversed(list(lines_above or ())):
+            if (t or "").strip() and not _is_comment_only(t):
+                ref = t
+                break
+    if ref is None:
+        return _leading_ws(cur_line)
+    base = _leading_ws(ref)
+    return base + unit if opens_block(ref) else base
+
+
+def _indent_unit_for(lines):
+    """一级缩进用什么字符串：默认 4 个空格；这个工程里用 Tab 缩进就跟着用 Tab。
+
+    可用 `set VBECOMPLETE_INDENT_UNIT=2`（2 个空格）或 `=tab` 覆盖。
+    """
+    try:
+        raw = (os.environ.get("VBECOMPLETE_INDENT_UNIT") or "").strip()
+    except Exception:
+        raw = ""
+    if raw:
+        if raw.lower() in ("tab", "\\t", "\t"):
+            return "\t"
+        if raw.isdigit():
+            return " " * max(1, min(16, int(raw)))
+    for t in lines or ():
+        if "\t" in _leading_ws(t):
+            return "\t"
+    return "    "
+
+
+def enter_indent_wanted(line_text, caret_ec):
+    """钩子线程用的纯判据：这一下回车值不值得由我们接管（v79）。
+
+    只有两种情形才接管，其余一律放行给 VBE 原生回车：
+      * 整行注释（要忽略它、跟上方第一个非注释行对齐）；
+      * 块结构开头（新行要深一级）。
+    另有四条保守门槛（拿不准就不抢回车）：
+      * 空行 / 只有空白：交给 VBE（它本来就继承上一行的缩进）；
+      * 行内有 Tab：列语义算不准，不拿"光标是否在行尾"去赌；
+      * 光标不在行尾：那是"拆行"，必须让 VBE 原生处理；
+      * caret_ec 拿不到（0）：不接管。
+    """
+    t = line_text or ""
+    if not t.strip():
+        return False
+    if "\t" in t:
+        return False
+    try:
+        if int(caret_ec or 0) < len(t):
+            return False
+    except Exception:
+        return False
+    return bool(_is_comment_only(t) or opens_block(t))
+
+
+def _unterminated_string(line_text):
+    """这一行的【代码部分】是否"引号没闭合"（VBE 原生回车会替用户补上右引号）。
+
+    注释里出现的引号不算（`x = 1  '他说"你好` 是好好的），字符串里的 `""`
+    按 VBA 的转义写法跳过去。判定为 True 时调用方【不接管】回车 —— 让 VBE
+    自己把右引号补上，那是它原生就有的、很有用的行为。
+    """
+    t = line_text or ""
+    in_str = False
+    i, n = 0, len(t)
+    while i < n:
+        c = t[i]
+        if c == "'" and not in_str:
+            break                       # 注释开始，后面的引号都不是代码
+        if c == '"':
+            if in_str and i + 1 < n and t[i + 1] == '"':
+                i += 2                  # 字符串里的转义引号 ""
+                continue
+            in_str = not in_str
+        i += 1
+    return in_str
+
+
 def _probe_semantics(cm, cp, line_no, line_text):
     """安全地探测列语义：移动光标探测后必定还原，并校验还原结果。
 
@@ -1402,6 +1592,17 @@ def _pair_insertion(line_text, col0, open_ch, close_ch):
             col0 + 1)
 
 
+def _norm_code(s):
+    """把一行代码压成"只看内容"的形式：去掉所有空白 + 统一小写。
+
+    只用于【在 VBE 重排过的行里找回我们的插入点】：VBE 的自动语法检测会补空格
+    （`x=1` -> `x = 1`、`foo(1,2)` -> `foo(1, 2)`）、改大小写（`if a then` ->
+    `If a Then`、`rgb` -> `RGB`）。这些都是同一条代码的另一种写法，压平之后两边
+    的前缀才可比。
+    """
+    return "".join(ch for ch in s if not ch.isspace()).lower()
+
+
 def _locate_inserted(after, written, open_ch, close_ch, col0):
     """在【VBE 改写过的行】里重新找出我们插入的那对符号，返回光标该落在的
     位置（0-based："开符号之后"）；找不到返回 None。
@@ -1413,13 +1614,38 @@ def _locate_inserted(after, written, open_ch, close_ch, col0):
     没落在括号/引号中间」。真机实测（v58）：`    w=4` 里 `w` 之后敲 `"`，得到
     `    w "" = 4`，光标停在 7（第一个引号之前）而不是 8（两引号之间）。
 
-    做法：把「我们写入的版本 written」与「VBE 改写后的版本 after」做序列对齐
-    （difflib），再把 written 中 open_ch 的下标 col0 **映射**到 after 里的对应
-    位置 —— 而不是去猜哪个 diff 块是"我们加的"。因为 VBE 的改写可能把我们的
-    符号卷进 equal 块（比如它只在符号前补了个空格），那时"找 insert 块"就会
-    落空。
+    ★v79 换成本法：**按"压平后的前缀"直接定位**（见 _norm_code）。我们插入的
+    位置左边是用户已经打好的代码（written[:col0]），把它压平（去空白 + 小写）
+    当指纹，再去 after 里找"左边压平后和这枚指纹一模一样"的那一对符号。好处：
+      * VBE 在【任何位置】补空格 / 改大小写都不影响指纹；
+      * 一行里有好几对括号时也不会认错 —— 用户报的正是这种行：
+        `targetSheet.Cells(i, "b").Interior.Color = RGB()`，`Cells(...)` 是
+        第一对、`RGB()` 是第二对，把"第几对"或纯差分对齐一挪就会指到别处。
+    差分对齐（difflib，v58 的老办法）留作兜底：指纹也对不上（VBE 真改了内容）
+    时再退回它。
     """
     want = open_ch + close_ch
+    try:
+        pre = _norm_code(written[:col0])
+    except Exception:
+        pre = None
+    # ---- 首选：压平前缀指纹 ----
+    if pre is not None:
+        try:
+            hits = []
+            k = after.find(want)
+            while k >= 0:
+                if _norm_code(after[:k]) == pre:
+                    hits.append(k)
+                k = after.find(want, k + 1)
+            if hits:
+                # 理论上只该命中一处（指纹含整行前缀）；真撞上重复时取离原位
+                # 最近的 —— VBE 重排只挪几个字符，不会把这一对搬到半行之外。
+                near = min(col0, len(after))
+                return min(hits, key=lambda x: abs(x - near)) + 1
+        except Exception:
+            pass
+    # ---- 兜底一：差分对齐（v58 的老办法） ----
     try:
         sm = difflib.SequenceMatcher(None, written, after, autojunk=False)
         p = None
@@ -1431,18 +1657,26 @@ def _locate_inserted(after, written, open_ch, close_ch, col0):
             elif i1 <= col0 <= i2:      # replace / insert / delete
                 p = j1
                 break
-        if p is None:
-            return None
-        if after[p:p + len(want)] == want:
-            return p + 1
-        if after[p:p + 1] == open_ch:
-            return p + 1
-        # 对齐点附近再找一下（VBE 把一对符号拆开或挪过位置）
-        k = after.find(want, max(0, p - 2), p + len(want) + 3)
-        if k >= 0:
-            return k + 1
+        if p is not None:
+            if after[p:p + len(want)] == want:
+                return p + 1
+            if after[p:p + 1] == open_ch:
+                return p + 1
+            # 对齐点附近再找一下（VBE 把一对符号拆开或挪过位置）
+            k = after.find(want, max(0, p - 2), p + len(want) + 3)
+            if k >= 0:
+                return k + 1
     except Exception:
         pass
+    # ---- 兜底二：连那一对符号都没了（VBE 把它删/改没了），至少把光标放到
+    #      "前缀压平后对齐"的位置上 —— 也就是用户刚打完那段代码之后，绝不乱扔。
+    if pre is not None:
+        try:
+            for k in range(len(after), -1, -1):
+                if _norm_code(after[:k]) == pre:
+                    return k
+        except Exception:
+            pass
     return None
 
 
@@ -1701,15 +1935,22 @@ class VbeBackend:
         _release_vbe_proxy(collect=True)
 
     def snapshot(self):
-        """轻量读取「模块名 + 当前行号 + 行文本」，用于轮询检测内容变化。
+        """轻量读取「模块名 + 当前行号 + 行文本 + 光标列」，用于轮询检测内容变化。
 
         刻意不做列语义探测（那会临时移动光标），因此足够廉价，可高频调用。
-        返回 (line_no, line_text, module_name)；不在代码窗/有选区/取不到时返回 None。
+        返回 (line_no, line_text, module_name, caret_col)；不在代码窗/多行选择/
+        取不到时返回 None。
 
         v64：多带一个【模块名】。主线程靠它区分"用户真在敲字"和"换了个代码
         窗格/模块"—— 后者会让"同一行 + 文本不同"看起来像一次编辑（Ctrl+Tab
         切代码窗、点工程树换模块都会），其实一个字都没敲，不该弹候选。
         模块名取不到就带空串，调用方据此不做否决（绝不让工具整个哑掉）。
+
+        v79：再带一个【光标列 ec】。只给"回车自动缩进"那道判据用（见
+        enter_indent_wanted）—— 它必须在【键盘钩子线程】里就决定要不要接管
+        这一下回车，而钩子线程不许碰 COM，只能读轮询留下的这份快照。
+        ⚠️ 变更检测仍然只比前三个元素（行号/行文本/模块名）：光标的移动不算
+        "内容变化"，否则点来点去都会弹候选窗（见 main._poll_mod_switch 附近）。
         """
         try:
             vbe = _get_vbe_cached()
@@ -1718,7 +1959,7 @@ class VbeBackend:
             cp = vbe.ActiveCodePane
             if cp is None:
                 return None
-            sl, _sc, el, _ec = cp.GetSelection()
+            sl, _sc, el, ec = cp.GetSelection()
             if sl != el:      # 多行选择：不参与补全
                 return None
             cm = cp.CodeModule
@@ -1726,7 +1967,11 @@ class VbeBackend:
                 mod = str(cm.Name or "")
             except Exception:
                 mod = ""
-            snap = (sl, cm.Lines(sl, 1), mod)
+            try:
+                ec = int(ec)
+            except Exception:
+                ec = 0
+            snap = (sl, cm.Lines(sl, 1), mod, ec)
             _com_ok()
             return snap
         except Exception:
@@ -2384,6 +2629,12 @@ class VbeBackend:
                     # 它中间；实在认不出来才退到行尾附近（绝不越界）。
                     off = _locate_inserted(actual, new_line, open_ch, close_ch,
                                            col0)
+                    # v79 起把这一路记进日志：VBE 到底怎么重排的、我们又把它
+                    # 认到了哪儿 —— 以后再出"光标没落在括号里"，一眼就能看出是
+                    # 定位错了还是 VBE 根本没重排（仅 run_debug.bat 下有开销）。
+                    _log("autopair: VBE 重排了整行 -> 重新定位"
+                         " (写入=%r 实际=%r col0=%d 定位=%r)"
+                         % (new_line, actual, col0, off))
                     if off is not None:
                         caret_off = off
                     else:
@@ -2572,18 +2823,54 @@ class VbeBackend:
             _release_vbe_proxy()
 
     # ---- 新起一行（Shift+Enter） ----
-    def new_line_below(self):
-        """在光标所在行的【下方】新起一行：缩进与上一行对齐，光标落在缩进之后。
+    # 往上读多少行来"跳过注释行"（够用即可：注释再长也不会超过这个数）。
+    _INDENT_LOOKBACK = 200
+
+    def _lines_above(self, cm, line_no, limit=None):
+        """取第 line_no 行【上方】的各行文本（最近的在最后）。
+
+        只读、且只在"回车由我们接管"这一条少见路径上调用，行数封顶
+        _INDENT_LOOKBACK —— 免得在几千行的模块里把半个模块都读进来。
+        """
+        n = self._INDENT_LOOKBACK if limit is None else int(limit)
+        start = max(1, int(line_no) - n)
+        cnt = int(line_no) - start
+        if cnt <= 0:
+            return []
+        try:
+            text = cm.Lines(start, cnt)
+        except Exception:
+            return []
+        lines = str(text).split("\n")
+        if lines and lines[-1] == "":
+            lines.pop()                    # Lines() 末尾带回车，会多一个空元素
+        return [l.rstrip("\r") for l in lines]
+
+    def new_line_below(self, smart=False):
+        """在光标所在行的【下方】新起一行，光标落在缩进之后。
 
         等价于"先把光标移到本行末尾，再按回车"，但一步到位 —— 而且当前行
         【不拆分】（光标右侧的代码留在原行）。VBE 只在"光标已在行尾"时按回车
         才继承上一行缩进；光标停在行中间时按回车会把行拆开，所以必须由我们代劳。
 
-        实现上刻意不依赖光标列，也不移动光标：直接读本行文本、取它的行首空白
-        作为新行内容，再把光标放到新行缩进之后。
+        smart=False（Shift+Enter，v78 起的老口径）：不依赖光标列、也不移动
+        光标，直接读本行文本、取它的行首空白作为新行缩进。
+
+        smart=True（回车自动缩进，v79）—— 由用户那两条要求而来：
+          * 本行是【整行注释】：忽略它（以及上方连续的注释行），跟上方第一个
+            非注释行对齐；
+          * 本行是【块结构开头】（For / Do / If…Then / With / Sub / Function /
+            Type / Enum / Select Case …）：新行缩进一级。
+        缩进由纯函数 next_line_indent 算；这一模式下多了四道保险，任一不满足
+        就返回 False 让调用方把回车【原样还给系统】：
+          * 有选区：多行选择按回车是删除/覆盖，语义完全不同；
+          * 光标不在本行行尾：那是"拆行"，必须交给 VBE 原生回车；
+          * 本行是空行（只有空白）：让 VBE 自己继承上一行缩进，别跟用户手动
+            排好的缩进较劲；
+          * 本行引号没闭合：VBE 原生回车会替用户补上右引号，别抢这个活。
 
         成功返回 True；不在代码窗 / 取不到 COM / 出任何异常都返回 False ——
-        调用方据此"不吞键"，让 VBE 按原生行为处理，绝不吞掉用户的换行。
+        调用方据此把这一下按键原样还给系统（回车绝不能吞掉）。
         """
         try:
             vbe = _get_vbe_cached()
@@ -2593,12 +2880,32 @@ class VbeBackend:
             if cp is None:
                 return False
             cm = cp.CodeModule
-            sl, _sc, el, _ec = cp.GetSelection()
-            # 有选区时以选区【末行】为基准（正常情况下 sl == el）。
-            anchor = max(int(sl), int(el))
-            if anchor <= 0:
-                return False
-            indent = _leading_ws(cm.Lines(anchor, 1))
+            sl, sc, el, ec = cp.GetSelection()
+            line_text = None
+            if smart:
+                if int(sl) != int(el) or int(sc) != int(ec):
+                    return False           # 有选区：不接管
+                anchor = int(sl)
+                if anchor <= 0:
+                    return False
+                line_text = cm.Lines(anchor, 1)
+                if not str(line_text).strip():
+                    return False           # 空行：交给 VBE
+                if _unterminated_string(line_text):
+                    return False           # 让 VBE 去补右引号
+                col, _sem, _tw, _w2 = _caret_char_col(
+                    cm, cp, anchor, line_text, ec)
+                if line_text[col - 1:].strip():
+                    return False           # 光标后面还有内容 -> 是"拆行"
+                above = self._lines_above(cm, anchor)
+                indent = next_line_indent(
+                    line_text, above, _indent_unit_for(above + [line_text]))
+            else:
+                # 有选区时以选区【末行】为基准（正常情况下 sl == el）。
+                anchor = max(int(sl), int(el))
+                if anchor <= 0:
+                    return False
+                indent = _leading_ws(cm.Lines(anchor, 1))
             # InsertLines 在 anchor+1 处插入（anchor == CountOfLines 时即追加到末尾），
             # 已有行自动下移 —— 正是"在本行下方新起一行"。
             cm.InsertLines(anchor + 1, indent)
