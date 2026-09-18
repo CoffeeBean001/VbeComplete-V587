@@ -395,6 +395,42 @@ def _is_comment_only(line_text):
     return low == "rem" or low.startswith("rem ") or low.startswith("rem\t")
 
 
+# 行标签：行首是"一个词"（标识符或数字）紧跟冒号 —— `1:` / `Retry:` /
+# `10: x = 1`（标签与语句同一行）。冒号前不是"一个词"就不算：
+# `Case 1:` / `Dim x: x = 1` / `foo(1)` 都不匹配。
+_RE_LABEL = re.compile(r"^\s*(?:[A-Za-z_\u4e00-\u9fff]\w*|\d+)\s*:")
+
+
+def _is_label_line(line_text):
+    """这一行是不是【行标签】（`1:` / `Retry:` / `10: x = 1`）？纯函数。
+
+    ⚠️ 为什么单独认它（v86，用户报的）：标签是用 `GoTo 1` / `On Error GoTo 1`
+    跳过来的落点，VBA 里的**惯例写法就是【顶格】**（`脚本.xlsm` 的 `Sub 功能2()`
+    里就有一个顶格的 `1:`）—— 它的缩进跟所在嵌套层级【毫无关系】。拿缩进推结构
+    的扫描看到它就会以为"已经出了这一层"，把下面真正的 `End If` / `End Sub`
+    当成不存在 ⇒ 回车再补一个收尾（用户报的正是这个）。
+
+    字符串与注释先被 `_code_part` 掩掉，所以 `"a:b"` / `'x:y` 不会误判。
+    """
+    code = _code_part(line_text)
+    if not code:
+        return False
+    return _RE_LABEL.match(code) is not None
+
+
+def _indent_blind(line_text):
+    """这一行的缩进【不代表结构层级】（向下扫描时整行跳过）。纯函数。
+
+    用户的 VBA 里这两类行很常见，而惯例写法与层级无关：
+      * 行标签 `1:` / `Retry:`（见 `_is_label_line`）；
+      * `#` 条件编译指令 `#If` / `#End If` / `#Const`… —— 同样惯例顶格，
+        而且 `#If` 块压根不参与"本块结束没结束"（v82 只跳了 `#Else`/`#ElseIf`）。
+
+    整行注释与块内分支行由调用处一并判 —— 那两条是 v80a/v82 的老口径。
+    """
+    return _is_label_line(line_text) or _directive_word(line_text) is not None
+
+
 def _block_kind(line_text):
     """这一行是【哪一种】块结构的开头？返回规范化的类型名；不是块头返回 None。
 
@@ -545,7 +581,9 @@ def _own_closer_below(lines_below, closer, kind, base):
         同类块头 / 收尾另用 deeper 配平（免得把内层的 `Next` 当成"用户写歪
         的收尾"而少补一条）；
       * 空行 / 整行注释 / 块内分支行（`Else` / `ElseIf…Then` / `Case…`，
-        含 `#Else` / `#ElseIf…Then`）-> 都不是"本块到此为止"的边界，跳过。
+        含 `#Else` / `#ElseIf…Then`）/ 行标签（`1:`）/ `#` 条件编译指令
+        -> 都不是"本块到此为止"的边界，跳过（它们的缩进不含结构信息，
+        见 `_indent_blind`）。
 
     为什么要这一问（v80a，用户报的）：先写了一个 `For`（回车自动补了 `Next`），
     再回到它【上面】补一个新的 `For` 并回车 —— 新 `For` 下面压着的正是原来那个
@@ -559,14 +597,25 @@ def _own_closer_below(lines_below, closer, kind, base):
     "本块已结束了"，收尾就当没看见，回车再补一条。注释同理（注释根本不参与块
     结构）。这两类行现在一律跳过，扫描继续往下走 —— 跳过是**先跳后判缩进**，
     所以分支行放在哪一级都不影响这一问（第 63.8 节钉着）。
+    ★v86（用户报的"过程里写了很多代码之后，回到 `Sub` 那行、或回到 `Then` 那行
+    按回车，又补出一个 `End Sub` / `End If`"）：v80a/v82 那两跳还是不够 ——
+    **行标签**（`1:`，配 `GoTo 1` 用，惯例顶格写）和 **`#` 条件编译指令**
+    （`#If` / `#End If`，同样惯例顶格）的缩进不代表层级，却照样被当成了
+    "同级的别的代码 / 更浅的行"⇒ 下面明明挂着的 `End If` / `End Sub` 全被
+    无视 ⇒ 再补一条。现这两类行也整行跳过（判据见 `_indent_blind`）。
+    `脚本.xlsm / 模块2` 里就是活样本：`Sub 功能2()` 里那个顶格的 `1:` 一次
+    坑掉三处（`Sub` 行、`For` 行、`If … Then` 行各一次）。
+    ⚠️ 这一跳必须在缩进判定【之前】（第 63.8 节钉着）。
     """
     depth = 0        # 同缩进的同类块头（本块下面嵌着的同类块）
     deeper = 0       # 真正嵌套（缩进更深）的同类块头
     for raw in (lines_below or ()):
         if not (raw or "").strip():
             continue
-        if _is_comment_only(raw) or _branch_word(raw) is not None:
+        if _is_comment_only(raw) or _branch_word(raw) is not None \
+                or _indent_blind(raw):
             # ★v82：注释 / 块内分支行都不是"本块到此为止"的边界（详见 docstring）。
+            # ★v86：行标签（`1:`）与 `#` 条件编译指令同理 —— 缩进不含结构信息。
             continue
         w = _indent_width(raw)
         if w < base:
@@ -595,7 +644,8 @@ def _own_closer_below(lines_below, closer, kind, base):
     return False
 
 
-def closer_needed(lines_below, closer, base_indent, kind=None, lines_above=()):
+def closer_needed(lines_below, closer, base_indent, kind=None, lines_above=(),
+                  truncated=False):
     """下面到底要不要补 closer（v79b；嵌套判定 v79c；同级判定 v80a，纯函数）。
 
     lines_below: 光标行【下方】各行的文本（越靠近它的越靠前）
@@ -603,6 +653,8 @@ def closer_needed(lines_below, closer, base_indent, kind=None, lines_above=()):
     base_indent: 块头那行的行首缩进【宽度】
     kind:        块头类型（可选；给了才能判"更浅的同类收尾是不是外层块的"）
     lines_above: 块头行上方各行（可选，同上）
+    truncated:   `lines_below` 是不是【被读的行数上限截断】的（v86，可选）。
+                 真时"窗口内没找到收尾"不能当"没有" —— 见下面的 ★v86。
 
     传了 kind（生产路径上一定会传）时的口径：
       * 下方【没有】本块自己的收尾 -> 补（怎么算"没有"，见 _own_closer_below：
@@ -647,6 +699,14 @@ def closer_needed(lines_below, closer, base_indent, kind=None, lines_above=()):
         # 这一问把"同级代码"分成三类：同类嵌套块头（配平）、本块的收尾、
         # 以及"本块早就结束了"的边界 —— 详见 _own_closer_below。
         if _own_closer_below(lines_below, closer, kind, base):
+            return False
+        if truncated:
+            # ★v86：行数是【读满上限被截断】的 ⇒ 本块的收尾可能就在窗口之外，
+            # "在窗口里没找到"不等于"下面没有"。这一档按"别再补"处理：宁可少补
+            # 一条（用户自己敲一下就好），也不要凭"看不到"变出【双份收尾】把
+            # 代码写坏 —— `End Sub` / `End If` 双份是直接编译不过的
+            # （用户报的"过程里写了很多代码，回到 Sub 行回车又补一个 End Sub"
+            #  就有一半是这么来的：窗口只有 200 行，收尾在 200 行之外）。
             return False
         if first is not None:
             w = _indent_width(first)
@@ -3321,6 +3381,14 @@ class VbeBackend:
     # ---- 新起一行（Shift+Enter） ----
     # 往上读多少行来"跳过注释行"（够用即可：注释再长也不会超过这个数）。
     _INDENT_LOOKBACK = 200
+    # ★v86：补收尾前"往下找本块自己的收尾"的扫描行数上限。刻意和
+    # _INDENT_LOOKBACK 分开：上面那个管"往上找缩进基准"（只看最近几行就够），
+    # 这里要真的看到本块的收尾 —— 原先两者共用 200，于是**长过程 / 长 If 的
+    # 收尾会落到窗口之外** ⇒ 判成"下面没有收尾" ⇒ 回车再补一条（双份收尾）。
+    # 定得越大越准，代价只是每次"块头行尾回车"多读几行（只在这条少见路径上，
+    # 读满也就几十 KB）；真读满还判不出来时由 closer_needed 的 truncated
+    # 那一档按"不补"兜底。
+    _CLOSER_SCAN_LINES = 600
 
     def _lines_above(self, cm, line_no, limit=None):
         """取第 line_no 行【上方】的各行文本（最近的在最后）。
@@ -3346,7 +3414,9 @@ class VbeBackend:
         """取第 line_no 行【下方】的各行文本（最近的在最前）。
 
         v79b 补收尾时用：得知道下面是不是已经挂着 `End If` / `Next` 了，
-        免得替用户补出一个重复的收尾。同样只读、行数封顶 _INDENT_LOOKBACK。
+        免得替用户补出一个重复的收尾。同样只读；行数默认封顶 _INDENT_LOOKBACK，
+        调用方（补收尾那条路）会显式传 `_CLOSER_SCAN_LINES` —— 见那里的说明，
+        以及 closer_needed 的 `truncated` 参数。
         """
         n = self._INDENT_LOOKBACK if limit is None else int(limit)
         try:
@@ -3458,10 +3528,22 @@ class VbeBackend:
                     _close = block_closer(line_text)
                     if _close:
                         base = _leading_ws(line_text)
-                        if closer_needed(self._lines_below(cm, anchor), _close,
+                        # ★v86：往下要找的是"本块自己的收尾"，所以要按
+                        # _CLOSER_SCAN_LINES 读（原先跟着 _INDENT_LOOKBACK 用
+                        # 200，长过程的收尾会落到窗口外）。真读满被截断时把
+                        # truncated 交给判据 —— 那时"窗口内没找到"不能当
+                        # "下面没有"，宁可少补一条也不要变出双份收尾。
+                        try:
+                            _rest = max(0, int(cm.CountOfLines) - anchor)
+                        except Exception:
+                            _rest = 0
+                        _cap = min(_rest, self._CLOSER_SCAN_LINES)
+                        if closer_needed(self._lines_below(cm, anchor, _cap),
+                                         _close,
                                          _indent_width(base),
                                          kind=_block_kind(line_text),
-                                         lines_above=above):
+                                         lines_above=above,
+                                         truncated=_rest > _cap):
                             closer_text = base + _close
             else:
                 # 有选区时以选区【末行】为基准（正常情况下 sl == el）。

@@ -9952,6 +9952,219 @@ def main():
     except Exception as _e64:
         check("第 64 节异常: %s" % _e64, [True], expect_contain=[False])
 
+    # ------------------------------------------------------------------
+    # 65. v86：补收尾的"边界"再修两类 ——【行标签】（`1:`，配 `GoTo 1` 用，
+    #     惯例顶格写）与【`#` 条件编译指令】（`#If` / `#End If`，同样惯例顶格）
+    #     的缩进【不含结构信息】，不能当"本块到此为止"的边界；
+    #     另外往下扫描的行数上限要够大，且读满被截断时按"不补"兜底。
+    #
+    #     用户报：`Sub` 里写了很多代码后，把光标移回 `Sub` 那行回车，又补出一个
+    #     `End Sub`；`If … Then` 那行回车同理又多一个 `End If`。
+    #     实测 `脚本.xlsm / 模块2` 里那个【顶格的 `1:`】一次坑掉三处
+    #     （`Sub 功能2()` 那行 / 外层 `For` 那行 / `If … Then` 那行）。
+    # ------------------------------------------------------------------
+    print("\n=== 65. 回车补收尾：行标签 / 条件编译指令不算边界（v86）===")
+    try:
+        import vbe_bridge as VB65
+
+        _ocb65 = VB65._own_closer_below
+        _cn65 = VB65.closer_needed
+        _lab65 = VB65._is_label_line
+        _blind65 = VB65._indent_blind
+
+        # ---- 65.1 纯函数：认行标签 ----
+        check("65.1 `_is_label_line`：`1:` / `Retry:` / `10: x = 1`（标签与语句"
+              "同一行）/ 带缩进的 `5:` / 中文名 `标签1:` 都算标签；"
+              "`Case 1:` / `Dim x: x = 1` / `foo(1)` / 过程头 / 普通赋值 / "
+              "字符串里的 `\"a:b\"` / 注释里的 `'x:y` 都不算",
+              [[_lab65("1:"), _lab65("Retry:"), _lab65("10: x = 1"),
+                _lab65("    5:"), _lab65("标签1:"),
+                _lab65("Case 1:"), _lab65("Dim x: x = 1"), _lab65("foo(1)"),
+                _lab65("Sub Test()"), _lab65("x = 1"),
+                _lab65('"a:b"'), _lab65("'x:y")]],
+              expect_contain=[[True, True, True, True, True,
+                               False, False, False, False, False,
+                               False, False]])
+
+        # ---- 65.2 纯函数：_indent_blind ----
+        check("65.2 `_indent_blind`：行标签与 `#` 条件编译指令"
+              "（`#If` / `#End If` / `#Const` / `#Else` / `#ElseIf`）的缩进都"
+              "不含结构信息；普通代码 / 块头 / 收尾行 / 分支行一律不算",
+              [[_blind65("1:"), _blind65("#If VBA7 Then"), _blind65("  #End If"),
+                _blind65("#Const A = 1"), _blind65("#Else"),
+                _blind65("#ElseIf V Then"),
+                _blind65("    x = 1"), _blind65("    For i = 1 To 3"),
+                _blind65("    End If"), _blind65("    Else")]],
+              expect_contain=[[True, True, True, True, True, True,
+                               False, False, False, False]])
+
+        # ---- 65.3 _own_closer_below：跳过标签 / 指令（先跳后判缩进）----
+        check("65.3 `_own_closer_below`（v86）：顶格的 `1:` 不是边界 —— "
+              "`If` 体里的 `1:` 之后仍有 `End If` -> True；`Sub` 体里的顶格 "
+              "`1:` 之后仍有 `End Sub` -> True；`#If` / `#End If`（0 列）同理；"
+              "对照组（同级普通代码 -> 本块已结束 -> False）不退化",
+              [[_ocb65(["            If x Then GoTo 1", "1:",
+                        "        End If"], "End If", "if", 8),
+                _ocb65(["    x = 1", "1:", "End Sub"], "End Sub", "sub", 0),
+                _ocb65(["#If VBA7 Then", "    x = 1", "#End If", "End Sub"],
+                       "End Sub", "sub", 0),
+                _ocb65(["    x = 1"], "End If", "if", 4)]],
+              expect_contain=[[True, True, True, False]])
+
+        # ---- 65.4 closer_needed（kind 给定）同口径 ----
+        check("65.4 `closer_needed`（kind 给定，v86）：下面压着顶格 `1:` / "
+              "`#If` / `#End If` 时，本块收尾仍然在下面 -> 【不补】；"
+              "对照组（同级普通代码 -> 本块已结束）仍然补",
+              [[_cn65(["            If x Then GoTo 1", "1:", "        End If"],
+                      "End If", 8, kind="if",
+                      lines_above=["Sub Test()",
+                                   "    For i = 1 To 3",
+                                   "        If a Then"]),
+                _cn65(["    x = 1", "1:", "End Sub"], "End Sub", 0, kind="sub",
+                      lines_above=[]),
+                _cn65(["#If VBA7 Then", "    x = 1", "#End If", "End Sub"],
+                      "End Sub", 0, kind="sub", lines_above=[]),
+                _cn65(["    x = 1"], "End If", 4, kind="if",
+                      lines_above=["Sub Test()", "    If a Then"])]],
+              expect_contain=[[False, False, False, True]])
+
+        # ---- 65.5 ★截断兜底 ----
+        check("65.5 ★v86 截断兜底：下方行数是【读满上限被截断】的 -> "
+              "『窗口里没找到收尾』不能当『下面没有收尾』-> 一律【不补】"
+              "（宁可少补一条，也不要变出双份收尾把代码写坏）；"
+              "truncated=False（默认）时维持 v80a 老口径（补）",
+              [[_cn65(["    x = 1", "    y = 2"], "End Sub", 0, kind="sub",
+                      lines_above=[], truncated=True),
+                _cn65(["    x = 1", "    y = 2"], "End Sub", 0, kind="sub",
+                      lines_above=[]),
+                _cn65(["    x = 1", "    y = 2"], "End Sub", 0, kind="sub",
+                      lines_above=[], truncated=False)]],
+              expect_contain=[[False, True, True]])
+
+        # ---- 集成骨架 ----
+        class _CM65(object):
+            def __init__(self, lines):
+                self.lines = list(lines)
+                self.Name = "模块2"
+
+            @property
+            def CountOfLines(self):
+                return len(self.lines)
+
+            def Lines(self, start, count):
+                s0 = max(0, int(start) - 1)
+                return "".join(l + "\n"
+                               for l in self.lines[s0:s0 + int(count)])
+
+            def InsertLines(self, start, text):
+                i = min(max(0, int(start) - 1), len(self.lines))
+                for k, ln in enumerate(str(text).split("\n")):
+                    self.lines.insert(i + k, ln)
+
+        class _Pane65(object):
+            def __init__(self, cm, sel):
+                self.CodeModule = cm
+                self.sel = sel
+
+            def GetSelection(self):
+                return self.sel
+
+            def SetSelection(self, sl, sc, el, ec):
+                self.sel = (sl, sc, el, ec)
+
+        class _VBE65(object):
+            def __init__(self, pane):
+                self.ActiveCodePane = pane
+
+        _orig65 = VB65._get_vbe_cached
+
+        # 用户现场的真实形态（`脚本.xlsm / 模块2` 摘录，15 行）：第 11 行那个
+        # 【顶格的 `1:`】配上面的 `GoTo 1` 用。
+        # ⚠️ 真实模块里的过程名叫 `功能2`、字符串是 `"姓名"`（全角）；这里换成
+        # ASCII 名是【测试脚手架】的需要 —— GetSelection 给的是**显示列**，
+        # 全角字符占两格，mock 里按字符列摆光标会偏（判据本身与此无关）。
+        _REAL65 = [
+            "Sub Func2()",
+            "    Set actSheet = ThisWorkbook.ActiveSheet",
+            "    For i = 3 To targetSheet.Cells(targetSheet.Cells.Rows.Count, "
+            "\"e\").End(xlUp).Row",
+            "        ID = CStr(targetSheet.Cells(i, \"e\"))",
+            "    Next",
+            "",
+            "    For i = 1 To dataSheet1.Cells(dataSheet1.Cells.Rows.Count, "
+            "\"c\").End(xlUp).Row",
+            "        If dataSheet1.Cells(i, \"c\") = \"name\" Then",
+            "            If dataSheet1.Cells(i, \"d\") = \"\" Then GoTo 1",
+            "            ID = CStr(dataSheet3.Cells(idRow, \"b\"))",
+            "1:",
+            "        End If",
+            "    Next",
+            "    MsgBox \"OK\", vbInformation",
+            "End Sub",
+        ]
+
+        def _nl65(line_no):
+            cm65 = _CM65(_REAL65)
+            cur = cm65.lines[line_no - 1]
+            pane65 = _Pane65(cm65, (line_no, len(cur) + 1, line_no,
+                                    len(cur) + 1))
+            VB65._get_vbe_cached = lambda: _VBE65(pane65)
+            ok65 = VB65.VbeBackend().new_line_below(smart=True, auto_close=True)
+            return (ok65, cm65.lines, pane65.sel)
+
+        # ---- 65.6 ★集成：用户现场那三处，一个收尾都不许补 ----
+        check("65.6 ★集成（`脚本.xlsm/模块2` 那个顶格 `1:` 的真实形态）："
+              "①`Sub …()` 那行回车 -> 不补 `End Sub`；②外层 `For` 那行回车 "
+              "-> 不补 `Next`；③`If … Then` 那行回车 -> 不补 `End If` —— "
+              "三处都只多一行缩进好的空行，原有 15 行代码一个字符没动",
+              [_nl65(1), _nl65(3), _nl65(8)],
+              expect_contain=[(True, _REAL65[:1] + ["    "] + _REAL65[1:],
+                               (2, 5, 2, 5)),
+                              (True, _REAL65[:3] + ["        "] + _REAL65[3:],
+                               (4, 9, 4, 9)),
+                              (True, _REAL65[:8] + ["            "]
+                               + _REAL65[8:], (9, 13, 9, 13))])
+
+        VB65._get_vbe_cached = _orig65
+
+        # ---- 65.7 ★接线护栏 ----
+        _root65 = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        _vbsrc65 = io.open(os.path.join(_root65, "vbe_bridge.py"),
+                           encoding="utf-8").read()
+        _fn65 = _vbsrc65.split("def _own_closer_below")[1].split(
+            "def closer_needed")[0]
+        check("65.7 ★接线护栏：`_own_closer_below` 里把【行标签 / `#` 指令】也跳过"
+              "（`_indent_blind`），而且这一跳同样必须在缩进判定【之前】"
+              "（放后面就等于没跳）；后端补收尾时按 `_CLOSER_SCAN_LINES` 读、"
+              "并把 `truncated` 交给判据；这个扫描窗口必须比"
+              "『往上找缩进基准』那个 `_INDENT_LOOKBACK` 大",
+              [[("_indent_blind(raw)" in _fn65),
+                ("w = _indent_width(raw)" in _fn65),
+                (_fn65.index("_indent_blind(raw)")
+                 < _fn65.index("w = _indent_width(raw)")),
+                ("self._CLOSER_SCAN_LINES" in _vbsrc65),
+                ("truncated=_rest > _cap" in _vbsrc65),
+                ("if truncated:" in _vbsrc65),
+                (VB65.VbeBackend._CLOSER_SCAN_LINES
+                 > VB65.VbeBackend._INDENT_LOOKBACK)]],
+              expect_contain=[[True] * 7])
+
+        # ---- 65.8 回归护栏：v80a / v82 口径不退化 ----
+        check("65.8 回归护栏：v80a 主场景（同级压着【同类嵌套块】-> 下面没有"
+              "本块收尾 -> 仍要补）与 v82 口径（同级 `Else` / 注释跳过 -> "
+              "不补）都不退化",
+              [[_cn65(["    For i = 1 To 10", "        x = 1", "    Next i",
+                       "End Sub"], "Next", 4, kind="for",
+                      lines_above=["Sub Test()"]),
+                _cn65(["    Else", "    End If"], "End If", 4, kind="if",
+                      lines_above=["Sub Test()", "    If x = 1 Then"]),
+                _cn65(["    ' 注释", "    End If"], "End If", 4, kind="if",
+                      lines_above=["Sub Test()", "    If x = 1 Then"])]],
+              expect_contain=[[True, False, False]])
+
+    except Exception as _e65:
+        check("第 65 节异常: %s" % _e65, [True], expect_contain=[False])
+
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))
     if FAILURES:
