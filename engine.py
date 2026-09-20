@@ -764,6 +764,10 @@ class Completer:
         self.yield_pending = None
         self.yield_given_up = None
         self.yield_given_up_at = 0.0
+        # v87：本次触发的上下文（trigger 一取到就挂上）。给 _module_level_names
+        # 这类"需要知道当前模块/过程才能判可见性"的判据用 —— 它们必须与候选池
+        # 的可见性口径一致，而 self.ctx 要到 trigger 末尾才赋值。
+        self._ctx_now = None
 
     def _clamp_top(self):
         """把窗口起点夹到合法区间（不能越过列表末尾）。"""
@@ -969,21 +973,37 @@ class Completer:
         return low in declared
 
     def _module_level_names(self):
-        """标识符池里在【模块级】存在的名字（小写集合）。
+        """当前位置**可见**的模块级名字（小写集合）。
 
-        v53 用：判断"光标处的这个词是不是全模块可见的真名字"。判据是标识符池里
-        有一条该名字的记录、且其过程名为空（模块声明区的 Dim/Const/Sub/Function…
-        或组件名）。过程内的局部变量、形参（proc 非空）都不算。
+        v53 用：判断"光标处的这个词是不是真名字"。判据是标识符池里有一条该名字的
+        记录、其过程名为空（模块声明区的 Dim/Const/Sub/Function… 或组件名），
+        **并且它在当前位置真的可见**。
+
+        ★v87：加了最后那半句 —— 可见性必须与候选池同口径（`filter_identifiers_
+        by_scope`）。原先只按"过程名为空"筛，于是**别的模块的私有成员也算了进
+        来**：类模块 / 窗体 / 文档模块的模块级成员默认就是 Private（跨模块只能
+        经实例或限定名访问，见 parser._is_private 与 vbe_bridge._is_std_module），
+        拿它们当"模块级真名字"会把光标处那个词原样放行 —— 正是用户报的
+        "在类模块里第一次写出来的变量名会提示自己"。
 
         为什么不问后端要一个专门接口：`get_identifiers()` 是【带缓存】的，
         同一次 trigger 早已取过（作用域过滤用的就是它），这里只是换个角度筛一遍，
-        一次 COM 都不会多打。
+        一次 COM 都不会多打。可见性也直接复用同一个函数，不再写第二份规则。
+
+        ctx 从 `self._ctx_now` 取（trigger 一开始就挂上）—— 保持本方法无参，
+        旧测试对它的替身（`lambda _self: set(...)`）不用跟着改。
         """
         try:
             recs = _normalize_scoped(self.backend.get_identifiers())
         except Exception:
             return set()
-        return set(str(n).lower() for n, _m, p, _pv in recs if not p)
+        ctx = getattr(self, "_ctx_now", None) or self.ctx or {}
+        module_level = set(str(n).lower() for n, _m, p, _pv in recs if not p)
+        if not module_level:
+            return set()
+        visible = set(n.lower() for n in filter_identifiers_by_scope(
+            recs, ctx.get("proc_name"), ctx.get("module_name")))
+        return module_level & visible
 
     def _declared_names(self):
         """工程里【真实声明】过的名字（小写集合），供 trigger 区分"真名字"与"幻影"。
@@ -1204,6 +1224,9 @@ class Completer:
         if ctx is None:
             self.hide()
             return
+        # v87：本次触发的 ctx 立刻挂上 —— 下面几处判据（如 _module_level_names
+        # 要看"当前模块里哪些模块级名字可见"）在 self.ctx 赋值之前就要用。
+        self._ctx_now = ctx
         if ctx.get("in_string") or ctx.get("in_comment"):
             self.hide()
             return

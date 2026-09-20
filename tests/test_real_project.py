@@ -10165,6 +10165,233 @@ def main():
     except Exception as _e65:
         check("第 65 节异常: %s" % _e65, [True], expect_contain=[False])
 
+    # ---- 66. v87：别的模块里【不可见】的声明不许当"真名字"证据 ----
+    #
+    # 用户报（第八条反馈）："对于未定义、第一次写出来的变量名，会提示自己；回退删除
+    # 已写的变量名时，也会提示自己。这个 bug 以前在模块里会存在、已经修好了，但是
+    # 现在在【类模块】里也会出。另外帮我查一下 sheet / thisworkbook / 窗体 里会不会
+    # 出现，都帮我修一下。"
+    #
+    # 真机定位（只读扫用户正在编辑的工程）：光标停在 `类2` 第 3 行 `Public 订单金额`
+    # 行尾，而 `订单金额` 在另一个类模块 `SummaryClass` 里也声明了一份 ——
+    #   池子侧：类模块成员是 Private（跨模块不能裸名引用），
+    #           filter_identifiers_by_scope 正确隐藏；
+    #   证据侧：declared_elsewhere 只看"名字在别的模块出现过没有"，**不看可见性**
+    #           -> 返回 True -> 回声防护放行 -> 弹窗把正在敲的字原样提示回来。
+    # 同一个漏洞对【窗体 / 文档模块（Sheet / ThisWorkbook）】一样成立（它们的模块级
+    # 成员同样默认 Private），所以这一节把这些组件类型一次性钉住。
+    print("\n=== 66. v87 类/窗体/文档模块的成员不再当跨模块证据（提示自己）===")
+    try:
+        import vbe_bridge as VB66
+        import parser as P66
+        import engine as E66
+
+        # ---- 66.1 记录面：同一个 `Public X`，跨模块可见性随模块类型不同 ----
+        def _priv66(code, std):
+            r = list(P66.extract_records(code, module="M", is_std_module=std))
+            return sorted((str(n), pv) for n, _m, _p, pv in r if not _p)
+
+        check("66.1 `Public X` 的跨模块可见性：标准模块 priv=False（工程可见）；"
+              "类 / 窗体 / 文档模块 priv=True（只能经实例或限定名访问）",
+              [_priv66("Public SharedName", True),
+               _priv66("Public SharedName", False)],
+              expect_contain=[[("SharedName", False)],
+                              [("SharedName", True)]])
+
+        # ---- 集成骨架：一个能喂饱收集流程的假 VBE（多组件、真模块名）----
+        class _CM66(object):
+            def __init__(self, comp, text):
+                self._comp = comp
+                self.text = text
+
+            @property
+            def Name(self):
+                return self._comp.Name
+
+            @property
+            def Parent(self):
+                return self._comp
+
+            @property
+            def CountOfLines(self):
+                return self.text.count("\n") + 1
+
+            def Lines(self, start, count):
+                return "\r\n".join(
+                    self.text.split("\n")[start - 1:start - 1 + count])
+
+        class _Comp66(object):
+            def __init__(self, name, ctype, text):
+                self.Name = name
+                self.Type = ctype
+                self.CodeModule = _CM66(self, text)
+
+        class _Proj66(object):
+            def __init__(self, comps):
+                self.Name = "VBAProject"
+                self.VBComponents = list(comps)
+
+        class _Pane66(object):
+            def __init__(self, cm, sel):
+                self.CodeModule = cm
+                self.sel = sel
+
+            def GetSelection(self):
+                return self.sel
+
+            def SetSelection(self, sl, sc, el, ec):
+                self.sel = (sl, sc, el, ec)
+
+        class _VBE66(object):
+            def __init__(self, comps, pane):
+                self.ActiveVBProject = _Proj66(comps)
+                self.ActiveCodePane = pane
+
+        class _UI66(object):
+            def __init__(self):
+                self.shown = False
+
+            def show(self, *a, **k):
+                self.shown = True
+
+            def hide(self, *a, **k):
+                self.shown = False
+
+            def update_selection(self, *a, **k):
+                pass
+
+            def contains_point(self, *a, **k):
+                return False
+
+        _orig66 = VB66._get_vbe_cached
+
+        def _mk66(comps, caret_name, sel):
+            """comps: [(模块名, 组件类型, 代码)]；返回 (backend, pane, comps)。"""
+            objs = {}
+            lst = []
+            for (n, t, s) in comps:
+                c = _Comp66(n, t, s)
+                objs[n] = c
+                lst.append(c)
+            pane = _Pane66(objs[caret_name].CodeModule, sel)
+            VB66._get_vbe_cached = lambda: _VBE66(lst, pane)
+            return VB66.VbeBackend(), pane, objs
+
+        def _go66(backend):
+            ui = _UI66()
+            c = E66.Completer(backend, ui)
+            c.trigger()
+            return ui.shown, c.matches
+
+        try:
+            # 组件类型：1=标准模块、2=类模块、3=窗体、100=文档模块（Sheet/ThisWorkbook）
+            # ⚠️ 代码行一律 ASCII —— 假 GetSelection 给的是显示列，全角字符会偏
+            #    （与第 65 节同一个脚手架坑）。
+            _P66 = [
+                ("模块A", 1,
+                 "Public GName\nSub Work()\n    Dim onlyLocal As Long\nEnd Sub"),
+                ("类C", 2, "Public SharedItem"),
+                ("类D", 2, "Public SharedItem"),
+                ("窗体F", 3, "Dim SharedItem As Long"),
+                ("Sheet1", 100, "Public SharedItem As Long"),
+                ("ThisWorkbook", 100, "Dim SharedItem As Long"),
+            ]
+            _bk66, _pane66, _objs66 = _mk66(_P66, "类C", (1, 18, 1, 18))
+            _ids66 = _bk66.get_identifiers()
+
+            # ---- 66.2 核心：同名成员散落在类/窗体/文档模块里，谁都不算证据 ----
+            check("66.2 ★真实后端：`SharedItem` 在 类C / 类D / 窗体F / Sheet1 / "
+                  "ThisWorkbook 里各声明一份 -> 从 类C 问【不算】跨模块证据"
+                  "（修前 True，正是用户那条「提示自己」）",
+                  [_bk66.declared_elsewhere("SharedItem", "类C")],
+                  expect_contain=[False])
+
+            # ---- 66.3 对照面：真的跨模块可见的，一路都不许退化 ----
+            check("66.3 对照：标准模块的 `Public GName` 仍是跨模块证据（v37 语义"
+                  "不许退化）；别的过程的局部变量 `onlyLocal` 不算；组件名 `模块A` 算",
+                  [_bk66.declared_elsewhere("GName", "类C"),
+                   _bk66.declared_elsewhere("onlyLocal", "类C"),
+                   _bk66.declared_elsewhere("模块A", "类C")],
+                  expect_contain=[True, False, True])
+
+            # ---- 66.4 ★端到端（用户场景①）：第一次写出来的成员名不提示自己 ----
+            _bk66b, _pane66b, _objs66b = _mk66(_P66, "类C", (1, 18, 1, 18))
+            check("66.4 ★端到端（用户场景①：第一次写出来的名字）：`Public "
+                  "SharedItem` 行尾触发 -> 弹窗不出现，一条候选都没有"
+                  "（修前会把 SharedItem 原样提示回来）",
+                  [_go66(_bk66b)],
+                  expect_contain=[(False, [])])
+
+            # ---- 66.5 ★端到端（用户场景②）：回退删字时不留旧版本的幽灵 ----
+            # 顺序很关键：先按"名字还完整"那一刻解析出池子（模拟 0.4s 缓存），
+            # 再让用户按退格删掉一个字符 —— 池子里那份 `SharedItem` 正是
+            # 用户说的"回退删除已写的变量名时提示自己"的来源。
+            _bk66c, _pane66c, _objs66c = _mk66(_P66, "类C", (1, 16, 1, 16))
+            _bk66c.get_identifiers()          # 池子快照（此刻文本还是完整的名字）
+            _objs66c["类C"].CodeModule.text = "Public SharedIt"
+            _pane66c.sel = (1, 16, 1, 16)     # 光标退到删剩下的位置
+            check("66.5 ★端到端（用户场景②：回退删字）：池子里还留着 "
+                  "`SharedItem`（缓存）-> 退格成 `SharedIt` 之后不许再把 "
+                  "`SharedItem` 提示出来",
+                  [_go66(_bk66c)],
+                  expect_contain=[(False, [])])
+
+            # ---- 66.6 对照：标准模块里真存在的公共名，回退/打全照常提示 ----
+            _P66b = [("模块A", 1, "Public GName"),
+                     ("类C", 2, "Public GNa")]
+            _bk66d, _pane66d, _objs66d = _mk66(_P66b, "类C", (1, 12, 1, 12))
+            _r66d = _go66(_bk66d)
+            check("66.6 对照：`Public GNa` 行尾触发 -> 别的标准模块里的公共名 "
+                  "`GName` 照常提示（跨模块 Public 是货真价实的存在）",
+                  [_r66d], expect_contain=[(True, ["GName"])])
+
+            # ---- 66.7 两条路径同一口径：候选池隐藏的，证据侧也必须否认 ----
+            _visA66 = set(n.lower() for n in E66.filter_identifiers_by_scope(
+                _ids66, None, "模块A"))
+            check("66.7 两条路径同口径：从 模块A 看 `SharedItem` —— 候选池里没有它"
+                  "（别的模块的私有成员），证据侧也否认它（都要 False）",
+                  [("shareditem" in _visA66,
+                    _bk66.declared_elsewhere("SharedItem", "模块A"))],
+                  expect_contain=[(False, False)])
+
+            # ---- 66.8 `_module_level_names` 也按可见性收窄（同类漏洞的另一处）----
+            class _B66(_FakeBackend):
+                def get_identifiers(self):
+                    return [("MyName", "类C", None, True),      # 本模块模块级 -> 可见
+                            ("PubName", "模块A", None, False),  # 别处 Public -> 可见
+                            ("OtherPriv", "类X", None, True),   # 别处 Private -> 不可见
+                            ("aLoc", "类C", "P", False)]        # 过程内 -> 不算模块级
+
+            _c66e = E66.Completer(_B66({"proc_name": None,
+                                        "module_name": "类C"}), _UI66())
+            _c66e._ctx_now = {"proc_name": None, "module_name": "类C"}
+            check("66.8 `_module_level_names` 按可见性收窄：本模块模块级（MyName）与"
+                  "别处 Public（PubName）算；别模块的私有成员（OtherPriv）与过程内"
+                  "局部（aLoc）不算",
+                  [sorted(_c66e._module_level_names())],
+                  expect_contain=[["myname", "pubname"]])
+
+            # ---- 66.9 ★接线护栏：两处判据各改对了地方（防日后被"顺手"改回去）----
+            _root66 = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            _vbsrc66 = io.open(os.path.join(_root66, "vbe_bridge.py"),
+                               encoding="utf-8").read()
+            _fn66 = _vbsrc66.split("def _collect_identifiers")[1].split(
+                "def get_type_names")[0]
+            _esrc66 = io.open(os.path.join(_root66, "engine.py"),
+                              encoding="utf-8").read()
+            _fn66e = _esrc66.split("def _module_level_names")[1].split(
+                "def _declared_names")[0]
+            check("66.9 ★接线护栏：`_decl_by_mod` 那段确实按 priv / proc 两道跳过"
+                  "（`_r_priv or _r_proc`）；`_module_level_names` 确实走了同一个"
+                  "可见性函数（`filter_identifiers_by_scope`），而不是自己写第二份规则",
+                  [("_r_priv or _r_proc" in _fn66),
+                   ("filter_identifiers_by_scope" in _fn66e)],
+                  expect_contain=[True, True])
+        finally:
+            VB66._get_vbe_cached = _orig66
+    except Exception as _e66:
+        check("第 66 节异常: %s" % _e66, [True], expect_contain=[False])
+
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))
     if FAILURES:

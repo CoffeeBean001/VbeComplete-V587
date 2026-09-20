@@ -2840,11 +2840,30 @@ class VbeBackend:
                     declared_names.update(
                         str(r[0]).lower() for r in recs
                         if str(r[0]).lower() not in caret_decl)
+                    # ★v87：`_decl_by_mod` 只收【别的模块能裸名引用】的声明 ——
+                    # 它的唯一消费者是 declared_elsewhere（引擎问"这个名字在
+                    # 【别的模块】声明过吗"，用来证明一个回声候选是真名字）。
+                    # 口径必须与候选池的可见性（engine.filter_identifiers_by_scope）
+                    # 一致，否则会把不可见的声明当成"真名字"的证据：
+                    #   * priv=True —— 模块私有。**类模块 / 窗体 / 文档模块的模块级
+                    #     成员默认就是 Private**（跨模块只能经实例或限定名访问，见
+                    #     parser._is_private、_is_std_module），别的模块压根写不成裸名；
+                    #   * proc 非空 —— 别的过程的局部变量 / 形参，同理。
+                    # 不排除会怎样（用户报的"在类模块里提示自己"）：同一个成员名
+                    # 在两个类模块里各声明一次（比如 类2 的 `Public 订单金额` 与
+                    # SummaryClass 的 `订单金额`），在 类2 那一行打 / 退格这个词时，
+                    # declared_elsewhere 因【另一个类模块的那份私有声明】返回 True
+                    # ⇒ 回声防护放行 ⇒ 弹窗把用户正在敲的字原样提示回来。
                     for _r in recs:
                         _n = str(_r[0]).lower()
-                        if _n not in caret_decl:
-                            _decl_by_mod.setdefault(
-                                _n, set()).add(str(mod_name).lower())
+                        if _n in caret_decl:
+                            continue
+                        _r_priv = bool(_r[3]) if len(_r) > 3 else False
+                        _r_proc = _r[2] if len(_r) > 2 else None
+                        if _r_priv or _r_proc:
+                            continue
+                        _decl_by_mod.setdefault(
+                            _n, set()).add(str(mod_name).lower())
                     # 隐式变量（没写 Option Explicit 时"用到即存在"）：
                     # 只补 extract_records 没声明过的名字，避免重复与作用域冲突。
                     #
