@@ -3462,8 +3462,15 @@ class VbeBackend:
         【不拆分】（光标右侧的代码留在原行）。VBE 只在"光标已在行尾"时按回车
         才继承上一行缩进；光标停在行中间时按回车会把行拆开，所以必须由我们代劳。
 
-        smart=False（Shift+Enter，v78 起的老口径）：不依赖光标列、也不移动
-        光标，直接读本行文本、取它的行首空白作为新行缩进。
+        smart=False（Shift+Enter，v78 起；★v89 起缩进判定与回车【同源】）：
+        不依赖光标列、也不改动本行内容 —— 直接读本行文本算新行缩进：
+          * 整行注释：忽略它（以及上方连续的注释行），跟上方第一个非注释行对齐；
+          * 块头（含 `Else` / `Case` / `#If … Then` 这些【没有收尾】的块头）：
+            新行深一级，而且 `Else` / `Case` 会先把【本行】拉回它该在的层级
+            （branch_align，与回车那条路同一份判据）；
+          * 空行：沿用本行自己的空白 —— 不替用户猜层级（回车那一档在这种行上
+            是直接放手、交回 VBE 原生，行为等价）；
+          * 其余普通行：抄本行行首空白（= v78 老口径，与回车那条路同结果）。
 
         smart=True（回车自动缩进，v79）—— 由用户那两条要求而来：
           * 本行是【整行注释】：忽略它（以及上方连续的注释行），跟上方第一个
@@ -3487,8 +3494,14 @@ class VbeBackend:
             （那一档 VBE 原生是【拆行】，我们不能替它决定）；
           * smart=False（Shift+Enter）：这条路本来就不拆行（只往下插一行），
             所以光标停在哪儿都无所谓 —— 照判、照补。
-        Shift+Enter 的其它情形（不是块头 / 收尾已挂在下面 / `auto_close` 关掉）
-        维持 v78 老口径：只往下插一行、行首空白抄本行的。
+        ★v89（Shift+Enter 的缩进判定并入同一份判据）：v88 只把"新行深一级"
+        接在了【有收尾】的块头里面（写在 `if _close:` 支里），于是 `Else` /
+        `Case` / `#If … Then` 这些"是块头但没有收尾"的行、以及整行注释，都仍
+        走 v78 那条"行首空白抄本行"的老路 —— 用户报的正是这个："按 Shift+Enter
+        换行，不会判定自动缩进，只按回车会判定自动缩进。"
+        现在这一支的缩进统一由 next_line_indent + branch_align 算（与 smart
+        分支逐字同源）。真正保留的老口径只剩两条：**空行不猜层级**、
+        **`auto_close` 关掉时不补收尾**（收尾才是那个开关管的语义）。
 
         auto_close=True（回车自动补收尾，v79b；嵌套判定 v79c）—— smart 模式下：
         块头是 `If x Then` / `With rng` / `Sub Foo()` / `Type Foo` / `Enum E` 这类
@@ -3497,7 +3510,8 @@ class VbeBackend:
         由纯函数 block_closer + closer_needed 决定：下面已经挂着本块的收尾、或者
         这块的下文已经在写了 —— 都不补，免得顶开已有代码。
 
-        align_branch=True（分支行自动对齐，v81；层级分档 v83）—— 仅对 smart 模式生效：
+        align_branch=True（分支行自动对齐，v81；层级分档 v83）—— 两个模式都生效
+        （★v89 起；此前只管 smart 模式）：
         本行是块【内】的分支（`Else` / `ElseIf … Then` / `Case …`，含条件编译的
         `#Else` / `#ElseIf`）时，先把它【自己】拉回该在的层级（`Else` / `ElseIf` 与
         `If … Then` 齐平、`#Else` / `#ElseIf` 与 `#If … Then` 齐平、**`Case` 比
@@ -3582,7 +3596,30 @@ class VbeBackend:
                 if anchor <= 0:
                     return False
                 line_text = cm.Lines(anchor, 1)
-                indent = _leading_ws(line_text)
+                above = self._lines_above(cm, anchor)
+                unit = _indent_unit_for(above + [line_text])
+                if not str(line_text).strip():
+                    # 空行：不替用户猜层级。回车那一档在这种行上是直接放手、把回车
+                    # 交回 VBE 原生（= 沿用本行自己的空白），所以这里照抄本行空白
+                    # 就是同一个结果。
+                    indent = _leading_ws(line_text)
+                else:
+                    # ★v89（用户报的）：Shift+Enter 的【缩进判定】与回车那条路逐字
+                    # 同源 —— 同一份 next_line_indent（整行注释往上找第一个非注释
+                    # 行、块头深一级）+ branch_align（`Else` / `Case` / `#Else` 先把
+                    # 【本行】拉回它该在的层级）。
+                    #
+                    # 为什么 v88 之后仍然"不判定"：v88 那段"新行深一级"写在下面
+                    # `if _close:` 里面，而 `_close = block_closer(line_text)` 对
+                    # `Else` / `Case` / `#If … Then`（`_block_kind` 认它们是块头、
+                    # 但**没有收尾**，见 _BLOCK_CLOSERS 的说明）返回 None ⇒
+                    # 这几类行、以及整行注释，全都落回了 v78 那条"行首空白抄本行"
+                    # 的老路，看起来就是"只有回车才判定自动缩进"。
+                    indent = next_line_indent(line_text, above, unit)
+                    if align_branch:
+                        _al = branch_align(line_text, above, unit)
+                        if _al is not None:
+                            fixed_line, indent = _al
                 # ★v88（用户报的）：Shift+Enter 也要能把块补起来，而且【光标停在
                 # 哪一列都行】。回车那条路（smart=True）有一条"光标必须在行尾"的
                 # 保险：光标在代码中间时它会把这一下原样还给 VBE，而 VBE 原生回车
@@ -3590,15 +3627,15 @@ class VbeBackend:
                 # 本来就不拆行（只往下插一行、本行一个字符都不动），所以可以放心地
                 # 在任意光标列上判块头、补收尾。
                 #
-                # 判据与缩进全部走【同一份实现】：block_closer / closer_needed /
-                # next_line_indent（v87 的教训：同一条语义规则只能有一份实现），
-                # 与 smart 分支逐字同源 —— 只是这里不必先问"光标在不在行尾"。
+                # 判据走【同一份实现】：block_closer / closer_needed（v87 的教训：
+                # 同一条语义规则只能有一份实现），与 smart 分支逐字同源 —— 只是
+                # 这里不必先问"光标在不在行尾"。**收尾**才是 `auto_close` 管的事，
+                # 缩进不归它管（`VBECOMPLETE_NO_AUTOCLOSE=1` 的语义就是"只留缩进、
+                # 不补收尾"）。
                 if auto_close:
                     _close = block_closer(line_text)
                     if _close:
                         base = _leading_ws(line_text)
-                        above = self._lines_above(cm, anchor)
-                        unit = _indent_unit_for(above + [line_text])
                         # 往下找本块收尾的窗口与"读满被截断"的兜底同 smart 分支
                         # （_CLOSER_SCAN_LINES / closer_needed 的 truncated）。
                         try:
@@ -3613,10 +3650,6 @@ class VbeBackend:
                                          lines_above=above,
                                          truncated=_rest > _cap):
                             closer_text = base + _close
-                        # 块头行 -> 新行深一级（与回车那条路一致）；这一档不看
-                        # 收尾补没补 —— 下面已经挂着本块收尾时，用户按 Shift+Enter
-                        # 想要的同样是"进块里写内容"。
-                        indent = next_line_indent(line_text, above, unit)
             if fixed_line is not None:
                 # v81：分支行（Else / ElseIf…Then / Case…）先拉回它该在的层级
                 # （v83：Case 比 Select Case 深一级，其余与块头齐平）。

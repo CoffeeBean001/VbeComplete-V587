@@ -2579,9 +2579,12 @@ def main():
                         ["Sub Foo()", "\tIf x Then", "End Sub"], 2, 11)
                 finally:
                     VB._sem_cache["info"] = _sem29
-                check("29.7 Tab 缩进：新行仍是 Tab，光标按显示列落在其后（第 5 列）",
+                # ★v89：`\tIf x Then` 是块头 -> 新行按判据深一级（两个 Tab；
+                # 原先只抄本行空白，是一个 Tab）。Tab 语义与列语义不变。
+                check("29.7 Tab 缩进：新行仍是 Tab（★v89 块头深一级 => 两个 Tab），"
+                      "光标按显示列落在其后（第 9 列）",
                       [_ok29c, _ls29c[2], _sel29c],
-                      expect_contain=[True, "\t", (3, 5, 3, 5)])
+                      expect_contain=[True, "\t\t", (3, 9, 3, 9)])
 
                 # 29.8 取不到 VBE（不在代码窗 / Excel 已关）必须返回 False ——
                 #      调用方据此【不吞键】，让 VBE 按原生行为处理
@@ -8007,13 +8010,16 @@ def main():
                               (True, ["If x = 1 Then", "    "], (2, 5, 2, 5))])
 
         # Shift+Enter 那条路（smart=False）任何情况下都不许补收尾
+        # ★v89：缩进判定并到同一份判据之后，这一条只钉"**不补收尾**"——
+        # `Sub Foo()` 是块头，所以新行按 next_line_indent 深一级（4 格）。
         _cm57s = _CM57(["Sub Foo()"])
         _pane57s = _Pane57(_cm57s, (1, 2, 1, 2))
         VB57._get_vbe_cached = lambda: _VBE57(_pane57s)
         _ok57s = VB57.VbeBackend().new_line_below()
-        check("57.4h Shift+Enter（smart=False）不补收尾：不改老行为",
+        check("57.4h Shift+Enter（smart=False）不补收尾（★v89：缩进照判据走，"
+              "块头新行深一级；见第 68 节）",
               [(_ok57s, _cm57s.lines)],
-              expect_contain=[(True, ["Sub Foo()", ""])])
+              expect_contain=[(True, ["Sub Foo()", "    "])])
 
         VB57._get_vbe_cached = lambda: None
         check("57.4i 取不到 VBE -> False（调用方把回车原样还给系统）",
@@ -9369,12 +9375,16 @@ def main():
         _pane62s = _Pane62(_cm62s, (2, 9, 2, 9))
         VB62._get_vbe_cached = lambda: _VBE62(_pane62s)
         _ok62s = VB62.VbeBackend().new_line_below()
+        # ★v89：这一档钉的是"**不许返回 False**"（不能因为 NameError 被
+        # 『出异常一律 return False』吞成"按了 Shift+Enter 却不换行"）。
+        # 这里的 `Else` 上方压根没有 `If … Then`，所以 branch_align 按设计
+        # 什么都不做（宁可不对齐也不挪错）；缩进按它自己的 4 格再深一级。
         check("62.12 ★护栏（与 v79b 的 closer_text 同坑）：Shift+Enter"
               "（smart=False）那条路不许被 v81 碰到 —— fixed_line 必须在 `if smart:`"
               "【之外】初始化，否则 NameError 会被『出异常一律 return False』吞成"
               "『按了 Shift+Enter 却不换行』",
               [(_ok62s, _cm62s.lines)],
-              expect_contain=[(True, ["Sub Foo()", "    Else", "    "])])
+              expect_contain=[(True, ["Sub Foo()", "    Else", "        "])])
 
         # ---- 62.11 ★接线护栏 ----
         _root62 = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -10507,13 +10517,14 @@ def main():
                                (3, 5, 3, 5))])
 
         # ---- 67.5 ★对照：auto_close 关掉 -> 完全回到 v78 ----
-        check("67.5 ★对照：`auto_close=False`（v78 老默认）时，块头行中也【不】"
-              "补收尾，新行行首空白抄本行（缩进 4，不是深一级）—— 证明这条新路"
-              "只在新开关打开时起作用，老调用（`new_line_below()`）不受影响",
+        check("67.5 ★对照：`auto_close=False` 时【不补收尾】（这条新路只由该开关"
+              "管收尾）；★v89：**缩进不再跟着这个开关走** —— 块头行照样按判据"
+              "深一级（`VBECOMPLETE_NO_AUTOCLOSE=1` 的语义就是\"只留缩进、"
+              "不补收尾\"）",
               [_run67(_IF67, 3, 8)],
               expect_contain=[(True,
                                ["Sub F1()", "    x = 0", "    If x = 1 Then",
-                                "    ", "End Sub"], (4, 5, 4, 5))])
+                                "        ", "End Sub"], (4, 9, 4, 9))])
 
         # ---- 67.6 ★对照：同一行、同一光标列，回车 vs Shift+Enter ----
         _smart67 = _run67(_IF67, 3, 8, smart=True, auto_close=True)
@@ -10535,15 +10546,16 @@ def main():
             "def _enter_indent_here")[0]
         _vbsrc67 = io.open(os.path.join(_root67, "vbe_bridge.py"),
                            encoding="utf-8").read()
-        _else67 = _vbsrc67.split(
-            "★v88（用户报的）：Shift+Enter 也要能把块补起来")[1].split(
+        # ⚠️ 切片锚点用 smart=False 支的第一句注释（唯一），别再用版本注释行 ——
+        # v89 往里插了缩进判定，锚在版本注释上会把新代码切到片外（假红）。
+        _else67 = _vbsrc67.split("有选区时以选区【末行】为基准")[1].split(
             "if fixed_line is not None")[0]
         check("67.7 ★接线护栏：Shift+Enter 那条线确实接上了 —— main 的 "
               "`_new_line_here` 把 `auto_close=AUTO_CLOSE_BLOCK` 传下去；"
               "vbe_bridge 的 smart=False 支用的是【同一份】纯判据"
               "（block_closer / closer_needed / next_line_indent，v87 的教训："
               "同一条语义只能有一份实现），扫描窗口与截断兜底也一并接上",
-              [[("backend.new_line_below(auto_close=AUTO_CLOSE_BLOCK)" in _fn67),
+              [[("auto_close=AUTO_CLOSE_BLOCK" in _fn67),
                 ("block_closer(line_text)" in _else67),
                 ("closer_needed(self._lines_below(cm, anchor, _cap)"
                  in _else67),
@@ -10590,6 +10602,219 @@ def main():
                                + _REAL67[8:], (9, 13, 9, 13))])
     except Exception as _e67:
         check("第 67 节异常: %s" % _e67, [True], expect_contain=[False])
+
+    # ---- 68. v89：Shift+Enter 的缩进判定与回车同源 ----
+    #
+    # 用户口径："按 shift+enter 换行，不会判定自动缩进，只按 enter 会判定自动缩进。"
+    # 根因：v88 只把"新行深一级"接在【有收尾】的块头里面（写在 `if _close:` 支
+    # 内），而 `Else` / `Case` / `#If … Then` 这三类是 `_block_kind` 认的块头、
+    # 却**没有收尾**（`block_closer` 返回 None，见 _BLOCK_CLOSERS 的说明）⇒
+    # 它们和整行注释一起，全落回了 v78 那条"行首空白抄本行"的老路。
+    print("\n=== 68. v89：Shift+Enter 的缩进判定与回车同源 ===")
+    try:
+        import vbe_bridge as VB68
+
+        class _CM68(object):
+            def __init__(self, lines):
+                self.lines = list(lines)
+                self.Name = "M1"
+                self.replace_calls = 0
+
+            @property
+            def CountOfLines(self):
+                return len(self.lines)
+
+            def Lines(self, start, count):
+                s0 = max(0, int(start) - 1)
+                return "".join(l + "\n"
+                               for l in self.lines[s0:s0 + int(count)])
+
+            def InsertLines(self, start, text):
+                i = min(max(0, int(start) - 1), len(self.lines))
+                for k, ln in enumerate(str(text).split("\n")):
+                    self.lines.insert(i + k, ln)
+
+            def ReplaceLine(self, line, text):
+                self.replace_calls += 1
+                self.lines[int(line) - 1] = str(text)
+
+        class _Pane68(object):
+            def __init__(self, cm, sel):
+                self.CodeModule = cm
+                self.sel = sel
+
+            def GetSelection(self):
+                return self.sel
+
+            def SetSelection(self, sl, sc, el, ec):
+                self.sel = (sl, sc, el, ec)
+
+        class _VBE68(object):
+            def __init__(self, pane):
+                self.ActiveCodePane = pane
+
+        _orig68 = VB68._get_vbe_cached
+
+        def _run68(lines, line_no, col, **kw):
+            """跑一次 new_line_below，返回 (ok, 行表, 选区, ReplaceLine 次数)。
+
+            ⚠️ 光标列按【字符列】给，脚手架里的行一律 ASCII（同第 65/67 节）。
+            """
+            cm68 = _CM68(lines)
+            pane68 = _Pane68(cm68,
+                             (int(line_no), int(col), int(line_no), int(col)))
+            VB68._get_vbe_cached = lambda: _VBE68(pane68)
+            try:
+                ok68 = VB68.VbeBackend().new_line_below(**kw)
+            finally:
+                VB68._get_vbe_cached = _orig68
+            return (ok68, cm68.lines, pane68.sel, cm68.replace_calls)
+
+        # ---- 68.1 ★判据形态：根因就在这三类行上 ----
+        _bad68a = []
+        for _t68 in ("        Else", "            Case 1", "#If VBA7 Then"):
+            if not VB68.opens_block(_t68) or VB68.block_closer(_t68) is not None:
+                _bad68a.append(_t68)
+        check("68.1 ★判据形态（根因）：`Else` / `Case` / `#If … Then` 都算"
+              "【块头】（opens_block=True -> 新行该深一级），但"
+              "【没有收尾】（block_closer=None，见 _BLOCK_CLOSERS 的说明）——"
+              "v88 把缩进写在 `if _close:` 里，这三类就被整片漏掉",
+              [_bad68a], expect_contain=[[]])
+
+        _ELSE68 = ["Sub F1()",
+                   "    If x = 1 Then",
+                   "        y = 1",
+                   "        Else"]
+        _CASE68 = ["Sub F1()",
+                   "    Select Case x",
+                   "            Case 1"]
+        _PLAIN68 = ["Sub F1()",
+                    "    x = y + 1",
+                    "End Sub"]
+        _IF68 = ["Sub F1()",
+                 "    x = 0",
+                 "    If x = 1 Then",
+                 "End Sub"]
+
+        # ---- 68.2 ★集成：`Else`（歪在块体那一级）行中按 Shift+Enter ----
+        check("68.2 ★集成（用户报的场景）：`Else` 歪在块体那一级（8 格）、光标"
+              "停在【行中】按 Shift+Enter -> 先把本行拉回 4 格（`Else` 归"
+              "`If … Then`、与它齐平，v83），新行 8 格；不补任何收尾"
+              "（`End If` 归那个 If，不是给它单开的）；行内文字一个字符没动",
+              [_run68(_ELSE68, 4, 10, auto_close=True, align_branch=True)],
+              expect_contain=[(True,
+                               _ELSE68[:3] + ["    Else", "        "],
+                               (5, 9, 5, 9), 1)])
+
+        # ---- 68.3 ★对照：同一行、同一位置，回车（行尾）结果逐字相同 ----
+        _sh68 = _run68(_ELSE68, 4, 10, auto_close=True, align_branch=True)
+        _en68 = _run68(_ELSE68, 4, 13, smart=True, auto_close=True,
+                       align_branch=True)
+        _en68mid = _run68(_ELSE68, 4, 10, smart=True, auto_close=True,
+                          align_branch=True)
+        check("68.3 ★对照（钉住\"两条路同一份判据\"）：同一条 `Else`（同样歪在"
+              "8 格）—— 回车在【行尾】时给出的结果（ok / 行表 / 光标位置 / "
+              "ReplaceLine 次数，4 项全等）与 Shift+Enter 在【行中】给出的"
+              "逐字相同；而回车在【行中】照旧拒绝接管（那道\"光标必须在行尾\""
+              "的保险是回车这条入口自己的语义，与判据无关）",
+              [[(_en68 == _sh68), _en68mid[0]]],
+              expect_contain=[[True, False]])
+
+        # ---- 68.4 ★集成：`Case`（歪在块体那一级）行中 ----
+        check("68.4 ★集成：`Case` 歪在 12 格、行中按 Shift+Enter -> 拉回 8 格"
+              "（`Case` 比 `Select Case`【深一级】，v83 的分档）+ 新行 12 格",
+              [_run68(_CASE68, 3, 15, auto_close=True, align_branch=True)],
+              expect_contain=[(True,
+                               _CASE68[:2] + ["        Case 1", "            "],
+                               (4, 13, 4, 13), 1)])
+
+        # ---- 68.5 ★集成：`#If … Then`（块头但收尾由用户自己写）----
+        check("68.5 ★集成：`#If VBA7 Then`（顶格，惯例写法）行中按 Shift+Enter "
+              "-> 新行深一级（4 格）；**不补 `#End If`**（条件编译的收尾必须"
+              "用户自己写，_BLOCK_CLOSERS 刻意没收它）",
+              [_run68(["Sub F1()", "#If VBA7 Then"], 2, 8,
+                      auto_close=True, align_branch=True)],
+              expect_contain=[(True, ["Sub F1()", "#If VBA7 Then", "    "],
+                               (3, 5, 3, 5), 0)])
+
+        # ---- 68.6 ★集成：整行注释 -> 往上找第一个非注释行 ----
+        check("68.6 ★集成：整行注释（顶格）行中按 Shift+Enter -> 忽略注释、跟"
+              "上方第一个非注释行（这里是块头 `Sub F1()`）对齐 => 新行 4 格"
+              "（原先抄注释自己的空白，是 0 格）",
+              [_run68(["Sub F1()", "' note"], 2, 4,
+                      auto_close=True, align_branch=True)],
+              expect_contain=[(True, ["Sub F1()", "' note", "    "],
+                               (3, 5, 3, 5), 0)])
+
+        # ---- 68.7 老口径里真正不动的那两条：普通行 / 空行 ----
+        _blank68 = _run68(["Sub F1()", "    x = 1", "", "End Sub"], 3, 1,
+                          auto_close=True, align_branch=True)
+        _ws68 = _run68(["Sub F1()", "    ", "End Sub"], 2, 3,
+                       auto_close=True, align_branch=True)
+        check("68.7 普通代码行照旧抄本行空白（4 格，v78 老口径）；空行【不猜"
+              "层级】（新行仍是空的 —— 回车那一档在这种行上是直接放手交回"
+              "VBE 原生，行为等价）；只有空白的行照抄它自己那几格",
+              [_run68(_PLAIN68, 2, 8, auto_close=True, align_branch=True),
+               _blank68, _ws68],
+              expect_contain=[(True, ["Sub F1()", "    x = y + 1", "    ",
+                                      "End Sub"], (3, 5, 3, 5), 0),
+                              (True, ["Sub F1()", "    x = 1", "", "",
+                                      "End Sub"], (4, 1, 4, 1), 0),
+                              (True, ["Sub F1()", "    ", "    ", "End Sub"],
+                               (3, 5, 3, 5), 0)])
+
+        # ---- 68.8 ★回归：v88 那套（块头补收尾）不许被这次改动碰掉 ----
+        check("68.8 ★回归护栏：v88 那套一个字没变 —— 未闭合的 `If … Then` "
+              "行中按 Shift+Enter 仍旧补 `End If`、新行深一级、光标停在中间",
+              [_run68(_IF68, 3, 8, auto_close=True, align_branch=True)],
+              expect_contain=[(True,
+                               _IF68[:3] + ["        ", "    End If"]
+                               + _IF68[3:], (4, 9, 4, 9), 0)])
+
+        # ---- 68.9 `auto_close` 只管收尾，不管缩进 ----
+        check("68.9 ★开关口径：`auto_close=False`（= `VBECOMPLETE_NO_AUTOCLOSE=1`"
+              "）时【不补收尾】，但缩进照样按判据算 —— 那条开关的语义就是"
+              "\"只留缩进、不补收尾\"（与 67.5 同口径，这里从块头/注释两侧再钉）",
+              [_run68(_IF68, 3, 8, auto_close=False, align_branch=True),
+               _run68(_ELSE68, 4, 10, auto_close=False, align_branch=True)],
+              expect_contain=[(True, _IF68[:3] + ["        "] + _IF68[3:],
+                               (4, 9, 4, 9), 0),
+                              (True, _ELSE68[:3] + ["    Else", "        "],
+                               (5, 9, 5, 9), 1)])
+
+        # ---- 68.10 `align_branch` 开关两条路共用 ----
+        check("68.10 `align_branch=False`（= `VBECOMPLETE_NO_BRANCH_ALIGN=1`）"
+              "时：`Else` 那一行【不动】（只按它的实际缩进深一级）—— 与回车那条"
+              "路同一个开关，不是各管各的",
+              [_run68(_ELSE68, 4, 10, auto_close=True, align_branch=False)],
+              expect_contain=[(True, _ELSE68 + ["            "],
+                               (5, 13, 5, 13), 0)])
+
+        # ---- 68.11 ★接线护栏：结构上防"又被塞进 if _close 里" ----
+        _root68 = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        _vbsrc68 = io.open(os.path.join(_root68, "vbe_bridge.py"),
+                           encoding="utf-8").read()
+        _else68 = _vbsrc68.split("有选区时以选区【末行】为基准")[1].split(
+            "if fixed_line is not None")[0]
+        _mainsrc68 = io.open(os.path.join(_root68, "main.py"),
+                             encoding="utf-8").read()
+        _fn68 = _mainsrc68.split("def _new_line_here")[1].split(
+            "def _enter_indent_here")[0]
+        _i_ind68 = _else68.index("next_line_indent(line_text, above, unit)")
+        _i_close68 = _else68.index("if auto_close:")
+        check("68.11 ★接线护栏：smart=False 支里 `next_line_indent` 与 "
+              "`branch_align` 都在【空行判断的 else 支】里，而且 `next_line_indent` "
+              "出现在 `if auto_close:` 【之前】（= 缩进不归那个开关管 —— 这正是"
+              "v88 把缩进塞进 `if _close:` 里造成这次报 bug 的形状）；main 的 "
+              "`_new_line_here` 把 `align_branch=BRANCH_ALIGN` 一并传下去",
+              [[("branch_align(line_text, above, unit)" in _else68),
+                ("if align_branch:" in _else68),
+                ("if not str(line_text).strip():" in _else68),
+                (_i_ind68 < _i_close68),
+                ("align_branch=BRANCH_ALIGN" in _fn68)]],
+              expect_contain=[[True] * 5])
+    except Exception as _e68:
+        check("第 68 节异常: %s" % _e68, [True], expect_contain=[False])
 
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))
