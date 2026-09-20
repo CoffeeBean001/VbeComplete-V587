@@ -10392,6 +10392,205 @@ def main():
     except Exception as _e66:
         check("第 66 节异常: %s" % _e66, [True], expect_contain=[False])
 
+    # ---- 67. v88：Shift+Enter（光标在代码中间）也补块收尾 ----
+    #
+    # 用户口径："把光标移动到语句最后按回车可以补全；光标在代码中间按 Shift+Enter，
+    # 不会自动补全代码块 —— 帮我加上，也能补全。"
+    # 根因：补块收尾只挂在 smart 模式（回车）那条路上，而那条路有一道"光标必须在
+    # 行尾"的保险 —— 光标停在中途时它整件事作废、把按键还给 VBE（那时 VBE 原生
+    # 回车是【拆行】）。Shift+Enter 这条路本来就不拆行（只往下插一行），所以能在
+    # 任意光标列上判块头、补收尾。两条路共用同一份 block_closer / closer_needed /
+    # next_line_indent。
+    print("\n=== 67. v88：Shift+Enter（行中）也补块收尾 ===")
+    try:
+        import vbe_bridge as VB67
+
+        class _CM67(object):
+            def __init__(self, lines):
+                self.lines = list(lines)
+                self.Name = "M1"
+
+            @property
+            def CountOfLines(self):
+                return len(self.lines)
+
+            def Lines(self, start, count):
+                s0 = max(0, int(start) - 1)
+                return "".join(l + "\n"
+                               for l in self.lines[s0:s0 + int(count)])
+
+            def InsertLines(self, start, text):
+                i = min(max(0, int(start) - 1), len(self.lines))
+                for k, ln in enumerate(str(text).split("\n")):
+                    self.lines.insert(i + k, ln)
+
+        class _Pane67(object):
+            def __init__(self, cm, sel):
+                self.CodeModule = cm
+                self.sel = sel
+
+            def GetSelection(self):
+                return self.sel
+
+            def SetSelection(self, sl, sc, el, ec):
+                self.sel = (sl, sc, el, ec)
+
+        class _VBE67(object):
+            def __init__(self, pane):
+                self.ActiveCodePane = pane
+
+        _orig67 = VB67._get_vbe_cached
+
+        def _run67(lines, line_no, col, **kw):
+            """按 mock 的代码窗跑一次 new_line_below，返回 (ok, 行表, 选区)。
+
+            ⚠️ 光标列按【字符列】给 —— 脚手架里的行一律用 ASCII。真机
+            GetSelection 给的是**显示列**，全角字符占两格会偏（判据本身与此
+            无关，见第 65 节同一处提醒）。
+            """
+            cm67 = _CM67(lines)
+            pane67 = _Pane67(cm67,
+                             (int(line_no), int(col), int(line_no), int(col)))
+            VB67._get_vbe_cached = lambda: _VBE67(pane67)
+            try:
+                ok67 = VB67.VbeBackend().new_line_below(**kw)
+            finally:
+                VB67._get_vbe_cached = _orig67
+            return (ok67, cm67.lines, pane67.sel)
+
+        _IF67 = ["Sub F1()",
+                 "    x = 0",
+                 "    If x = 1 Then",
+                 "End Sub"]
+        _IFCLOSED67 = ["Sub F1()",
+                       "    x = 0",
+                       "    If x = 1 Then",
+                       "        y = 1",
+                       "    End If",
+                       "End Sub"]
+        _PLAIN67 = ["Sub F1()",
+                    "    x = y + 1",
+                    "End Sub"]
+
+        # ---- 67.1 ★集成：未闭合的 `If … Then`，光标【行中】-> 补 End If ----
+        check("67.1 ★集成（用户报的场景）：`If … Then` 那行、光标停在第 8 列"
+              "（行中，不在行尾）按 Shift+Enter -> 补出 `End If`；新行比块头"
+              "深一级、光标落在中间那行；块头那一行一个字符没动",
+              [_run67(_IF67, 3, 8, auto_close=True)],
+              expect_contain=[(True,
+                               _IF67[:3] + ["        ", "    End If"] + _IF67[3:],
+                               (4, 9, 4, 9))])
+
+        # ---- 67.2 已闭合：不补第二条，但照样进块（深一级）----
+        check("67.2 ★集成：`If … Then` 下面已经挂着自己的 `End If` -> 不补第二条"
+              "（同一份 closer_needed，v86 那套判据自动覆盖这条新路），但光标"
+              "行中按 Shift+Enter 照样把新行缩进深一级（进块里写内容）",
+              [_run67(_IFCLOSED67, 3, 8, auto_close=True)],
+              expect_contain=[(True,
+                               _IFCLOSED67[:3] + ["        "]
+                               + _IFCLOSED67[3:], (4, 9, 4, 9))])
+
+        # ---- 67.3 ★过程头：行中按 Shift+Enter -> 补 End Sub ----
+        check("67.3 ★集成：过程头 `Sub F1()` 那行、光标停在第 6 列（正好落在"
+              "过程名中间）按 Shift+Enter -> 补出 `End Sub`，新行深一级；"
+              "过程头那一行原样不动（Shift+Enter 从不拆行）",
+              [_run67(["Sub F1()", "    x = 0"], 1, 6, auto_close=True)],
+              expect_contain=[(True, ["Sub F1()", "    ", "End Sub", "    x = 0"],
+                               (2, 5, 2, 5))])
+
+        # ---- 67.4 普通代码行：维持 v78 老口径 ----
+        check("67.4 非块头（普通代码行）光标行中按 Shift+Enter：不补任何收尾，"
+              "新行行首空白【抄本行】—— v78 的老口径一个字不动",
+              [_run67(_PLAIN67, 2, 8, auto_close=True)],
+              expect_contain=[(True,
+                               ["Sub F1()", "    x = y + 1", "    ", "End Sub"],
+                               (3, 5, 3, 5))])
+
+        # ---- 67.5 ★对照：auto_close 关掉 -> 完全回到 v78 ----
+        check("67.5 ★对照：`auto_close=False`（v78 老默认）时，块头行中也【不】"
+              "补收尾，新行行首空白抄本行（缩进 4，不是深一级）—— 证明这条新路"
+              "只在新开关打开时起作用，老调用（`new_line_below()`）不受影响",
+              [_run67(_IF67, 3, 8)],
+              expect_contain=[(True,
+                               ["Sub F1()", "    x = 0", "    If x = 1 Then",
+                                "    ", "End Sub"], (4, 5, 4, 5))])
+
+        # ---- 67.6 ★对照：同一行、同一光标列，回车 vs Shift+Enter ----
+        _smart67 = _run67(_IF67, 3, 8, smart=True, auto_close=True)
+        _shift67 = _run67(_IF67, 3, 8, auto_close=True)
+        check("67.6 ★对照（钉住用户报的那个差别）：同一条 `If … Then`、同一个"
+              "【行中】光标列 —— 回车那条路（smart=True）有『光标必须在行尾』"
+              "这道保险，这里【拒绝接管】（返回 False，按键还给 VBE 的拆行）；"
+              "Shift+Enter 那条路（smart=False + auto_close）把块补出来",
+              [[_smart67[0], _shift67[0], _shift67[1]]],
+              expect_contain=[[False, True,
+                               _IF67[:3] + ["        ", "    End If"]
+                               + _IF67[3:]]])
+
+        # ---- 67.7 ★接线护栏 ----
+        _root67 = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        _mainsrc67 = io.open(os.path.join(_root67, "main.py"),
+                             encoding="utf-8").read()
+        _fn67 = _mainsrc67.split("def _new_line_here")[1].split(
+            "def _enter_indent_here")[0]
+        _vbsrc67 = io.open(os.path.join(_root67, "vbe_bridge.py"),
+                           encoding="utf-8").read()
+        _else67 = _vbsrc67.split(
+            "★v88（用户报的）：Shift+Enter 也要能把块补起来")[1].split(
+            "if fixed_line is not None")[0]
+        check("67.7 ★接线护栏：Shift+Enter 那条线确实接上了 —— main 的 "
+              "`_new_line_here` 把 `auto_close=AUTO_CLOSE_BLOCK` 传下去；"
+              "vbe_bridge 的 smart=False 支用的是【同一份】纯判据"
+              "（block_closer / closer_needed / next_line_indent，v87 的教训："
+              "同一条语义只能有一份实现），扫描窗口与截断兜底也一并接上",
+              [[("backend.new_line_below(auto_close=AUTO_CLOSE_BLOCK)" in _fn67),
+                ("block_closer(line_text)" in _else67),
+                ("closer_needed(self._lines_below(cm, anchor, _cap)"
+                 in _else67),
+                ("_block_kind(line_text)" in _else67),
+                ("next_line_indent(line_text, above, unit)" in _else67),
+                ("truncated=_rest > _cap" in _else67),
+                ("self._CLOSER_SCAN_LINES" in _else67)]],
+              expect_contain=[[True] * 7])
+
+        # ---- 67.8 ★回归护栏：v86 那个现场形态，行中也不许多补 ----
+        # `脚本.xlsm / 模块2` 摘录（15 行）：第 11 行是那个【顶格】的 `1:`。
+        # ⚠️ 真实模块里是全角名，这里换 ASCII —— 同第 65 节的脚手架说明。
+        _REAL67 = [
+            "Sub Func2()",
+            "    Set actSheet = ThisWorkbook.ActiveSheet",
+            "    For i = 3 To targetSheet.Cells(targetSheet.Cells.Rows.Count, "
+            "\"e\").End(xlUp).Row",
+            "        ID = CStr(targetSheet.Cells(i, \"e\"))",
+            "    Next",
+            "",
+            "    For i = 1 To dataSheet1.Cells(dataSheet1.Cells.Rows.Count, "
+            "\"c\").End(xlUp).Row",
+            "        If dataSheet1.Cells(i, \"c\") = \"name\" Then",
+            "            If dataSheet1.Cells(i, \"d\") = \"\" Then GoTo 1",
+            "            ID = CStr(dataSheet3.Cells(idRow, \"b\"))",
+            "1:",
+            "        End If",
+            "    Next",
+            "    MsgBox \"OK\", vbInformation",
+            "End Sub",
+        ]
+        check("67.8 ★回归护栏：v86 那个现场形态（顶格 `1:`）—— 在 `Sub` 那行、"
+              "外层 `For` 那行、`If … Then` 那行的【行中】各按一次 Shift+Enter，"
+              "同样一个收尾都不许补（三处下面都挂着自己的收尾）；只多一行缩进"
+              "深一级的空行，原有 15 行一个字符没动",
+              [_run67(_REAL67, 1, 6, auto_close=True),
+               _run67(_REAL67, 3, 10, auto_close=True),
+               _run67(_REAL67, 8, 12, auto_close=True)],
+              expect_contain=[(True, _REAL67[:1] + ["    "] + _REAL67[1:],
+                               (2, 5, 2, 5)),
+                              (True, _REAL67[:3] + ["        "] + _REAL67[3:],
+                               (4, 9, 4, 9)),
+                              (True, _REAL67[:8] + ["            "]
+                               + _REAL67[8:], (9, 13, 9, 13))])
+    except Exception as _e67:
+        check("第 67 节异常: %s" % _e67, [True], expect_contain=[False])
+
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))
     if FAILURES:

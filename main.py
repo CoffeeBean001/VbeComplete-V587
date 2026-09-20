@@ -331,6 +331,9 @@ ENTER_CTX_MAX_AGE = 0.8
 # Else / ElseIf…Then / Case 是块【内】的分支，条件编译 #If 要配 #End If —— 都不补。
 # 下面已经挂着同一个收尾、或这块的下文已经在写了（下一行缩进不比块头浅）也不补，
 # 见 vbe_bridge.closer_needed —— 免得把用户已有的代码顶开。
+# ★v88：这条路【回车】与【Shift+Enter】都用 —— 回车那条要求光标在行尾，Shift+Enter
+# 那条不看光标列（它本来就不拆行），于是"光标停在代码中间"时也能补出收尾来。
+# 关掉它，两边一起回到"只换行不补收尾"。
 # 想关掉（只留缩进、不补收尾）：set VBECOMPLETE_NO_AUTOCLOSE=1
 try:
     AUTO_CLOSE_BLOCK = (os.environ.get("VBECOMPLETE_NO_AUTOCLOSE",
@@ -719,11 +722,19 @@ def main():
         post(_run_trigger)
 
     def _new_line_here():
-        """Shift+Enter：在当前行下方新起一行（缩进对齐上一行）。
+        """Shift+Enter：在当前行下方新起一行（缩进对齐上一行）；块头行再补收尾。
 
         等价于用户"先把光标移到本行末尾，再按回车"，但一步到位 —— 当前行
         【不拆分】（光标右侧的代码留在原行），新行复制上一行的行首空白，
         光标落到新行缩进之后。细节见 VbeBackend.new_line_below。
+
+        ★v88（用户报的）：本行是块头（`If … Then` / `Sub …()` / `For …`…）时，
+        这里也把【块收尾】补出来（`End If` / `End Sub` / `Next`…），新行缩进
+        深一级、光标停在中间那行 —— 和回车那条路的待遇完全一样。
+        关键差别是**不看光标在不在行尾**：回车那条路光标不在行尾会把按键还给
+        VBE（那时 VBE 是"拆行"），而 Shift+Enter 本来就不拆行，所以光标停在
+        代码中间也照样补 —— 用户报的正是"光标在代码中间时拿不到收尾"。
+        要不要补、缩进多少，都由 vbe_bridge 里那份纯判据算（与回车同源）。
 
         顺序：先收起弹窗（光标要换行了，列表留着没意义），再动文本。
         v79 补上兜底：后端没写成（COM 抽风 / 不在代码窗）就把这一下按键原样
@@ -736,7 +747,7 @@ def main():
             pass
         _ok = False
         try:
-            _ok = backend.new_line_below()
+            _ok = backend.new_line_below(auto_close=AUTO_CLOSE_BLOCK)
         except Exception:
             _ok = False
         if not _ok:

@@ -3478,7 +3478,19 @@ class VbeBackend:
             排好的缩进较劲；
           * 本行引号没闭合：VBE 原生回车会替用户补上右引号，别抢这个活。
 
-        auto_close=True（回车自动补收尾，v79b；嵌套判定 v79c）—— 仅对 smart 模式生效：
+        ★v88（Shift+Enter 也补收尾）：auto_close 不再只对 smart 模式生效 ——
+        smart=False（Shift+Enter）那条路现在也判块头、补收尾，**且不要求光标在
+        行尾**（用户报的："光标在代码中间按 Shift+Enter，不会自动补全代码块"）。
+        两条路共用同一份 block_closer + closer_needed + next_line_indent，
+        差别只在"怎么起步"：
+          * smart=True（回车）：光标不在行尾 -> 整件事作废，把回车还给 VBE
+            （那一档 VBE 原生是【拆行】，我们不能替它决定）；
+          * smart=False（Shift+Enter）：这条路本来就不拆行（只往下插一行），
+            所以光标停在哪儿都无所谓 —— 照判、照补。
+        Shift+Enter 的其它情形（不是块头 / 收尾已挂在下面 / `auto_close` 关掉）
+        维持 v78 老口径：只往下插一行、行首空白抄本行的。
+
+        auto_close=True（回车自动补收尾，v79b；嵌套判定 v79c）—— smart 模式下：
         块头是 `If x Then` / `With rng` / `Sub Foo()` / `Type Foo` / `Enum E` 这类
         【真需要收尾】的，再在其后补一行同级的 `End If` / `End With` / `Next` /
         `End Type`…，光标停在中间那行（缩进正好），用户直接在块里写内容。要不要补
@@ -3569,7 +3581,42 @@ class VbeBackend:
                 anchor = max(int(sl), int(el))
                 if anchor <= 0:
                     return False
-                indent = _leading_ws(cm.Lines(anchor, 1))
+                line_text = cm.Lines(anchor, 1)
+                indent = _leading_ws(line_text)
+                # ★v88（用户报的）：Shift+Enter 也要能把块补起来，而且【光标停在
+                # 哪一列都行】。回车那条路（smart=True）有一条"光标必须在行尾"的
+                # 保险：光标在代码中间时它会把这一下原样还给 VBE，而 VBE 原生回车
+                # 在那种位置是【拆行】—— 于是用户拿不到收尾。Shift+Enter 这条路
+                # 本来就不拆行（只往下插一行、本行一个字符都不动），所以可以放心地
+                # 在任意光标列上判块头、补收尾。
+                #
+                # 判据与缩进全部走【同一份实现】：block_closer / closer_needed /
+                # next_line_indent（v87 的教训：同一条语义规则只能有一份实现），
+                # 与 smart 分支逐字同源 —— 只是这里不必先问"光标在不在行尾"。
+                if auto_close:
+                    _close = block_closer(line_text)
+                    if _close:
+                        base = _leading_ws(line_text)
+                        above = self._lines_above(cm, anchor)
+                        unit = _indent_unit_for(above + [line_text])
+                        # 往下找本块收尾的窗口与"读满被截断"的兜底同 smart 分支
+                        # （_CLOSER_SCAN_LINES / closer_needed 的 truncated）。
+                        try:
+                            _rest = max(0, int(cm.CountOfLines) - anchor)
+                        except Exception:
+                            _rest = 0
+                        _cap = min(_rest, self._CLOSER_SCAN_LINES)
+                        if closer_needed(self._lines_below(cm, anchor, _cap),
+                                         _close,
+                                         _indent_width(base),
+                                         kind=_block_kind(line_text),
+                                         lines_above=above,
+                                         truncated=_rest > _cap):
+                            closer_text = base + _close
+                        # 块头行 -> 新行深一级（与回车那条路一致）；这一档不看
+                        # 收尾补没补 —— 下面已经挂着本块收尾时，用户按 Shift+Enter
+                        # 想要的同样是"进块里写内容"。
+                        indent = next_line_indent(line_text, above, unit)
             if fixed_line is not None:
                 # v81：分支行（Else / ElseIf…Then / Case…）先拉回它该在的层级
                 # （v83：Case 比 Select Case 深一级，其余与块头齐平）。
