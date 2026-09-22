@@ -1056,7 +1056,9 @@ def main():
                     # "VBE 成员列表出现就让位"的兜底收掉 —— 否则就成了
                     # "按了 Ctrl+Space 却没反应"（比被遮住更让人以为工具坏了）。
                     state["popup_manual"] = True
-                    post(completer.trigger)
+                    # ★v90：v90 那条"刚由 Tab 写进去的那个词不再提示自己"同样
+                    # 不该拦住手动唤出 —— 同 v72 的理由：用户点名的列表照弹。
+                    post(lambda: completer.trigger(manual=True))
             elif state["ctrl"] and not state["alt"] and _is_vk_char(key, "j"):
                 # Ctrl+J / Ctrl+Shift+J = VBE 唤出它自己的「列出属性/方法」。
                 # 这是唯一能确定"VBE 列表马上要出现"的时刻（文本没变，轮询看

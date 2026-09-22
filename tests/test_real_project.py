@@ -10816,6 +10816,258 @@ def main():
     except Exception as _e68:
         check("第 68 节异常: %s" % _e68, [True], expect_contain=[False])
 
+    # ---- 69. v90：Tab 确认之后的那个词，不再提示自己 ----
+    #
+    # 用户口径（原话）："我还想要修改一个地方，就是当我按下 tab 键之后，提示词打印
+    # 到编辑器里，那么本次按键的提示词，就不用匹配提示了。"
+    #
+    # 修前只有 accept() 里那 0.35s 的【时间】静默期（SUPPRESS_AFTER_ACCEPT）在兜：
+    # 轮询发现这次写入、并把它排进动作队列，只要比静默期晚一拍（主线程正忙在一次
+    # 全量重解析上时很常见），trigger 就会照常跑到底；而此刻光标处那个词恰好
+    # "在工程里真实存在"（就是我们刚写进去的），v37 的"打全名照样提示"会把它留下
+    # -> 用户看到刚写进去的词又被提示一遍。
+    #
+    # 修后：accept() 记下【内容 + 位置】（词 / 模块 / 行号），trigger() 三条全中
+    # 就不再提示；任何人为编辑（多一个字符 / 少一个字符 / 换行 / 换模块）都会让
+    # 对照失败并当场作废 —— 所以这条记忆不需要计时器，也不会永久屏蔽这个名字。
+    print("\n=== 69. v90：Tab 确认后的那个词不再提示自己 ===")
+    try:
+        import engine as E69
+        import vbe_bridge as VB69
+
+        class _UI69(object):
+            def __init__(self):
+                self.shown = False
+
+            def show(self, *a, **k):
+                self.shown = True
+
+            def hide(self, *a, **k):
+                self.shown = False
+
+            def update_selection(self, *a, **k):
+                pass
+
+            def contains_point(self, *a, **k):
+                return False
+
+        class _CM69(object):
+            def __init__(self, comp, text):
+                self._comp = comp
+                self.lines = list(text)
+
+            @property
+            def Name(self):
+                return self._comp.Name
+
+            @property
+            def Parent(self):
+                return self._comp
+
+            @property
+            def CountOfLines(self):
+                return len(self.lines)
+
+            def Lines(self, start, count):
+                s0 = max(0, int(start) - 1)
+                return "\r\n".join(self.lines[s0:s0 + int(count)])
+
+            def ReplaceLine(self, n, text):
+                self.lines[int(n) - 1] = str(text).rstrip("\r\n")
+
+        class _Comp69(object):
+            def __init__(self, name, ctype, text):
+                self.Name = name
+                self.Type = ctype
+                self.CodeModule = _CM69(self, text)
+
+        class _Proj69(object):
+            def __init__(self, comps):
+                self.Name = "VBAProject"
+                self.VBComponents = list(comps)
+
+        class _Pane69(object):
+            def __init__(self, cm, sel):
+                self.CodeModule = cm
+                self.sel = sel
+
+            def GetSelection(self):
+                return self.sel
+
+            def SetSelection(self, sl, sc, el, ec):
+                self.sel = (sl, sc, el, ec)
+
+        class _VBE69(object):
+            def __init__(self, comps, pane):
+                self.ActiveVBProject = _Proj69(comps)
+                self.ActiveCodePane = pane
+
+        _orig69 = VB69._get_vbe_cached
+
+        # 标准模块：三个模块级真名字；光标停在第 5 行 `    num` 的词尾。
+        # 第 9 行留一段同样的文字，给"换行 -> 记忆作废"用。
+        # ⚠️ 行一律 ASCII —— 假 GetSelection 给的是显示列（同第 65 节的脚手架说明）。
+        _TEXT69 = ["Public num As Long",
+                   "Public numArr As Long",
+                   "Public numCount As Long",
+                   "Sub Work()",
+                   "    num",
+                   "End Sub",
+                   "",
+                   "",
+                   "    numCount",
+                   ""]
+
+        def _wire69(module="M1", line=5, col=8):
+            _c69 = _Comp69(module, 1, _TEXT69)
+            _p69 = _Pane69(_c69.CodeModule, (int(line), int(col),
+                                             int(line), int(col)))
+            VB69._get_vbe_cached = lambda: _VBE69([_c69], _p69)
+            return _c69, _p69
+
+        def _mk69(module="M1", line=5, col=8):
+            _c69, _p69 = _wire69(module, line, col)
+            _ui69 = _UI69()
+            _k69 = E69.Completer(VB69.VbeBackend(), _ui69)
+            return _k69, _ui69, _c69, _p69
+
+        def _acc69(c, name="numCount"):
+            """触发 -> 选中 name -> Tab 确认 -> 把【时间】静默期清 0。
+
+            清 0 这一步是刻意的：它模拟"轮询发现这次写入时已经过了静默期"
+            （= 修前会漏的那种晚到），也就是这条用例咬住的那个场景。
+            """
+            c.trigger(True)
+            c.selected = [m.lower() for m in c.current_matches()].index(
+                name.lower())
+            c.accept()
+            c._suppress_until = 0.0
+
+        # ---- 69.1 记忆的内容与来源 ----
+        _k69, _u69, _c69, _p69 = _mk69()
+        _acc69(_k69)
+        check("69.1 accept() 记下【内容 + 位置】= (词, 模块, 行号)；写回也真的"
+              "落到那一行、光标停在词尾。⚠️ 模块名必须从 `_ctx_now` 取 —— "
+              "`self.ctx` 那份精简快照没有模块名，用它会把模块记成空串，"
+              "\"换模块\"这条对照就永远失效",
+              [(_k69._accepted, _c69.CodeModule.lines[4], _p69.sel)],
+              expect_contain=[(("numcount", "m1", 5), "    numCount",
+                               (5, 13, 5, 13))])
+
+        # ---- 69.2 ★核心：晚到的 trigger 不再提示自己 ----
+        _k69b, _u69b, _c69b, _p69b = _mk69()
+        _acc69(_k69b)
+        _k69b.trigger(True)
+        check("69.2 ★核心（用户报的）：Tab 确认后，那次写入被轮询【晚一点】"
+              "发现（静默期已过）—— 弹窗不再把刚写进去的那个词提示回来",
+              [(_u69b.shown, _k69b.current_matches())],
+              expect_contain=[(False, [])])
+
+        # ---- 69.3 ★对照：用户点名的列表照弹（证明 69.2 挡的是回声，不是没候选）----
+        _k69c, _u69c, _c69c, _p69c = _mk69()
+        _acc69(_k69c)
+        _k69c.trigger(True, manual=True)
+        check("69.3 ★对照：同一条路径上 `manual=True`（Ctrl+Space，用户点名的"
+              "列表）照弹 —— 证明 69.2 不是\"候选里压根没有它\"，而是被 v90 那条"
+              "规矩挡下的（v72 老口径：点名的列表不能被收掉）",
+              [(_u69c.shown, _k69c.current_matches())],
+              expect_contain=[(True, ["numCount"])])
+
+        # ---- 69.4 对照：换了一行 -> 记忆作废 ----
+        _k69d, _u69d, _c69d, _p69d = _mk69()
+        _acc69(_k69d)
+        _p69d.SetSelection(9, 13, 9, 13)
+        _k69d.trigger(True)
+        check("69.4 ★对照（记忆不许赖着不走·换行）：确认后光标移到【另一行】的"
+              "同名文字上 —— 位置对不上，记忆当场作废，照常提示（v37 老口径）",
+              [(_u69d.shown, _k69d.current_matches(), _k69d._accepted)],
+              expect_contain=[(True, ["numCount"], None)])
+
+        # ---- 69.5 对照：换了模块 -> 记忆作废 ----
+        _k69e, _u69e, _c69e, _p69e = _mk69()
+        _acc69(_k69e)
+        # 另一个标准模块：第 5 行就写着 numCount（同名成员在它那儿也是真名字）
+        _TEXT69B = list(_TEXT69)
+        _TEXT69B[4] = "    numCount"
+        _p69e2 = _Pane69(_Comp69("M2", 1, _TEXT69B).CodeModule,
+                         (5, 13, 5, 13))
+        VB69._get_vbe_cached = lambda: _VBE69([_p69e2.CodeModule.Parent],
+                                              _p69e2)
+        _k69e.trigger(True)
+        check("69.5 ★对照（记忆不许赖着不走·换模块）：同名成员在另一个标准模块"
+              "里也是真名字 —— 模块名对不上，记忆作废，照常提示",
+              [(_u69e.shown, _k69e.current_matches(), _k69e._accepted)],
+              expect_contain=[(True, ["numCount"], None)])
+
+        # ---- 69.6 ★关键对照：用户一动过手，v37 老口径立刻恢复 ----
+        _k69f, _u69f, _c69f, _p69f = _mk69()
+        _acc69(_k69f)
+        _c69f.CodeModule.lines[4] = "    numCoun"      # 退格删掉一个字符
+        _p69f.SetSelection(5, 12, 5, 12)
+        _k69f.trigger(True)
+        _r69f1 = (_u69f.shown, _k69f.current_matches(), _k69f._accepted)
+        _c69f.CodeModule.lines[4] = "    numCount"     # 又打回来
+        _p69f.SetSelection(5, 13, 5, 13)
+        _k69f.trigger(True)
+        _r69f2 = (_u69f.shown, _k69f.current_matches())
+        check("69.6 ★关键对照：确认之后【退格一个字符】-> 词对不上，记忆当场"
+              "作废，照常提示（连退格后剩下的 numCoun 也照旧提示出真实存在的"
+              "numCount，v43/v37 的老口径）；再手打回 numCount 也照常提示 —— "
+              "这条记忆只活到\"用户动过手\"为止，不是永久屏蔽",
+              [_r69f1, _r69f2],
+              expect_contain=[(True, ["numCount"], None),
+                              (True, ["numCount"])])
+
+        # ---- 69.7 没确认过就没有记忆（不误伤）----
+        _k69g, _u69g, _c69g, _p69g = _mk69()
+        _k69g.trigger(True)
+        check("69.7 只触发、没确认 -> `_accepted` 是 None（没有待作废的记忆），"
+              "照常提示（别让这条规矩误伤正常输入）",
+              [(_k69g._accepted, _u69g.shown)],
+              expect_contain=[(None, True)])
+
+        # ---- 69.8 ★接线护栏 ----
+        _root69 = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        _engsrc69 = io.open(os.path.join(_root69, "engine.py"),
+                            encoding="utf-8").read()
+        _mainsrc69 = io.open(os.path.join(_root69, "main.py"),
+                             encoding="utf-8").read()
+        _acc69src = _engsrc69.split("    def accept(self):")[1].split(
+            "    def pick(self")[0]
+        _trgsrc69 = _engsrc69.split("def trigger(self,")[1].split(
+            "    def can_space_confirm")[0]
+        _tgate69 = _trgsrc69.split(
+            "if self._accepted is not None and not manual:")[1]
+        check("69.8 ★接线护栏：accept() 从 `_ctx_now` 取上下文（不是 self.ctx，"
+              "它没有模块名）、并把记忆写在【真正写回之前】；trigger 里那道判据"
+              "在 `not manual` 之内（手动唤出放行），且对照失败时会把记忆作废"
+              "（= 它不是一劳永逸的屏蔽）；main 的 Ctrl+Space 传 `manual=True`",
+              [[("_src = getattr(self, \"_ctx_now\", None) or self.ctx or {}"
+                 in _acc69src),
+                ("self._accepted = (str(chosen).lower()" in _acc69src),
+                (_acc69src.index("self._accepted = (str(chosen).lower()")
+                 < _acc69src.index("self.backend.apply_completion(")),
+                ("if self._accepted is not None and not manual:" in _trgsrc69),
+                ("self._accepted = None" in _tgate69),
+                ("completer.trigger(manual=True)" in _mainsrc69)]],
+              expect_contain=[[True] * 6])
+
+        # ---- 69.9 ★反坑护栏：hide() 里不许清记忆 ----
+        _hidesrc69 = _engsrc69.split("    def hide(self):")[1].split(
+            "    def maybe_hide_on_outside_click")[0]
+        check("69.9 ★反坑护栏：`hide()` 里【不许】出现 `_accepted` —— accept() "
+              "记完记忆紧接着就调 hide()，在 hide 里清等于这个功能从来没生效过"
+              "（两条判据也都在：`SUPPRESS_AFTER_ACCEPT` 那条时间静默期没被删）",
+              [[("_accepted" not in _hidesrc69),
+                ("SUPPRESS_AFTER_ACCEPT" in _acc69src),
+                ("self._suppress_until = time.time() + SUPPRESS_AFTER_ACCEPT"
+                 in _acc69src)]],
+              expect_contain=[[True, True, True]])
+
+        VB69._get_vbe_cached = _orig69
+    except Exception as _e69:
+        check("第 69 节异常: %s" % _e69, [True], expect_contain=[False])
+
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))
     if FAILURES:

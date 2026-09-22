@@ -94,6 +94,10 @@ _IDENT = re.compile(r"[^\W\d]\w*$")
 # 确认补全后的"静默期"（秒）：这段时间内忽略新的触发请求。
 # 目的：Tab 确认后，可能还有排队中的 trigger（来自刚才那次按键），
 # 若不屏蔽，弹窗会在收起后立刻又冒出来。
+#
+# ★v90：这条是【时间】判据，只兜得住"确认这一下之后紧跟着排进来的 trigger"；
+# 晚到的那种（轮询发现这次写入时已经过了静默期）得靠内容+位置判据兜 ——
+# 见 Completer._accepted 与 trigger() 里那段注释。两条判据各管一段，都在。
 SUPPRESS_AFTER_ACCEPT = 0.35
 
 
@@ -739,6 +743,10 @@ class Completer:
         self.ctx = None
         self.word_is_complete = False
         self._suppress_until = 0.0
+        # ★v90：刚由我们（Tab 确认 / 鼠标点选）写进编辑器的那个词，连同它落在
+        # 哪一行。见 trigger() 里那段"刚写进去的词不再提示自己"。
+        # 形如 (词小写, 模块名小写, 行号)；None = 没有待作废的记忆。
+        self._accepted = None
         self.shown_at = 0.0       # 最近一次真正弹出的时刻（供"刚弹出保护期"使用）
         # 当前候选各自的命中下标：{名字: [下标, ...]}，供 UI 把命中的字符标红。
         # 由 trigger() 填写、hide() 清空。UI 通过 completer 读取，不占用 show() 签名。
@@ -1202,13 +1210,18 @@ class Completer:
         except Exception:
             return None
 
-    def trigger(self, require_ident_before_caret=False):
+    def trigger(self, require_ident_before_caret=False, manual=False):
         """尝试弹出补全列表。
 
         require_ident_before_caret=True：由「编辑器内容变化」轮询触发时使用。
         此时无法从按键判断用户输的是什么，需要检查光标前一个字符——若是空格/
         标点/换行，说明不在拼标识符，应当收起弹窗（等效于按空格收起）。
         键盘事件触发路径不需要该检查，按键本身已能区分。
+
+        manual=True：用户点名要（Ctrl+Space）。v90 起它还负责放行下面那条
+        "刚由我们写进去的词不再提示自己"——那是【自动】路径该守的规矩，不该
+        把用户主动按出来的列表也拦掉（v72 的老口径：点名的列表照弹，否则就成了
+        "按了 Ctrl+Space 却没反应"，比被遮住更让人以为工具坏了）。
 
         采用轮询而不仅靠键盘事件的原因：中文经输入法(IME)输入时，键盘钩子拿
         到的往往是 VK_PROCESSKEY 或空字符（尤其 on_release），导致中文永不触发。
@@ -1330,6 +1343,41 @@ class Completer:
         if not word or not (word[0].isalpha() or word[0] == "_"):
             self.hide()
             return
+        # ★v90：刚由 Tab 写进编辑器的那个词，不再当候选提示回来（用户报的）。
+        #
+        # 用户口径（原话）："当我按下 tab 键之后，提示词打印到编辑器里，那么本次
+        # 按键的提示词，就不用匹配提示了。"
+        #
+        # 判据只有【内容 + 位置】两条：同一个模块、同一行、且光标处的词与刚确认
+        # 的那个逐字相同。三条同时成立时，"用户在拼这个词"这个前提一定是假的
+        # —— 那次插入就是我们干的。而任何人为编辑（多一个字符、少一个字符、
+        # 换行、换模块）都会让对照失败，所以这条记忆既不需要计时器，也不会赖着
+        # 不走：对照一失败就当场作废（见下面那行 self._accepted = None）。
+        #
+        # 对照失败就作废这一步是关键，它保证这不是"永久屏蔽这个名字"：确认之后
+        # 只要你动过手（哪怕只是退格删掉一个字符再打回来），v37 的老口径
+        # （打全名照样提示）立刻恢复。
+        #
+        # 为什么要在 accept() 的时间静默期（SUPPRESS_AFTER_ACCEPT）之外再判一次：
+        # 那是【时间】判据，兜的是"确认这一下之后紧跟着排进来的 trigger"；只要
+        # 轮询发现这次写入比静默期晚一拍（主线程正在做全量重解析时很常见），它
+        # 就拦不住了，而此刻光标处那个词是真实存在的（我们刚写进去的），会被
+        # v37 的"打全名照样提示"留下来 -> 用户看到刚写进去的词又被提示一遍。
+        if self._accepted is not None and not manual:
+            _aw, _am, _al = self._accepted
+            try:
+                _same = (word.lower() == _aw
+                         and str(ctx.get("module_name") or "").lower() == _am
+                         and int(ctx.get("line_no") or 0) == _al)
+            except Exception:
+                _same = False
+            if _same:
+                _log("trigger: 光标处 %r 是刚由 Tab 写进去的 -> 不提示自己"
+                     % word)
+                self.hide()
+                return
+            # 词 / 行 / 模块对不上 -> 用户已经动过手，这条记忆作废
+            self._accepted = None
         # 只保留当前作用域可见的标识符（屏蔽其他过程局部变量 + 其他模块 Private）
         visible_ids = filter_identifiers_by_scope(
             self.backend.get_identifiers(),
@@ -1704,6 +1752,30 @@ class Completer:
             return
         chosen = self.matches[self.selected % len(self.matches)]
         ctx = self.ctx
+        # ★v90：记住"这个词是我们替你写进去的、写在哪一行"。
+        #
+        # 用户口径（原话）："当我按下 tab 键之后，提示词打印到编辑器里，那么本次
+        # 按键的提示词，就不用匹配提示了。" 只靠下面那个 0.35s 静默期是靠不住的
+        # —— 那是【时间】判据：轮询发现这次写入、并把它排进动作队列，只要比静默期
+        # 晚一拍（主线程正忙在一次全量重解析上时很常见），trigger 就会照常跑到底，
+        # 而此刻光标处那个词偏偏是"在工程里真实存在"的（就是我们刚写进去的），
+        # v37 的"打全名照样提示"会把它留下 -> 用户看到刚写进去的词又被提示一遍。
+        #
+        # 这里记的是【内容 + 位置】，与计时无关：只有同一模块、同一行、且光标处
+        # 那个词与刚确认的逐字相同，才认作"留给自己的回声"（见 trigger）。
+        # 用户一旦动过手（多一个字符、少一个字符、换行、换模块），对照当场失败、
+        # 记忆立刻作废 —— 所以它不会赖着不走，也不会永久屏蔽这个名字。
+        #
+        # ⚠️ 上下文从 `_ctx_now` 取（v87 立的规矩）：`trigger` 在开头就把这一次的
+        # 完整上下文挂在那里；`self.ctx` 是引擎自己那份精简快照，**没有模块名**
+        # （只有行号 / 光标列 / 词范围），拿它记位置会让"换模块"这条对照永远失效。
+        _src = getattr(self, "_ctx_now", None) or self.ctx or {}
+        try:
+            self._accepted = (str(chosen).lower(),
+                              str(_src.get("module_name") or "").lower(),
+                              int(_src.get("line_no") or 0))
+        except Exception:
+            self._accepted = None
         try:
             end_col = ctx.get("word_end_col") or ctx.get("caret_col")
             self.backend.apply_completion(
