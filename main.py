@@ -705,6 +705,22 @@ def main():
         state["popup_manual"] = False
         completer.trigger(True)
 
+    def _vbe_list_showing_now():
+        """上一轮轮询采到的 VBE 提示窗签名里，有没有【成员列表】（v90b）。
+
+        刻意只读 state["_popup_sig"] 这份本地缓存：win32_filter 跑在键盘钩子
+        线程里，那里绝不能碰 COM，也要尽量少做 Win32 调用（每次按键都会走）。
+        这份签名由 poll_editor 每轮（100ms）无条件采样，而用户停在 VBE 的成员
+        列表上挑项的时间远长于一个轮询周期，所以按下那一刻它一定是最新的。
+        """
+        try:
+            for _cls, _l, _t, _r, _b in (state.get("_popup_sig") or ()):
+                if _cls in vbe_bridge.VBE_YIELD_CLASSES:
+                    return True
+        except Exception:
+            pass
+        return False
+
     def post_trigger():
         """把"内容变了，重整候选"排进主线程队列，并做【合并】。
 
@@ -989,6 +1005,35 @@ def main():
                     elif vk in CONFIRM_VKS:
                         action = (completer.accept, ())
                         suppress = True
+                elif (vk == VK_TAB
+                        and not _mod_down()
+                        and not _shift_down()
+                        and com_backoff_remaining() <= 0
+                        and in_vbe_code_area()
+                        and _vbe_list_showing_now()):
+                    # ★v90b（用户报的）：这一下 Tab 是压给【VBE 自己的成员列表】
+                    # 的 —— 我们的弹窗早就让位隐藏了（VBE 的列表画在屏幕上时我们
+                    # 一律让位），所以上面那条 `completer.is_visible()` 的
+                    # CONFIRM_VKS 分支根本轮不到，accept() 从没被调用。
+                    #
+                    # 麻烦在于我们看不见 VBE 插了什么词：等这一行变了被轮询发现而
+                    # 触发时，光标处那个词已经是"在工程里真实存在的"（就是 VBE
+                    # 刚写进去的，比如 `类1`），v37 的"打全名照样提示"就把它弹了
+                    # 出来。用户口径（原话）："按 tab 键，就意味着本次录入完成，
+                    # 不需要去匹配提示词。"
+                    #
+                    # 这里只做一件事：记下【按下前】那一刻的位置快照（吃
+                    # state["cur_ctx"] —— 钩子线程不能碰 COM，理由同
+                    # _enter_indent_key_ok）。刻意**不带光标列**：cur_ctx 里那一
+                    # 列是 VBE 的显示列，而触发时的 ctx["caret_col"] 是字符列，
+                    # 混着比中文名字会对不上（engine.note_accept_key 有详注）。
+                    # 真正的判据在 engine.trigger 里：这一行只被插入了一段、
+                    # 其余逐字未动，才认作那次录入。
+                    # 刻意【不】吞键：这一下 Tab 照旧交给 VBE 去插入。
+                    _snap = state.get("cur_ctx")
+                    if _snap and len(_snap) >= 3:
+                        post(completer.note_accept_key,
+                             (time.time(), _snap[1], _snap[2]))
                 if suppress:
                     state["swallowed"].add(vk)
 

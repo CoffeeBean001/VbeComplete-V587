@@ -100,6 +100,15 @@ _IDENT = re.compile(r"[^\W\d]\w*$")
 # 见 Completer._accepted 与 trigger() 里那段注释。两条判据各管一段，都在。
 SUPPRESS_AFTER_ACCEPT = 0.35
 
+# ★v90b：确认键压在【VBE 自己的成员列表】上时的记忆有效期（秒）。
+#
+# 与上面那条不是一回事：上面管"我们自己确认的"，这条管"VBE 确认的"（见
+# Completer.note_accept_key）—— 那种情形我们只看得见"按了确认键"，看不见
+# VBE 插了什么词，所以只能靠【按下前的位置快照 + 这一行只被插入了一段】
+# 来认。TTL 只负责兜"陈旧快照"（COM 退避时 cur_ctx 会停更），不是主判据 ——
+# 主判据是内容（那一行除了插入段之外逐字未动）。
+ACCEPT_KEY_TTL = 1.5
+
 
 def extract_word_before(line_text, caret_col):
     """返回 (word, start_col)，均为 1-based；无则返回 (None, None)。
@@ -747,6 +756,15 @@ class Completer:
         # 哪一行。见 trigger() 里那段"刚写进去的词不再提示自己"。
         # 形如 (词小写, 模块名小写, 行号)；None = 没有待作废的记忆。
         self._accepted = None
+        # ★v90b：用户在【VBE 自己的成员列表】上按了确认键（Tab / 回车）时，
+        # 记下"按下前"那一刻的光标快照 —— 形如 (时刻, 行号, 行文本, 光标列)。
+        #
+        # 为什么需要它：那一下按键是 VBE 处理的（我们的弹窗早让位了），我们
+        # 看不见它插了什么词；等文本变化被轮询发现时，光标处那个词已经是
+        # "在工程里真实存在的"（就是 VBE 刚插进去的），于是又弹出来一遍 ——
+        # 用户报的"选中 类1 之后按 Tab，我们还会提示 类1"。
+        # 判据见 trigger()：这一行【只被插入了一段、其余逐字未动】才认。
+        self._accept_key = None
         self.shown_at = 0.0       # 最近一次真正弹出的时刻（供"刚弹出保护期"使用）
         # 当前候选各自的命中下标：{名字: [下标, ...]}，供 UI 把命中的字符标红。
         # 由 trigger() 填写、hide() 清空。UI 通过 completer 读取，不占用 show() 签名。
@@ -1343,6 +1361,58 @@ class Completer:
         if not word or not (word[0].isalpha() or word[0] == "_"):
             self.hide()
             return
+        # ★v90b（用户报的）：确认键压在【VBE 自己的成员列表】上时留下的快照。
+        #
+        # 用户口径（原话）："我选中 类1 之后，按 tab 键，我们项目还会提示 类1
+        # …… 按 tab 键，就意味着本次录入完成，不需要去匹配提示词。"
+        #
+        # 与上面那条 v90 的分工：v90 管【我们替用户写进去的】词（我们知道自己
+        # 插了什么，所以能用"词 + 模块 + 行号"对照）；这条管【VBE 替用户写进去
+        # 的】词 —— 那一下按键是 VBE 处理的，我们看不见它插了什么，只剩一个
+        # "按下前"的光标快照可用。
+        #
+        # 判据（只用【文本】—— 见下面对列口径的说明）：
+        #   * 同一行（行号一致）；
+        #   * 这一行【变长了】；
+        #   * 旧行文本恰好等于"新行文本的公共前缀 + 公共后缀"（`_p + _s >= len`）
+        #     ⇒ 这一行除了被插入了一段之外，一个字都没动。
+        # 三条一起成立 ⇒ 那一段就是 VBE 刚替用户补进来的词，v37 的"打全名照样
+        # 提示"在这儿必须让路。用户只要动过手（退格、换行、在别处编辑）对照就
+        # 失败 —— 与 v90 一样，这不是永久屏蔽，只活一次。
+        #
+        # ⚠️ 刻意**不用光标列**做判据：state["cur_ctx"] 里那一列是 VBE 的【显示
+        # 列】（backend.snapshot() 不做列语义探测，全角占 2 格），而这里
+        # ctx["caret_col"] 是【字符列】—— 两个口径混着比，中文名字（用户报的
+        # `类1`）必然对不上。用"只插入了一段"这条纯文本判据就没这问题。
+        #
+        # TTL（ACCEPT_KEY_TTL）只兜"陈旧快照"：COM 退避时 cur_ctx 会停更，
+        # 那时拿一份很旧的快照去比，可能把用户后来的正常输入误认成那次录入。
+        if self._accept_key is not None and not manual:
+            _ak = self._accept_key
+            self._accept_key = None       # 只活一次：无论成立与否都消费掉
+            _hit = False
+            try:
+                _ak_ts, _ak_ln, _ak_txt = _ak
+                _now_txt = str(ctx.get("line_text") or "")
+                _p = 0
+                while (_p < len(_ak_txt) and _p < len(_now_txt)
+                       and _ak_txt[_p] == _now_txt[_p]):
+                    _p += 1
+                _s = 0
+                while (_s < len(_ak_txt) - _p and _s < len(_now_txt) - _p
+                       and _ak_txt[-1 - _s] == _now_txt[-1 - _s]):
+                    _s += 1
+                _hit = ((time.time() - _ak_ts) <= ACCEPT_KEY_TTL
+                        and int(ctx.get("line_no") or 0) == _ak_ln
+                        and len(_now_txt) > len(_ak_txt)
+                        and _p + _s >= len(_ak_txt))
+            except Exception:
+                _hit = False
+            if _hit:
+                _log("trigger: 这一行刚被确认键补进一段 -> 本次录入已完成，"
+                     "不提示自己（%r）" % (str(ctx.get("line_text") or "")[-40:],))
+                self.hide()
+                return
         # ★v90：刚由 Tab 写进编辑器的那个词，不再当候选提示回来（用户报的）。
         #
         # 用户口径（原话）："当我按下 tab 键之后，提示词打印到编辑器里，那么本次
@@ -1746,6 +1816,34 @@ class Completer:
         # 首项按上键绕到末项时直接滚到底部。
         self._scroll_to_selected()
         self.ui.update_selection(self.selected)
+
+    def note_accept_key(self, snapshot):
+        """记下"确认键压在【VBE 自己的成员列表】上"时的那一刻光标快照。
+
+        ★v90b（用户报的）：用户口径是"**按完 Tab 键就意味着本次录入完成**，
+        不要再匹配提示"。麻烦在于这一下 Tab 是**喂给 VBE 自己的成员列表**的
+        —— 我们的弹窗早已让位隐藏（VBE 列表画在屏幕上时我们一律让位），
+        所以 accept() 根本没被调用，v90 那条"内容 + 位置"的记忆压根没写下。
+        随后 poll_editor 看到这一行变了 -> trigger，而光标处那个词正是 VBE
+        刚插进去的"真名字"，v37 的"打全名照样提示"就把它弹了出来。
+
+        参数 snapshot = (按下时刻, 行号, 行文本)，由 main.py 的键盘钩子线程给出
+        （按下时刻 + state["cur_ctx"]）—— 钩子线程绝不能碰 COM，"按下前"那一眼
+        只能吃这份本地快照（与 v79 的 _enter_indent_key_ok 同源：都只吃快照）。
+
+        ⚠️ 刻意**不带光标列**：state["cur_ctx"] 里那一列来自 backend.snapshot()，
+        是 VBE 的【显示列】（全角占 2 格，它不做列语义探测）；而触发时
+        ctx["caret_col"] 是【字符列】。两个口径混着比，中文名字（用户报的
+        `类1`）就必然对不上 —— 判据因此只用【文本】：这一行是不是只被插入了
+        一段、其余逐字未动（见 trigger）。
+
+        这里**不判**"该不该静默"，只负责把快照存下来；判据在 trigger() 里。
+        """
+        try:
+            _ts, _ln, _txt = snapshot
+            self._accept_key = (float(_ts), int(_ln), str(_txt))
+        except Exception:
+            self._accept_key = None
 
     def accept(self):
         if not self.visible or not self.matches:

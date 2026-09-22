@@ -11068,6 +11068,271 @@ def main():
     except Exception as _e69:
         check("第 69 节异常: %s" % _e69, [True], expect_contain=[False])
 
+    # ===== 70. v90b：确认键压在 VBE 的成员列表上，那一次录入就算完成 =====
+    # 用户报的（原话）："我定义了一个类模块叫 类1，当我输入 Set s1 = New，再按
+    # 空格，vbe 会弹提示列表，我选中 类1 之后，按 tab 键，我们项目还会提示 类1。
+    # …… 按 tab 键，就意味着本次录入完成，不需要去匹配提示词。"
+    #
+    # 与第 69 节（v90）的分工 —— 两条判据管的是【两个不同的写入者】：
+    #   * v90 管【我们替用户写进去的】词：accept() 知道自己写了什么，用
+    #     (词, 模块, 行号) 三条对照；
+    #   * v90b 管【VBE 替用户写进去的】词：那一记 Tab 是喂给 VBE 自己的成员
+    #     列表的 —— 我们的窗早就让位隐藏了（VBE 列表画在屏幕上时我们一律
+    #     让位），所以 accept() 压根没被调用、v90 的记忆从没写下。我们只看得见
+    #     "按了确认键"，看不见 VBE 插了什么，于是只能靠【按下前的行文本 + 这一行
+    #     只被插入了一段（其余逐字未动）】来认。
+    #
+    # ⚠️ 判据刻意【不用光标列】：state["cur_ctx"] 里那一列来自
+    #    backend.snapshot()，是 VBE 的【显示列】（全角占 2 格）；而 trigger 里
+    #    ctx["caret_col"] 是【字符列】。两个口径混着比，用户场景的中文类名
+    #    `类1` 必然对不上 —— 这正是本案差点踩进去的坑，70.8 有护栏钉它。
+    print("\n=== 70. v90b：确认键压在 VBE 成员列表上时，那一次录入算完成 ===")
+    try:
+        import engine as E70
+        import vbe_bridge as VB70
+
+        class _UI70(object):
+            def __init__(self):
+                self.shown = False
+
+            def show(self, *a, **k):
+                self.shown = True
+
+            def hide(self, *a, **k):
+                self.shown = False
+
+            def update_selection(self, *a, **k):
+                pass
+
+            def contains_point(self, *a, **k):
+                return False
+
+        class _CM70(object):
+            def __init__(self, comp, text):
+                self._comp = comp
+                self.lines = list(text)
+
+            @property
+            def Name(self):
+                return self._comp.Name
+
+            @property
+            def Parent(self):
+                return self._comp
+
+            @property
+            def CountOfLines(self):
+                return len(self.lines)
+
+            def Lines(self, start, count):
+                s0 = max(0, int(start) - 1)
+                return "\r\n".join(self.lines[s0:s0 + int(count)])
+
+            def ReplaceLine(self, n, text):
+                self.lines[int(n) - 1] = str(text).rstrip("\r\n")
+
+        class _Comp70(object):
+            def __init__(self, name, ctype, text):
+                self.Name = name
+                self.Type = ctype
+                self.CodeModule = _CM70(self, text)
+
+        class _Proj70(object):
+            def __init__(self, comps):
+                self.Name = "VBAProject"
+                self.VBComponents = list(comps)
+
+        class _Pane70(object):
+            def __init__(self, cm, sel):
+                self.CodeModule = cm
+                self.sel = sel
+
+            def GetSelection(self):
+                return self.sel
+
+            def SetSelection(self, sl, sc, el, ec):
+                self.sel = (sl, sc, el, ec)
+
+        class _VBE70(object):
+            def __init__(self, comps, pane):
+                self.ActiveVBProject = _Proj70(comps)
+                self.ActiveCodePane = pane
+
+        _orig70 = VB70._get_vbe_cached
+
+        _BEFORE70 = "    Set s1 = New "          # 按下 Tab 之前那一行（17 字符）
+        _AFTER70 = "    Set s1 = New Cls1"       # VBE 把 Cls1 写了进来
+
+        def _wire70(line_text, line=3, col=None, cls_name="Cls1",
+                    with_cls=True):
+            _c70 = _Comp70("M1", 1,
+                           ["Sub Work()",
+                            "    Dim s1 As Object",
+                            line_text,
+                            "End Sub"])
+            _comps70 = [_c70]
+            if with_cls:
+                _comps70.append(_Comp70(cls_name, 2, ["Public x As Long"]))
+            _n70 = int(col if col is not None else len(line_text))
+            _p70 = _Pane70(_c70.CodeModule, (line, _n70, line, _n70))
+            VB70._get_vbe_cached = lambda: _VBE70(_comps70, _p70)
+            return _c70, _p70
+
+        def _mk70(line_text, **kw):
+            _c70, _p70 = _wire70(line_text, **kw)
+            _ui70 = _UI70()
+            _k70 = E70.Completer(VB70.VbeBackend(), _ui70)
+            return _k70, _ui70, _c70, _p70
+
+        def _note70(k, ts=0.0, line=3, text=_BEFORE70):
+            """模拟"按下确认键那一刻"：main 的钩子线程把快照交给 engine。"""
+            k.note_accept_key((time.time() + ts, line, text))
+
+        # ---- 70.1 ★核心（用户报的那一下）----
+        _k70, _u70, _c70, _p70 = _mk70(_AFTER70)
+        _note70(_k70)
+        _k70.trigger(False)
+        check("70.1 ★核心（用户报的）：Tab 压在【VBE 自己的成员列表】上确认"
+              "（我们的窗早已让位隐藏、accept 从没被调用），VBE 把 `Cls1` 写了"
+              "进来 —— 轮询发现这一行变了之后，不该把它提示回来",
+              [(_u70.shown, _k70.current_matches())],
+              expect_contain=[(False, [])])
+
+        # ---- 70.2 ★对照：同一条行、同一个光标，只是【没有】这条记忆 ----
+        _k70b, _u70b, _c70b, _p70b = _mk70(_AFTER70)
+        _k70b.trigger(False)
+        check("70.2 ★对照：换一个人（没按过确认键）在同一处触发 -> 照常提示。"
+              "证明 70.1 挡的是\"刚确认的那一次录入\"，不是候选里压根没有它",
+              [(_u70b.shown, _k70b.current_matches())],
+              expect_contain=[(True, ["Cls1"])])
+
+        # ---- 70.3 ★用户原场景：中文类名（全角显示列）----
+        _k70c, _u70c, _c70c, _p70c = _mk70("    Set s1 = New 类1", col=21,
+                                           cls_name=u"类1")
+        _note70(_k70c)
+        _k70c.trigger(False)
+        _r70c = (_u70c.shown, _k70c.current_matches())
+        _k70d, _u70d, _c70d, _p70d = _mk70("    Set s1 = New 类1", col=21,
+                                           cls_name=u"类1")
+        _k70d.trigger(False)
+        check("70.3 ★用户原场景（中文类名 `类1`，光标给的是全角显示列 21）："
+              "①有确认键记忆 -> 不提示；②同样一处、没有记忆 -> 照常提示。"
+              "判据只用文本、不碰列 —— 显示列/字符列混用在这儿必然对不上",
+              [_r70c, (_u70d.shown, _k70d.current_matches())],
+              expect_contain=[(False, []), (True, [u"类1"])])
+
+        # ---- 70.4 只活一次 ----
+        _k70e, _u70e, _c70e, _p70e = _mk70(_AFTER70)
+        _note70(_k70e)
+        _k70e.trigger(False)
+        _r70e1 = (_k70e._accept_key, _u70e.shown)
+        _k70e.trigger(False)
+        check("70.4 这条记忆【只活一次】：命中那一刻就被消费掉（用户接着正常"
+              "输入时照常提示）—— 与 v90 一样，它不是永久屏蔽",
+              [_r70e1, (_k70e._accept_key, _u70e.shown)],
+              expect_contain=[(None, False), (None, True)])
+
+        # ---- 70.5 ★对照（记忆不许赖着不走）：陈旧 / 换行 ----
+        _k70f, _u70f, _c70f, _p70f = _mk70(_AFTER70)
+        _note70(_k70f, ts=-3.0)
+        _k70f.trigger(False)
+        _r70f = (_u70f.shown, _k70f.current_matches())
+        _k70g, _u70g, _c70g, _p70g = _mk70(_AFTER70)
+        _note70(_k70g, line=9)
+        _k70g.trigger(False)
+        check("70.5 ★对照（记忆不许赖着不走）：①快照已陈旧（TTL 过期 —— "
+              "COM 退避时 cur_ctx 会停更）-> 照常提示；②行号对不上（用户换行"
+              "了）-> 照常提示",
+              [_r70f, (_u70g.shown, _k70g.current_matches())],
+              expect_contain=[(True, ["Cls1"]), (True, ["Cls1"])])
+
+        # ---- 70.6 ★对照（用户一动过手，v37 老口径立刻恢复）----
+        # 按【真实时序】摆：Tab 插入那一行变化总会先被轮询发现、触发一次
+        # （记忆在那一次就消费掉了），用户再退格走的是第二次 trigger。
+        _k70h, _u70h, _c70h, _p70h = _mk70(_AFTER70)
+        _note70(_k70h)
+        _k70h.trigger(False)
+        _r70h1 = _u70h.shown
+        _p70h.CodeModule.lines[2] = "    Set s1 = New Cl"    # 退格删一个字符
+        _p70h.SetSelection(3, 19, 3, 19)
+        _k70h.trigger(False)
+        _r70h2 = (_u70h.shown, _k70h.current_matches())
+        _k70i, _u70i, _c70i, _p70i = _mk70("    Set s1 = New Cls")
+        _note70(_k70i, text=_AFTER70)   # 快照里的旧文本更长 -> 这一行是变短的
+        _k70i.trigger(False)
+        check("70.6 ★对照（用户一动过手，老口径立刻恢复）：①真实时序的第 1 次"
+              "（Tab 那次）不提示；②用户退格后第 2 次 -> 照常提示（连退格后"
+              "剩下的 `Cl` 也照旧提示出真实存在的 `Cls1`）；③这一行比快照"
+              "【变短】了（旧文本被动过，不是\"只插入一段\"）-> 照常提示",
+              [_r70h1, _r70h2, (_u70i.shown, _k70i.current_matches())],
+              expect_contain=[False, (True, ["Cls1"]), (True, ["Cls1"])])
+
+        # ---- 70.7 manual=True 放行 ----
+        _k70j, _u70j, _c70j, _p70j = _mk70(_AFTER70)
+        _note70(_k70j)
+        _k70j.trigger(False, manual=True)
+        check("70.7 ★对照：`manual=True`（Ctrl+Space 点名要的列表）放行 —— "
+              "v72 老口径：点名的列表不能被这条规矩收掉",
+              [(_u70j.shown, _k70j.current_matches())],
+              expect_contain=[(True, ["Cls1"])])
+
+        # ---- 70.8 ★接线护栏 ----
+        _root70 = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        _mainsrc70 = io.open(os.path.join(_root70, "main.py"),
+                             encoding="utf-8").read()
+        _engsrc70 = io.open(os.path.join(_root70, "engine.py"),
+                            encoding="utf-8").read()
+        _helper70 = _mainsrc70.split("def _vbe_list_showing_now():")[1].split(
+            "    def post_trigger():")[0]
+        _branch70 = _mainsrc70.split("elif (vk == VK_TAB")[1].split(
+            "if suppress:")[0]
+        _note70src = _engsrc70.split(
+            "    def note_accept_key(self, snapshot):")[1].split(
+            "    def accept(self):")[0]
+        _trg70 = _engsrc70.split("def trigger(self,")[1].split(
+            "    def can_space_confirm")[0]
+        _key70 = _trg70.split(
+            "if self._accept_key is not None and not manual:")[1]
+        check("70.8 ★接线护栏：①钩子线程里只读 state[\"_popup_sig\"] 那份本地"
+              "缓存判\"VBE 的成员列表在不在屏幕上\"（绝不碰 COM）；②那一支排在"
+              "`completer.is_visible()` 之后（我们的窗可见时走 accept，不重复"
+              "记账）；③刻意【不吞键】—— 分支里没有 suppress = True，这一下 "
+              "Tab 照旧交给 VBE 去插入；④交给 engine 的是 (时刻, 行号, 行文本)，"
+              "【不带光标列】；⑤engine 那条判据在 `not manual` 之内、命中即 "
+              "hide + return，且排在 v90 那条【之前】",
+              [[("state.get(\"_popup_sig\")" in _helper70),
+                ("VBE_YIELD_CLASSES" in _helper70),
+                ("get_context" not in _helper70),
+                ("backend" not in _helper70),
+                ("post(completer.note_accept_key" in _branch70),
+                ("_snap[1], _snap[2]" in _branch70),
+                ("_snap[3]" not in _branch70),
+                ("suppress = True" not in _branch70),
+                (_mainsrc70.index("elif completer.is_visible():")
+                 < _mainsrc70.index("elif (vk == VK_TAB")),
+                ("_ts, _ln, _txt = snapshot" in _note70src),
+                ("_ts, _ln, _txt, _col" not in _note70src),
+                ("if self._accept_key is not None and not manual:" in _trg70),
+                (_trg70.index("if self._accept_key is not None")
+                 < _trg70.index(
+                     "if self._accepted is not None and not manual:")),
+                ("self.hide()" in _key70)]],
+              expect_contain=[[True] * 14])
+
+        # ---- 70.9 ★反坑护栏：hide() 里不许清这条记忆 ----
+        _hide70 = _engsrc70.split("    def hide(self):")[1].split(
+            "    def maybe_hide_on_outside_click")[0]
+        check("70.9 ★反坑护栏：`hide()` 里【不许】出现 `_accept_key`（也不许"
+              "出现 v90 的 `_accepted`）—— 命中那一刻的处理正是 hide() + "
+              "return，在 hide 里清等于这条判据从来没生效过",
+              [[("_accept_key" not in _hide70),
+                ("_accepted" not in _hide70)]],
+              expect_contain=[[True, True]])
+
+        VB70._get_vbe_cached = _orig70
+    except Exception as _e70:
+        check("第 70 节异常: %s" % _e70, [True], expect_contain=[False])
+
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))
     if FAILURES:
