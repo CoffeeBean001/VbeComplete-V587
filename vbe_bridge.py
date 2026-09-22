@@ -293,24 +293,75 @@ def _leading_ws(line_text):
     return m.group(0) if m else ""
 
 
-def _indent_end_col(indent):
+def _resolve_sem_info(cm, cp, line_no):
+    """取当前编辑器的列语义三元组 (sem, tabw, wide2)；拿不到返回 None。
+
+    ★v93：`_indent_end_col` 在缩进含 Tab 时【必须】有语义信息才敢算显示列。
+    缓存（_sem_cache）可能还是空的 —— 它只由 _probe_semantics 写入，而那条路
+    要"行内含 Tab / 全角且 ec 超过 len+1"才走到，新建一行这种场景可能一次都
+    没触发过。这里按 _caret_char_col 的同一套顺序补一次：缓存 -> 被动探测 ->
+    主动探测（_probe_semantics 自己会还原光标并校验）。任何异常都吞成 None，
+    调用方退回"按显示列 + 默认 tab 宽度"的兜底 —— 绝不因为探测失败就写错列。
+    """
+    info = _sem_cache.get("info")
+    if info:
+        return info
+    try:
+        line_text = cm.Lines(int(line_no), 1)
+    except Exception:
+        return None
+    try:
+        _sl, _sc, _el, ec = cp.GetSelection()
+        ec = int(ec)
+    except Exception:
+        ec = 0
+    try:
+        info = _detect_semantics_passive(line_text, ec)
+        if info is None:
+            info = _probe_semantics(cm, cp, int(line_no), line_text)
+    except Exception:
+        return None
+    return info
+
+
+def _indent_end_col(indent, sem_info=None):
     """缩进【之后】那一列（1-based）——新行光标要停在这里。
 
     缩进只由空格与 Tab 组成、不含全角字符，因此：
       * 编辑器按【字符列】计时 col = len(indent) + 1；
       * 编辑器按【显示列】计时，Tab 要展开到下一个 tab stop。
-    列语义是编辑器级属性（与 apply_completion 共用 _sem_cache）；拿不到缓存时
-    按字符列算 —— 缩进全是空格（最常见）时两种算法结果一致。
+    列语义是编辑器级属性（与 apply_completion 共用 _sem_cache）。
+
+    ★v93：缩进里【含 Tab】时必须用显示列算。原先的实现是"缓存里没有语义
+    信息就一律按字符列算"，而缩进全是【Tab】的工程恰恰最容易踩：
+
+      * `_sem_cache["info"]` 只在 `_probe_semantics` 里写入，而那条路要
+        "行内含 Tab / 全角且 ec 超过 len+1"才会走到 —— 新行是**编辑器自己
+        刚插出来的**，本次会话可能一次都没触发过探测，缓存还是 None；
+      * 于是 `\t` 缩进被算成 `len("\t")+1 = 2`，而显示列语义下正确值是
+        5（Tab 展开到第 5 列）—— `SetSelection` 把光标落在 Tab 中间，
+        用户接着打字就"歪了一格"。只在 Tab 缩进的工程、且本次会话还没
+        碰过任何含 Tab / 中文的行时才复现，正是那种"偶尔"的口径。
+
+    修法：含 Tab 却拿不到缓存时，**就地补一次探测**（调用方把 cm / cp /
+    行位置通过 sem_info 传进来，或允许本函数直接读进程级缓存）。仍然拿不到
+    就按显示列 + 默认 tab 宽度 4 算 —— 这是"最可能正确"的兜底，比按字符列
+    算更贴近 VBE 实际行为（Tab 缩进 + 字符列语义的组合在真实 VBE 上不存在）。
     """
-    info = _sem_cache.get("info")
+    if "\t" not in indent:
+        # 全部是空格：两种语义结果完全相同，无需语义信息（最常见的一档）。
+        return len(indent) + 1
+    info = sem_info if sem_info else _sem_cache.get("info")
     if info:
         try:
             sem, tabw, wide2 = info
             if sem == "disp":
                 return _disp_width(indent, tabw, wide2) + 1
+            return len(indent) + 1
         except Exception:
             pass
-    return len(indent) + 1
+    # 含 Tab 又没有语义信息：按显示列 + 默认 tab 宽度兜底（见 docstring）。
+    return _disp_width(indent, 4, False) + 1
 
 
 # ---- 回车后的自动缩进（v79） ----
@@ -926,17 +977,51 @@ def _indent_unit_for(lines):
     return "    "
 
 
+def _eol_disp_col(line_text, tabw=4):
+    """行尾光标应该报告的【显示列】（1-based）。
+
+    与 VBE 的列语义一致：全角字符占 2 格，Tab 展开到下一个 tab stop。
+    纯函数，不碰 COM —— 供 enter_indent_wanted 在钩子线程里用。
+    """
+    col = 1
+    for ch in line_text:
+        if ch == "\t":
+            col += tabw - (col - 1) % tabw
+        elif _is_wide(ch):
+            col += 2
+        else:
+            col += 1
+    return col
+
+
 def enter_indent_wanted(line_text, caret_ec):
     """钩子线程用的纯判据：这一下回车值不值得由我们接管（v79）。
 
     只有两种情形才接管，其余一律放行给 VBE 原生回车：
       * 整行注释（要忽略它、跟上方第一个非注释行对齐）；
       * 块结构开头（新行要深一级）。
-    另有四条保守门槛（拿不准就不抢回车）：
+    另有五条保守门槛（拿不准就不抢回车）：
       * 空行 / 只有空白：交给 VBE（它本来就继承上一行的缩进）；
       * 行内有 Tab：列语义算不准，不拿"光标是否在行尾"去赌；
       * 光标不在行尾：那是"拆行"，必须让 VBE 原生处理；
-      * caret_ec 拿不到（0）：不接管。
+      * caret_ec 拿不到（0）：不接管；
+      * ★v93 行内含【全角字符】：caret_ec 是 VBE 的【显示列】，全角占 2 格，
+        直接拿它和 len(t)（字符数）比会算错 —— 见下面的详细说明。
+
+    ★v93 修的是"中文行上误吞回车"：原判据是 `int(caret_ec) < len(t) -> 放行`，
+    也就是"显示列 ≥ 字符数"就当光标在行尾。纯 ASCII 行两者相等、没问题；
+    可中文行里全角让显示列【虚高】，行中间的光标也能满足这个条件，于是本该
+    由 VBE 原生处理的【拆行】被我们接管，用户看到"回车没拆行 / 多出一行"。
+
+    实测（_probe_v93n2）：`    For 每个元素 = 1 To 10`（22 字符、行尾列 23）
+    光标停在字符列 18 时显示列是 22 ≥ 22 → 旧判据误判"在行尾"并接管。
+
+    修法刻意**不用**"显示列 -> 字符列"的完整换算（那需要 tabw / wide2 的
+    列语义探测，而钩子线程不许碰 COM）：改成拿 eol 的【显示列】当靶子，
+    要求两边完全相等。行内含全角时"恰好等于行尾显示列"的位置是唯一的
+    （每个字符的显示宽度都 ≥ 1，列值单调递增），不会误判；
+    而"行尾"这个语义正是我们唯一要认的位置。判据仍然全是纯文本，
+    在钩子线程里可安全执行。
     """
     t = line_text or ""
     if not t.strip():
@@ -944,9 +1029,17 @@ def enter_indent_wanted(line_text, caret_ec):
     if "\t" in t:
         return False
     try:
-        if int(caret_ec or 0) < len(t):
-            return False
+        ec = int(caret_ec or 0)
     except Exception:
+        return False
+    if ec <= 0:
+        return False
+    if any(_is_wide(c) for c in t):
+        # 含全角：只认"显示列恰好等于行尾显示列"
+        if ec != _eol_disp_col(t):
+            return False
+    elif ec < len(t):
+        # 纯 ASCII（无 Tab）：显示列 == 字符列，直接比
         return False
     return bool(_is_comment_only(t) or opens_block(t))
 
@@ -3667,7 +3760,7 @@ class VbeBackend:
                 # 收尾插在"新起的空行"下面：块头下面留出缩进好了的一行给用户写
                 # 内容，收尾再往下、缩进回到块头同级。原有行整体再下移一行。
                 cm.InsertLines(anchor + 2, closer_text)
-            col = _indent_end_col(indent)
+            col = _indent_end_col(indent, _resolve_sem_info(cm, cp, anchor + 1))
             cp.SetSelection(anchor + 1, col, anchor + 1, col)
             return True
         except Exception:

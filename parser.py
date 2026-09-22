@@ -113,31 +113,73 @@ def _is_private(kind, has_priv_kw, has_pub_kw, is_std_module):
     return False      # member/local：priv 字段无意义，调用处另定
 
 
-def _mask_strings_and_comments(code):
-    """把字符串字面量和注释替换为等长的空格，避免误匹配。"""
-    out = []
-    i, n = 0, len(code)
+def scan_code_states(code):
+    """逐字符标注：每个下标处的字符是否落在【字符串 / 注释】里。
+
+    返回一个与 `code` **等长**的 bool 列表（True = 该下标在字符串或注释里）。
+
+    ★v93：这是这套扫描规则的【唯一实现】—— `_mask_strings_and_comments`
+    （要一份抹白后的文本去跑正则）与 `engine._in_comment_or_string`（要问
+    "光标左边那个字符在不在字符串/注释里"）都从它派生。
+
+    为什么必须抽出来：`_mask_strings_and_comments` 的产物是**逐 token 一格**
+    的空格（一整个字符串 / 一整行注释都只落一个空格），**不是逐字符**等长，
+    因此调用方【不能】拿它的下标去对应原文的下标。engine 那边一开始就是这么
+    误用的（`masked[n-1]` 直接 IndexError）。规则本身又很细（`""` 转义、
+    `'` 到行尾），写第二份必然再次分叉 —— 所以只能有一份。
+
+    规则（与 VBE 一致的常见约定，不含行继续符等跨行情形）：
+      * `"` 开启字符串，直到配对的 `"`；串内 `""` 是一个转义的引号，跳过；
+      * `'` 开启注释，直到行尾（含 `\\n` 之前）；
+      * 其余字符都不在里面。
+    刻意**不认 `Rem`** —— 它需要"行首 / 语句边界"这条额外的语法前提，
+    那个前提属于调用方的判据（见 engine._member_list_dot_col 的守卫）。
+    """
+    n = len(code)
+    states = [False] * n
+    i = 0
     while i < n:
         c = code[i]
         if c == '"':
-            out.append(" ")
+            states[i] = True
             i += 1
             while i < n:
+                states[i] = True
                 if code[i] == '"':
                     if i + 1 < n and code[i + 1] == '"':  # 转义引号 ""
+                        states[i + 1] = True
                         i += 2
                         continue
                     i += 1
                     break
                 i += 1
-            out.append(" ")
             continue
         if c == "'":  # 注释到行尾
             while i < n and code[i] != "\n":
-                out.append(" ")
+                states[i] = True
                 i += 1
             continue
-        out.append(c)
+        i += 1
+    return states
+
+
+def _mask_strings_and_comments(code):
+    """把字符串字面量和注释替换为空格，避免误匹配。
+
+    ⚠️ 产物长度【不等】于原文本：一整个字符串 / 一整行注释只落一个空格
+    （逐 token，不是逐字符）。需要按下标对齐的场合请用 scan_code_states。
+    """
+    states = scan_code_states(code)
+    out = []
+    i, n = 0, len(code)
+    while i < n:
+        if states[i]:
+            # 一整段连续的字符串 / 注释 -> 合成一个空格
+            while i < n and states[i]:
+                i += 1
+            out.append(" ")
+            continue
+        out.append(code[i])
         i += 1
     return "".join(out)
 
@@ -747,14 +789,30 @@ def is_caret_in_type_position(line_text, caret_col):
         return False
     if not caret_col or caret_col <= 1:
         return False
-    # 先屏蔽字符串/注释再判断，避免 `"As ..."` 里的 As 误判
-    masked = _mask_strings_and_comments(line_text)
+    # 先屏蔽字符串/注释再判断，避免 `"As ..."` 里的 As 误判。
+    # ⚠️ 必须用【逐字符状态】再拼前缀，不能拿 _mask_strings_and_comments 的
+    # 产物去切片 —— 它是逐 token 一个空格、长度与原文不等（v93 踩过）。
+    _states = scan_code_states(line_text)
     end = caret_col - 1
     if end < 0:
         end = 0
-    if end > len(masked):
-        end = len(masked)
-    prefix = masked[:end]
+    if end > len(line_text):
+        end = len(line_text)
+    prefix = "".join(" " if _states[i] else line_text[i] for i in range(end))
+    # ★v93：`New` 也是类型位置（`Set c = New |` / `Set c = New Coll|`，VBE
+    # 在这儿弹类型列表）。原实现只认 `As`，于是 `Set c = New ` 处
+    # in_type_position=False —— 我们不再把候选收窄到"类型名"，一堆变量名 /
+    # 过程名冒出来（正是用户报的"填类型名时提示一堆变量名"那类噪音）。
+    #
+    # 判据与 engine._type_list_kw_end 同口径：先跳过【紧贴光标】的那个词
+    # （用户正在打的类型名），再跳空白，然后要求收尾是整词 `New`。
+    _q = prefix
+    if _q and (_q[-1].isalnum() or _q[-1] == "_"):
+        while _q and (_q[-1].isalnum() or _q[-1] == "_"):
+            _q = _q[:-1]
+    _q = _q.rstrip(" \t")
+    if re.search(r"\bNew$", _q, re.I):
+        return True
     # 括号深度跟踪：从光标往前，遇到顶层逗号即当前声明片段起点。
     # 顶层逗号 = 不在任何括号里（数组维度 / 过程参数 / 下标）的逗号。
     depth = 0

@@ -7626,16 +7626,29 @@ def main():
               expect_contain=["            ", "        "])
 
         # ---- 56.6 钩子侧判据：只在这两种情形接管回车 ----
-        _W56b = [("整行注释+行尾", "'注释", 20, True),
-                 ("块头+行尾", "    For i = 1 To 10", 21, True),
+        # ⚠️ caret_ec 是 VBE 的【显示列】(1-based，全角占 2 格)。下面每个
+        # "行尾"用例给的列 = _eol_disp_col(该行)，不是 len(该行)+1 ——
+        # 有全角字符时两者不等（`'注释` 3 字符但行尾显示列是 6）。
+        # v93 起判据对此是【严格相等】，旧数据里那个凭空的 20 会红。
+        _W56b = [("整行注释+行尾", "'注释", 6, True),
+                 ("块头+行尾", "    For i = 1 To 10", 20, True),
                  ("普通代码行+行尾", "    x = 1", 10, False),
                  ("光标在行中间", "    For i = 1 To 10", 12, False),
                  ("空行", "        ", 9, False),
                  ("整行空白", "", 1, False),
-                 ("含 Tab 的行", "\tFor i", 9, False),
-                 ("光标列拿不到", "    For i", 0, False)]
+                 ("含 Tab 的行", "\tFor i", 10, False),
+                 ("光标列拿不到", "    For i", 0, False),
+                 # ★v93：含全角时"显示列虚高"差点被当成"在行尾"——
+                 # `    For 每个元素 = 1 To 10`(22 字符、行尾显示列 27)，
+                 # 光标停在字符列 18 时 VBE 报显示列 22 >= 22，旧判据
+                 # (ec >= len) 会误接管那一下【拆行】的回车。
+                 ("中文块头 光标在中间", "    For 每个元素 = 1 To 10", 22, False),
+                 ("中文注释 光标在中间", "    ' 配置：读取 用户名", 18, False),
+                 ("中文块头 真·行尾", "    For 每个元素 = 1 To 10", 27, True),
+                 ("中文注释 真·行尾", "    ' 配置：读取 用户名", 24, True)]
         check("56.6 enter_indent_wanted：注释 / 块头 + 光标在行尾才接管；"
-              "普通行、行中间、空行、含 Tab、拿不到列一律放行给 VBE",
+              "普通行、行中间、空行、含 Tab、拿不到列一律放行给 VBE；"
+              "★含全角字符时按【显示列】精确比对行尾（不许被虚高的列骗去拆行）",
               [[n for (n, t, c, e) in _W56b
                 if VB56.enter_indent_wanted(t, c) != e]],
               expect_contain=[[]])
@@ -11181,7 +11194,14 @@ def main():
         def _mk70(line_text, **kw):
             _c70, _p70 = _wire70(line_text, **kw)
             _ui70 = _UI70()
-            _k70 = E70.Completer(VB70.VbeBackend(), _ui70)
+            _be70 = VB70.VbeBackend()
+            # ★v93：`Set s1 = New Cls1` 是【New 类型位置】—— parser 现在会把它
+            # 认成 in_type_position=True（见 is_caret_in_type_position 的 v93 说明），
+            # 于是候选要收窄到"类型名"。真后端由 get_type_names 提供；这个假 VBE
+            # 没有那套 COM 面，得手动喂上，否则候选会被收空（不是产品行为，是
+            # 脚手架缺件）。类模块名本来就是类型名，喂 Cls1 与 kw 的 cls_name 一致。
+            _be70._type_names = {str(kw.get("cls_name", "Cls1")).lower()}
+            _k70 = E70.Completer(_be70, _ui70)
             return _k70, _ui70, _c70, _p70
 
         def _note70(k, ts=0.0, line=3, text=_BEFORE70):
@@ -11905,6 +11925,290 @@ def main():
         E72.Completer._vbe_popup_showing = _pyshow72
     except Exception as _e72:
         check("第 72 节异常: %s" % _e72, [True], expect_contain=[False])
+
+    # ================================================================
+    # 第 73 节（v93）：一次"从头到尾"的审计改出来的五笔
+    #
+    # 用户口径（原话）："麻烦你帮我好好从头到尾检查一次，除了这个 bug，
+    # 也帮我检查检查其他方面，还有没有 bug 了。"
+    #
+    # 这一节钉的是"同一条语义只能一份实现"这条铁律（MEMORY 第 14 条）
+    # 在 2026-09-22 这一轮里暴露出来的全部裂缝：
+    #   73.1 字符串/注释扫描：engine 不再自写第三份，复用 parser 的
+    #        scan_code_states（`""` 转义 / 注释边界一次扫对、按下标对齐）
+    #   73.2 `Rem ...` 注释：`Rem a.b` 的点不是成员访问（假槽位根因）
+    #   73.3 类型位置判据：engine 侧"跳过正在输入的词"不许把 `New` 吃掉
+    #        —— `Set c = New |` 必须让位给 VBE 的类型列表
+    #   73.4 类型位置判据：parser 侧补上 `New`（`Set x = New |` 要收窄到类型名）
+    #   73.5 回车自动缩进：含全角时"光标在行尾"要按【显示列】比，不许被
+    #        虚高的列骗去接管（那是"拆行"，必须交给 VBE）
+    #   73.6 新行光标列：Tab 缩进 + 缓存缺失时不许按字符列算（会歪在 Tab 中间）
+    #   73.7 接线护栏（源码断言）：死代码已清、判据只有一份实现
+    #
+    # ⚠️ check() 是【子集匹配】—— 两段期望雷同会假绿（70.5 / v92 踩过），
+    #    所以下面凡"两轮期望一样"的地方都刻意分开写、并让第二轮带上
+    #    能区分的结果值。
+    # ================================================================
+    try:
+        import engine as E73
+        import parser as P73
+        import vbe_bridge as VB73
+
+        # ---- 73.1 字符串 / 注释扫描只有一份实现，且 `""` 转义扫对 ----
+        # ★v93 实测订正：`x = "a""b".c` 里 `""` 确实是一个转义引号、字符串在
+        # 收尾引号处关闭（scan_code_states 逐字符状态表已证实：下标 4~9 为 True，
+        # 下标 10、11 的 `.c` 为 False）；但 `.` 左边紧挨的是【收尾引号】，
+        # 而 VBE 对 `"abc".c` 这种"串字面量后面取成员"是**不弹成员列表**的 ——
+        # 它压根不是合法 VBA 表达式。所以这一处【不该让位】。
+        # 真正被判错的是 `.c` 其后的位置 —— 让位与否必须与"`.` 是不是真代码"一致。
+        # 这一条同时钉住两件事：
+        #   ① `""` 相位不能反相（反相会让 `.c` 被当成串内内容）；
+        #   ② 无论让不让位，`_in_comment_or_string` 对 `.c` 两格都必须为 False。
+        _t73q = 'x = "a""b".c'
+        check("73.1 ★`\"\"` 转义扫对：`x = \"a\"\"b\".c` 里 `\"\"` 是一个转义引号，"
+              "字符串在收尾引号处关闭 -> 其后的 `.c` 两格【都在代码里】"
+              "（旧实现把 `\"\"` 当开+关、相位反相会把它判成串内内容）",
+              [E73._in_comment_or_string(_t73q, len(_t73q)),
+               E73._in_comment_or_string(_t73q, len(_t73q) + 1)],
+              expect_contain=[False, False])
+
+        # 对照 1：转义引号之后是【真注释】，注释里的点不该让位
+        _t73a = 'x = "a""b" \' .c'
+        check("73.1a ★对照：`x = \"a\"\"b\" ' .c` 里 `\"\"` 之后是注释，`.c` "
+              "在注释里 -> 不算成员访问（两种相位下都不让位）",
+              [E73._in_comment_or_string(_t73a, len(_t73a) + 1),
+               E73._member_list_dot_col(_t73a, len(_t73a) + 1),
+               E73.list_slot_anchor(_t73a, len(_t73a) + 1),
+               E73.vbe_member_list_expected(_t73a, len(_t73a) + 1)],
+              expect_contain=[True, None, None, False])
+
+        # 对照 2：正常的「括号 + 成员访问」不能被误伤
+        # （第一版实现扫整个前缀 -> 34.6 整节红；这里把那个坑钉住）
+        _t73b = '    Range("A1").'
+        check("73.1b ★对照：`Range(\"A1\").` 里的 `\"A1\"` 在字符串里，但光标"
+              "左边的字符是句末那个【点号】—— 只许看紧邻光标那一个位置，"
+              "扫整个前缀会把合法成员点号误判成\"在字符串里\"",
+              [E73._in_comment_or_string(_t73b, len(_t73b) + 1),
+               E73.vbe_member_list_expected(_t73b, len(_t73b) + 1)],
+              expect_contain=[False, True])
+
+        # 对照 3 ★v93 新发现的两个真 bug（都是"`.` 左边紧挨什么"这一格问错）
+        # 3a) 光标紧贴点号：`Range("A1").|` —— 这是最常见的一处（刚敲完点，
+        #     成员名还没开始打）。旧实现第 1 步往回吃字母数字、停到 `)` 上，
+        #     第 2 步再"从 j 往回找点号"，此时点号在【i-1】而不是 j 的位置，
+        #     于是找不到点号 -> 判"不在成员位置" -> 不让位 -> 我们的窗压住
+        #     VBE 的成员列表。修法：先把紧贴光标的那一个点号直接认下来。
+        # 3b) owner 那一格要问【紧邻点号】的字符，不能问"跳过空白后的 m"：
+        #     `Range("A1").` 里 m 落在 `)` 上，而 `)` 在 `"A1"` 里 —— 拿它
+        #     当依据会把 With 之外最常见的括号取成员全误杀。
+        _t73o = '    Range("A1").'
+        _t73p = '    Range("A1").V'
+        check("73.1c ★光标【紧贴点号】也要让位（`Range(\"A1\").|` 是刚敲完点、"
+              "成员名还没打的最常见一处）：①行尾那一格；②已经在打成员名"
+              "（`.V|`）—— 两者都必须 True，且槽位都要算出来（旧实现在 ① 上"
+              "因为找不到点号而判 False -> 不让位 -> 候选窗压住 VBE 列表）",
+              [E73.vbe_member_list_expected(_t73o, len(_t73o) + 1),
+               E73.list_slot_anchor(_t73o, len(_t73o) + 1),
+               E73.vbe_member_list_expected(_t73p, len(_t73p) + 1),
+               E73.list_slot_anchor(_t73p, len(_t73p) + 1)],
+              expect_contain=[True, 17, True, 17])
+
+        # 3c) ★v93 真 bug：`_in_comment_or_string` 的列号必须【夹到行长】。
+        #     不夹时 `[n-1]` 会越界成 Python 负下标、静默回绕到行尾字符上。
+        #     ⚠️ 半开区间：`col = len+1` 看的是下标 len-1（行尾那个字符），
+        #     它本来就该 False；`col = len+2`（超出恰好一格）才真正把负下标
+        #     走了一遍，**它是最有判别力的一格** —— 旧实现会回绕到下标 -1
+        #     （行尾的 `)`）而返回 False、看不出问题；真正暴露的是
+        #     `Range("A1")` 这种"行尾字符在串里"的行，所以这里连行尾那格一起
+        #     钉住，并把 `col = len+1` 的期望按其真实语义写成 False。
+        #     （旧实现在 `Range("A1")` 的 col=len+1 上返回 True —— 读到了
+        #     下标 13 的 `1`，这就是 34.6「该让位却不让位」的根因。）
+        _t73r = '    Range("A1")'
+        check("73.1d ★列号越界不许回绕：`Range(\"A1\")` 里 `)` 之后那几格"
+              "（col=len 起）全必须 False —— 不把 col 夹到行长的实现会因负下标"
+              "静默读到行尾的 `1`（在串里）而返回 True",
+              [E73._in_comment_or_string(_t73r, len(_t73r) - 1),
+               E73._in_comment_or_string(_t73r, len(_t73r)),
+               E73._in_comment_or_string(_t73r, len(_t73r) + 1),
+               E73._in_comment_or_string(_t73r, len(_t73r) + 2)],
+              expect_contain=[True, False, False, False])
+
+        # ---- 73.2 `Rem ...` 注释里的点不是成员访问 ----
+        _t73c = "Rem a.b"
+        _t73d = "    Rem a.b"
+        check("73.2 ★`Rem` 注释：`Rem a.b` / 缩进版都不该算出成员位置"
+              "（点号左边是个标识符 `a`，走不到\"行首/边界之后\"那条 With 分支，"
+              "必须单独识别 —— 否则是【假槽位】，污染 yield_given_up 的键，"
+              "症状是\"偶尔某处不再让位\"）",
+              [E73._member_list_dot_col(_t73c, len(_t73c) + 1),
+               E73._member_list_dot_col(_t73d, len(_t73d) + 1),
+               E73.list_slot_anchor(_t73c, len(_t73c) + 1),
+               E73.vbe_member_list_expected(_t73c, len(_t73c) + 1)],
+              expect_contain=[None, None, None, False])
+
+        # 对照：`Rem` 只在【行首 / 语句分隔符之后】才是注释，标识符里
+        # 含 rem 的（`Remote.foo`）照旧是成员访问
+        _t73e = "    Remote.foo"
+        check("73.2b ★对照：`Remote.foo` 的成员访问照旧成立（`Rem` 只有"
+              "顶格 / 紧跟 `:` 时才是注释，不能拿\"标识符含 rem\"去拦）",
+              [E73._member_list_dot_col(_t73e, len(_t73e) + 1) is not None,
+               E73.vbe_member_list_expected(_t73e, len(_t73e) + 1)],
+              expect_contain=[True, True])
+
+        # 对照 2：`Rem` 不止「点号」这一路 —— 类型位置那一支原先只查
+        # _in_comment_or_string（只认 `'`），**漏了 Rem**，于是 `... : Rem a As b`
+        # 这种行上注释里的 `As` 会被当成"正在填的类型位置"（假槽位）。
+        # ★v93：两处现在共用一个 `_in_rem_comment`。
+        _t73rem = "Dim x As Integer : Rem a As b"
+        check("73.2c ★`Rem` 里的 `As` 不算类型位置：`Dim x As Integer : Rem a As b`"
+              " 光标在行尾 —— 注释里的 `As b` 是注释文字，不该让位、更不该"
+              "算出槽位（类型位置那一支原先漏查 Rem，只有成员那一支查了）",
+              [E73._in_type_list_position(_t73rem, len(_t73rem) + 1),
+               E73.list_slot_anchor(_t73rem, len(_t73rem) + 1),
+               E73._in_rem_comment(_t73rem, len(_t73rem) + 1)],
+              expect_contain=[False, None, True])
+
+        # ---- 73.3 类型位置：`New` 侧的行为（合并判据，行为与旧版逐字相同） ----
+        # ⚠️ 诚实标注：这一条【不是】新修的 bug —— 旧 `_in_type_list_position`
+        # 在 `Set c = New |` 上本来就返回 True（它把 `New` 当关键字尾巴，
+        # 并不受"跳过正在输入的词"那步影响，因为光标就在 `New` 之后）。
+        # 之所以仍然写进来：v93 把"要不要让位"（_in_type_list_position）与
+        # "是哪一个槽位"（_type_list_anchor）合并成同一份 _type_list_kw_end，
+        # 这一条钉的就是"合并后行为不变"，防止以后有人改一处漏一处。
+        _t73f = "Set c = New "
+        _t73g = "Set c = New Coll"
+        check("73.3 ★类型位置判据已合并（`_type_list_kw_end` 一份实现）："
+              "`Set c = New |` / `Set c = New Coll|` 都让位且槽位同为 13；"
+              "`Dim x As |` 这一路照旧 —— 合并前后逐字等价（防未来分叉）",
+              [E73._in_type_list_position(_t73f, len(_t73f) + 1),
+               E73._in_type_list_position(_t73g, len(_t73g) + 1),
+               E73.vbe_list_expected(_t73f, len(_t73f) + 1),
+               E73._type_list_anchor(_t73f, len(_t73f) + 1)],
+              expect_contain=[True, True, True, 13])
+
+        # 对照：`Dim x As |` / 第二个 `As |` 这条老路一个字都没动
+        _t73h = "Dim x As "
+        _t73i = "Dim x As Long, y As "
+        check("73.3b ★对照（回归）：`Dim x As |` / 第二个 `As |` 照旧让位，"
+              "槽位起点列仍是类型名该开始的那一列（10 / 21）",
+              [E73._in_type_list_position(_t73h, len(_t73h) + 1),
+               E73._in_type_list_position(_t73i, len(_t73i) + 1),
+               E73._type_list_anchor(_t73h, len(_t73h) + 1),
+               E73._type_list_anchor(_t73i, len(_t73i) + 1)],
+              expect_contain=[True, True, 10, 21])
+
+        # ---- 73.4 类型位置：parser 侧也要认 `New`（收窄到类型名） ----
+        # 旧 parser 只认 `As`，于是 `Set x = New ` 处 in_type_position=False
+        # -> 不把候选收窄到类型名 -> 一堆变量名 / 过程名冒出来（噪音）。
+        check("73.4 ★parser 侧补上 `New`：`Set x = New |` 与 `Set x = New Cls|` "
+              "都算\"正在填类型名\"（候选收窄到类型名）；`Dim x As |` 照旧成立；"
+              "普通赋值行不是类型位置",
+              [P73.is_caret_in_type_position("Set s1 = New ", 14),
+               P73.is_caret_in_type_position("Set s1 = New Cls1", 19),
+               P73.is_caret_in_type_position("Dim x As ", 10),
+               P73.is_caret_in_type_position("    userName = 1", 16)],
+              expect_contain=[True, True, True, False])
+
+        # 对照：字符串里的 As / New 不算（prefix 的逐字符抹白负责）
+        check("73.4b ★对照：字符串里的 `New ` 不算类型位置（逐字符抹白后正则"
+              "自然不匹配）—— 注意必须用 scan_code_states 的【逐字符】状态拼"
+              "prefix，_mask_strings_and_comments 的产物长度与原文不等，"
+              "拿它切片会直接 IndexError（v93 第一版就是这么红的）",
+              [P73.is_caret_in_type_position('    s = "New "', 14),
+               P73.is_caret_in_type_position('    s = "As "', 13)],
+              expect_contain=[False, False])
+
+        # ---- 73.5 回车自动缩进：含全角时按【显示列】比行尾 ----
+        # 旧判据 `int(caret_ec) < len(t) -> 放行`：中文全角让显示列虚高，
+        # 行中间的光标也能满足"显示列 ≥ 字符数"，于是本该交给 VBE 的
+        # 【拆行】被我们吞了。
+        _t73j = "    For 每个元素 = 1 To 10"      # 22 字符、行尾显示列 27
+        _t73k = "    ' 配置：读取 用户名"          # 15 字符、行尾显示列 24
+        check("73.5 ★中文行不许被虚高的显示列骗去接管回车："
+              "①`For 每个元素 = 1 To 10` 光标停字符列 18（显示列 22 ≥ 22）"
+              "  -> 放行（那是拆行）；②同一行真·行尾（显示列 27）-> 接管；"
+              "③中文整行注释同行同理（中间放行 / 行尾接管）",
+              [VB73.enter_indent_wanted(_t73j, 22),
+               VB73.enter_indent_wanted(_t73j, 27),
+               VB73.enter_indent_wanted(_t73k, 18),
+               VB73.enter_indent_wanted(_t73k, 24)],
+              expect_contain=[False, True, False, True])
+
+        # 对照：`""` 影响的不是这里 —— 纯 ASCII 行判据逐字未变（回归）
+        check("73.5b ★对照（回归）：纯 ASCII 行照旧 —— 块头行尾接管、"
+              "行中间放行、空行 / 含 Tab / 拿不到列一律放行",
+              [VB73.enter_indent_wanted("    For i = 1 To 10", 20),
+               VB73.enter_indent_wanted("    For i = 1 To 10", 12),
+               VB73.enter_indent_wanted("        ", 9),
+               VB73.enter_indent_wanted("\tFor i", 10),
+               VB73.enter_indent_wanted("    For i", 0)],
+              expect_contain=[True, False, False, False, False])
+
+        # ---- 73.6 新行光标列：Tab 缩进 + 缓存缺失不许按字符列算 ----
+        # `_sem_cache["info"]` 只由 _probe_semantics 写入，新起一行这种场景
+        # 可能一次都没触发过 -> 旧实现按 `len("\t")+1 = 2` 落光标，而显示列
+        # 语义下正确值是 5（Tab 展开到第 5 列）-> 光标歪在 Tab 中间。
+        _sem73 = VB73._sem_cache.get("info")
+        try:
+            VB73._sem_cache["info"] = None
+            _tab_nocache = VB73._indent_end_col("\t")
+        finally:
+            VB73._sem_cache["info"] = _sem73
+        check("73.6 ★Tab 缩进 + 语义缓存缺失：按【显示列 + 默认 tab 宽度 4】"
+              "兜底（`\\t` -> 5，不是字符列语义的 2）；拿到显式语义时各按各算；"
+              "纯空格缩进两种语义一致（仍 5）",
+              [_tab_nocache,
+               VB73._indent_end_col("\t", ("char", 4, False)),
+               VB73._indent_end_col("\t", ("disp", 4, False)),
+               VB73._indent_end_col("\t", ("disp", 8, False)),
+               VB73._indent_end_col("    ")],
+              expect_contain=[5, 2, 5, 9, 5])
+
+        # ---- 73.7 ★接线护栏（源码断言） ----
+        _root73 = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        _eng73 = io.open(os.path.join(_root73, "engine.py"),
+                         encoding="utf-8").read()
+        _par73 = io.open(os.path.join(_root73, "parser.py"),
+                         encoding="utf-8").read()
+        _vbr73 = io.open(os.path.join(_root73, "vbe_bridge.py"),
+                         encoding="utf-8").read()
+        # ① engine 不再自写字符串/注释扫描，改调 parser 的唯一实现
+        _ics73 = _eng73.split("def _in_comment_or_string(")[1].split(
+            "\ndef ")[0]
+        # ② 死代码已清（判"没有定义"，不判"文本里没提过"—— 删它的注释里
+        #    会点名提到它，那是【说明】，不是残留）
+        _dead73 = ("def _name_exists_outside_caret(" in _eng73)
+        # ③ parser 侧 scan_code_states 存在，且 _mask 由它派生
+        _scan73 = ("def scan_code_states(" in _par73)
+        _mask73 = ("states = scan_code_states(code)" in _par73)
+        # ④ 成员位置 / 类型位置在 engine 各只有一份实现
+        _dot73 = _eng73.count("def _member_list_dot_col(")
+        _kw73 = _eng73.count("def _type_list_kw_end(")
+        # ⑤ 两个公共入口都委托到它们（不许再有第二份内联逻辑）
+        _deleg73 = ("return _member_list_dot_col(line_text, caret_col) is not None"
+                    in _eng73)
+        _deleg73b = ("e = _type_list_kw_end(line_text, caret_col)" in _eng73)
+        # ⑥ vbe_bridge：含 Tab 的缩进不许走"缓存缺失就按字符列"
+        _iec73 = _vbr73.split("def _indent_end_col(")[1].split("\ndef ")[0]
+        _guard73 = ('if "\\t" not in indent:' in _iec73)
+        _resolve73 = ("def _resolve_sem_info(" in _vbr73)
+        check("73.7 ★接线护栏：①`_in_comment_or_string` 改走 parser 的"
+              "`scan_code_states`（唯一实现）；②`_name_exists_outside_caret` "
+              "死代码已删；③parser 侧 `scan_code_states` 存在且 `_mask_"
+              "strings_and_comments` 由它派生；④成员/类型位置在 engine 各只有"
+              "一份实现（`_member_list_dot_col` / `_type_list_kw_end`）；"
+              "⑤`vbe_member_list_expected` / `_type_list_anchor` 都委托到它们；"
+              "⑥`_indent_end_col` 含 Tab 时不再回落到字符列，并有 `_resolve_sem_"
+              "info` 补探测",
+              [[("vba_parser.scan_code_states(line_text)" in _ics73),
+                (not _dead73),
+                _scan73, _mask73,
+                (_dot73 == 1), (_kw73 == 1),
+                _deleg73, _deleg73b,
+                _guard73, _resolve73]],
+              expect_contain=[[True] * 10])
+    except Exception as _e73:
+        check("第 73 节异常: %s" % _e73, [True], expect_contain=[False])
 
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))

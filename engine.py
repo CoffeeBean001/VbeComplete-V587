@@ -27,6 +27,8 @@ import os
 import re
 import time
 
+import parser as vba_parser
+
 from log import log as _log
 from log import LOG_ENABLED as _LOG_ENABLED
 
@@ -305,49 +307,152 @@ _WITH_OWNER_BOUNDARY = ":,=(&+-*/\\^><"
 
 
 def _in_comment_or_string(line_text, col):
-    """光标（1-based 列）左边是否落在字符串 / 注释里（极简扫描）。
+    """光标（1-based 列）左边是否落在字符串 / 注释里。
 
     VBE 在注释和字符串里不会弹列表，那种位置我们照旧弹自己的。
+
+    ★v93：这里是"字符串 / 注释扫描"的【唯一实现】，逐字复用
+    parser._mask_strings_and_comments —— 不再自己写一份。
+
+    为什么必须复用（原实现的三条错，全部实测复现）：
+
+    1. **`""` 转义没认**。VBA 里字符串内的双引号写成两个（`"他说""你好"`）。
+       原实现见到第一个 `"` 就认为字符串结束，于是第二个引号又被当成"字符串
+       开始"，此后的真引号反倒被当成结束 —— 从此 in_str 一路反相。落到
+       `_member_list_dot_col` 上的后果是两种都要命：真该让位的地方判定为
+       "在字符串里"从而 `return None`（**不让位**，我们的窗盖住 VBE 的成员
+       列表）；或反过来在字符串里算出真点号（**假槽位**，污染 `yield_given_up`
+       的键，症状是"偶尔某处不再让位 / 让位记录对不上"这类时序竞态）。
+       实例：`x = "a""b" ' .c` —— 原实现说 `.c` 让位（错），新实现说这是注释
+       里的点，不该让位（对）。
+    2. **`Rem` 注释没认**。`Rem` 是 VBA 的另一种注释写法，同样到行尾。
+       实例：`Rem a.b` —— 原实现把 `.b` 当成员访问（**假槽位**），新实现正确
+       地按注释处理。
+    3. 扫描窗口用 `col-1` 而不是整行。`""` 转义的相位依赖"从行首扫到底"，
+       只扫光标左边一段会在相位上出错（`x = "" : y.foo` 这类）。
+
+    ⚠️ 这正是 MEMORY 第 14 条"同一条语义只能一份实现"的第三次踩坑（前两次：
+    v87 可见性口径、v93 `list_slot_anchor`）。字符串/注释扫描的权威实现在
+    parser，任何地方要判"这里是不是字符串/注释"都必须调它。
     """
     if not line_text or not col or col < 1:
         return False
-    in_str = False
-    n = min(col - 1, len(line_text))
-    for i in range(n):
-        c = line_text[i]
-        if in_str:
-            if c == '"':
-                in_str = False
-        elif c == '"':
-            in_str = True
-        elif c == "'":
-            return True                  # 注释一直延续到行尾
-    return in_str
+    n = min(int(col) - 1, len(line_text))
+    if n <= 0:
+        return False
+    # ★v93：规则只有一份 —— parser.scan_code_states 逐字符标注"这里在不在
+    # 字符串 / 注释里"。问"光标左边那个字符"（下标 n-1）即可。
+    #
+    # ⚠️ v93 的坑：一开始我拿 `_mask_strings_and_comments` 的下标去对应原文，
+    # 可它的产物是【逐 token 一个空格】，长度根本不等于原文 —— 直接
+    # IndexError（第 34 节整节异常）。要按下标对齐就必须用 scan_code_states。
+    #
+    # ⚠️ 只能看【紧邻光标的这一个位置】，不能扫整个前缀：`    Range("A1").`
+    # 的前缀里有 `"A1"` 在字符串里，扫前缀会把句末那个合法的成员点号也判成
+    # "在字符串里"（34.6 正是这么红的）。
+    # ⚠️ n 必须夹到 len(line_text) 之内。调用方按**字符列**约定传 col，而
+    # 超过行尾的 col 全都被夹到同一个下标（这一层是对的）；可要是**不夹**，
+    # `[n-1]` 会因为 n > len 而越界成 Python 的【负下标】—— 静默回绕到行尾
+    # 字符上，于是 `Range("A1")` 里的 `)`（下标 14）被问成 col=15 时读到了
+    # 下标 13 的 `1`（在串里）-> True。这正是 34.6 那条「`Range("A1").` 该
+    # 让位却不让位」的根因：判据看的是"里"而不是"尾"。行尾之后的列语义上
+    # 等价于"行尾字符之后"，夹到边界即正确。
+    n = min(n, len(line_text))
+    return vba_parser.scan_code_states(line_text)[n - 1]
 
 
-def vbe_member_list_expected(line_text, caret_col):
-    """光标是否正停在 VBE 会自己弹【成员列表】的位置（`标识符.` 之后）。
+def _in_rem_comment(line_text, col):
+    """光标左边那一格是否落在 `Rem ...` 注释里（col 1-based，问 col-1 那一格）。
 
-    判据：光标左边形如 `xxx.` + 正在输入的成员名（成员名可以还没开始打）。
-    纯文本判定，不碰窗口、不碰 COM，可单测。
+    ★v93：这是 `Rem` 判据的【唯一实现】。原先它内联在 `_member_list_dot_col`
+    的第 4b 条里，而 `_type_list_kw_end` 的第 4 条只查 `_in_comment_or_string`，
+    **漏了 Rem** —— 于是 `Dim x As Integer : Rem a As b` 这类行上，类型位置会
+    在注释里算出一个假槽位。同一句语义两处判、其中一处漏了，正是本仓库反复
+    栽的坑（MEMORY 第 14 条），所以抽成函数、两边都调它。
 
-    v72 起还认 With 块的成员访问：点顶在行首（`    .Size`）或紧跟语句 /
-    运算符边界（`a = 1: .Size`、`Set f = .Font`、`x = .Left + .Width`）。
-    见 _WITH_OWNER_BOUNDARY。
+    为什么不能并进 parser.scan_code_states：`Rem` 只在【行首 / `:` 之后 /
+    另一个行号标签之后】才是注释 —— 这需要"行首/边界"这个前提，而
+    scan_code_states 是逐字符状态机、看不到"前面是不是行首"。所以它刻意不认
+    Rem，把这层判断留给调用方（见 parser.scan_code_states 的 docstring）。
+
+    ⚠️ 认整词：`Remote.foo` 里的 `rem` 不是注释 —— 要求 `rem` 前面是
+    行首 / 空白 / `:`。
+    """
+    if not line_text or not col or col < 1:
+        return False
+    n = min(int(col) - 1, len(line_text))
+    if n <= 0:
+        return False
+    head = line_text[:n]
+    # ★v93：`Rem` 注释是【到行尾】的 —— 判据必须是"这一行从某个 rem 起到
+    # 底都在注释里"，而不是"光标左边那一个字在不在 rem 三个字母里"。
+    # 一开始我写的是"取光标左边最后一个非空白字符、看它是否落在 rem 三字母
+    # 内"，于是 `Rem a As b` 里问 `As` 那一格（head == "Rem a "）时最后
+    # 一个非空白又是 `a`、根本不在 rem 内 -> 判 False -> 注释里的 `As` 被
+    # 当成真类型位置（假槽位）。正确判据：找出这一行里所有"算注释起点的
+    # rem"，只要光标落在其中一个起点的【右侧】（含起点本身），就是在注释里。
+    #
+    # `rem` 的认定（VBA 规则）：整词，且前面是行首 / 空白 / `:` / 另一个
+    # 行号标签之后。这里用简化的等价判据：往前看一个字符是行首 / 空白 / `:`。
+    low = head.lower()
+    start = 0
+    while True:
+        q = low.find("rem", start)
+        if q < 0:
+            return False
+        # 必须是整词：后面不能紧跟标识符字符（否则是 Remote 这类名字）
+        after_ok = not (q + 3 < len(low)
+                        and (low[q + 3].isalnum() or low[q + 3] == "_"))
+        # 前面必须是行首 / 空白 / `:`
+        before_ok = (q == 0 or low[q - 1] in " \t:")
+        if after_ok and before_ok:
+            return True
+        start = q + 1
+
+
+def _member_list_dot_col(line_text, caret_col):
+    """光标若停在成员访问位置，返回那个【点号】的 0-based 下标；否则返回 None。
+
+    ★v93：这是成员位置判据的【唯一实现】—— `vbe_member_list_expected`（要不要
+    让位）与 `list_slot_anchor`（是哪一个槽位）都调它。
+
+    为什么必须合并：这两处原先各写了一遍，于是判据悄悄分叉了 ——
+    `vbe_member_list_expected` 有「`1.5` 小数点不算」「注释/字符串里不算」两条
+    守卫，而 `list_slot_anchor` 一条都没有。后果不是"少让位一次"那么轻：
+    `list_slot_anchor` 的结果是让位标记 `yield_given_up` 的**键**（v80b 起按
+    槽位记），在 `a = 1.5` 或注释里算出一个假槽位，会让【真槽位】上的让位
+    失败记录串到别处去 —— 症状是"偶尔某处不再让位 / 让位记录对不上"这类
+    时序竞态，最难查。同一问题在 v87 已经栽过一次（"同一条语义只能一份实现"，
+    MEMORY 第 14 条），这次是第二次。
+
+    约定：caret_col 1-based，光标左边 = line_text[:caret_col-1]（与
+    extract_word_before 一致）。
     """
     if not line_text or not caret_col or caret_col < 1:
-        return False
-    i = min(caret_col - 1, len(line_text))
-    # 1) 跳过光标左边正在输入的成员名
-    j = i - 1
-    while j >= 0 and (line_text[j].isalnum() or line_text[j] == "_"):
-        j -= 1
-    # 2) 成员名左边应当是点号（`X .` 这种带空格的写法也认）
-    k = j
-    while k >= 0 and line_text[k] in " \t":
-        k -= 1
-    if k < 0 or line_text[k] != ".":
-        return False
+        return None
+    i = min(int(caret_col) - 1, len(line_text))
+    # 1) 跳过光标左边正在输入的成员名。
+    #    ⚠️ ★v93：光标若【紧贴点号】（`Range("A1").|` 这种刚敲完点、成员名还没
+    #    开始打的位置），这第一个字符就是点号本身 —— 不能当成"正在输入的名字"
+    #    吃掉它。旧实现只判 isalnum/_，`.isalnum()` 为 False 所以它其实**没吃**？
+    #    恰好相反：`.` 不含字母数字，是不吃没错；但光标紧贴点号时 j 会停在
+    #    `)` 上（因为第 2 步是"从 j 往回找点号"，而此时点号在【i-1】、j 也在
+    #    `)` 上），于是第 2 步往回找点号找不到 -> 判"不在成员位置"。
+    #    实例：`    Range("A1").` 光标停在行尾（=点号之后）本该让位，旧实现
+    #    返回 False（我们的候选窗压在 VBE 的成员列表上）。修法是先把紧贴光标的
+    #    那一个点号直接认下来。
+    if i > 0 and line_text[i - 1] == ".":
+        k = i - 1
+    else:
+        j = i - 1
+        while j >= 0 and (line_text[j].isalnum() or line_text[j] == "_"):
+            j -= 1
+        # 2) 成员名左边应当是点号（`X .` 这种带空格的写法也认）
+        k = j
+        while k >= 0 and line_text[k] in " \t":
+            k -= 1
+        if k < 0 or line_text[k] != ".":
+            return None
     # 3) 点号左边得是能取成员的东西：标识符 / ) / ] / }
     m = k - 1
     while m >= 0 and line_text[m] in " \t":
@@ -363,40 +468,131 @@ def vbe_member_list_expected(line_text, caret_col):
     # 等它真的画出来再去让位，这个"让位"本身已经被我们破坏掉了。
     if m < 0 or line_text[m] in _WITH_OWNER_BOUNDARY:
         # 注释 / 字符串里 VBE 不弹，我们照旧弹（`x = 1 ' c: .foo` 这种）
-        return not _in_comment_or_string(line_text, k + 1)
+        return None if _in_comment_or_string(line_text, k + 1) else k
     if not (line_text[m].isalnum() or line_text[m] in _MEMBER_OWNER_TAIL):
-        return False
+        return None
+    # 3b) ★v93：owner 那一格若是【收尾引号】，这个点不是成员访问 ——
+    #     `x = "abc".c` 里 `"abc"` 是一个完整的串字面量，`.` 在串外，
+    #     VBE【不会】弹成员列表。旧实现在第 3 条里无条件认下 `"`（它不在
+    #     _WITH_OWNER_BOUNDARY 里），把串尾引号当成了成员 owner，于是我们
+    #     不让位、候选窗压在 VBE 上方。
+    #
+    #     ⚠️ 判据只看点号【紧邻左边】那一格（m == k-1），不能看"往回跳过空白
+    #     之后的 m"：`    Range("A1").` 光标紧贴点号时 k == i-1，而 m 会落到
+    #     `)` 上 —— 可 `)` 在 `"A1"` 里（in_cs(m+1) 真）！拿它当依据会把
+    #     With 之外最常见的 `Range("A1").` / `Foo("x").` 全误杀（实测红）。
+    #     真正该问的是：这个点号左边紧挨着的是不是一个【完整的串字面量】——
+    #     `"abc"` 这样以收尾引号直接贴住点号才算。中间隔了 `)` 的一律不算。
+    if (k - 1 >= 0 and line_text[k - 1] == '"'
+            and _in_comment_or_string(line_text, k)):
+        return None
     # 4) `1.5` 这种小数点：点号左边整段是纯数字，VBE 不弹列表
     s = m
     while s >= 0 and (line_text[s].isalnum() or line_text[s] == "_"):
         s -= 1
-    if line_text[s + 1:m + 1].isdigit():
-        return False
+    owner_seg = line_text[s + 1:m + 1]
+    if owner_seg.isdigit():
+        return None
+    # 4b) ★v93：`Rem ...` 注释。VBA 里 `Rem` 出现在【行首 / 语句分隔符 `:` 之后 /
+    # 另一个行号标签之后】时，它后面整行都是注释 —— `Rem a.b` 这个点不是成员
+    # 访问。这里必须显式查一遍：光靠 _in_comment_or_string 不够，因为它只认
+    # `'` 开头的注释（`Rem` 是另一种写法）。不拦的后果是算出假槽位（anchor），
+    # 污染 yield_given_up 的键 —— 症状是"偶尔某处不再让位"的时序竞态。
+    # ⚠️ 判据要问 owner 那一格（m+1，此处等于 s+2），不能问点号那一格（k+1）：
+    #    `Rem a.b` 里 `.` 所在的列在 scan_code_states 里是 False（scan_code_states
+    #    刻意不认 Rem），拿它去查 _in_comment_or_string 永远得 False —— 第一版
+    #    就是这么写的，Rem 守卫完全没生效。
+    if _in_rem_comment(line_text, m + 1):
+        return None
     # 5) 注释 / 字符串里 VBE 不弹，我们照旧弹
     if _in_comment_or_string(line_text, k + 1):
-        return False
-    return True
+        return None
+    return k
+
+
+def vbe_member_list_expected(line_text, caret_col):
+    """光标是否正停在 VBE 会自己弹【成员列表】的位置（`标识符.` 之后）。
+
+    判据：光标左边形如 `xxx.` + 正在输入的成员名（成员名可以还没开始打）。
+    纯文本判定，不碰窗口、不碰 COM，可单测。
+
+    v72 起还认 With 块的成员访问：点顶在行首（`    .Size`）或紧跟语句 /
+    运算符边界（`a = 1: .Size`、`Set f = .Font`、`x = .Left + .Width`）。
+    见 _WITH_OWNER_BOUNDARY。
+
+    ★v93：实现下沉到 _member_list_dot_col，与 list_slot_anchor 共用同一份 ——
+    "要不要让位"与"是哪一个槽位"从此不可能再分叉。
+    """
+    return _member_list_dot_col(line_text, caret_col) is not None
+
+
+# ★v93：类型列表位置（`As |` / `New |`）的【唯一实现】。
+#
+# 为什么抽出来：`_in_type_list_position`（要不要让位）与 `_type_list_anchor`
+# （是哪一个槽位）原先各写一遍，和 v93 成员位置那次一样是分叉温床。
+#
+# ★v93 修的错：原来"跳过光标左边正在输入的那个词"这一步**无条件**往回吃
+# 标识符字符，于是把刚刚打完的【关键字本身】也吃掉了：
+#     `Set c = New `  光标在末尾空格之后
+#       -> 往回吃 New -> head = "set c =" -> 不以 " new" 收尾 -> 判"不在类型位置"
+# 结果是 **VBE 弹出类型列表时我们不让位**，我们的候选窗照样压在它上面 ——
+# 正是用户报的那一类"弹窗盖住 VBE 列表"。判据必须分清两种情况：
+#   * 光标【紧贴】标识符（`New Col|`）：那个词是用户在打的类型名，要跳过；
+#   * 光标前面是空白（`New |`）：**没有词在打**，不能跳 —— `New` / `As`
+#     本身就是我们认识的尾巴。
+# （上面按 `line_text[j].isalnum()` 往回吃，无法区分这两者；看 `i` 这个
+#  位置本身是不是标识符字符即可。）
+def _type_list_kw_end(line_text, caret_col):
+    """光标停在 `As |` / `New |` 时返回该关键字的 0-based 结束下标；否则 None。"""
+    if not line_text or not caret_col or caret_col < 1:
+        return None
+    i = min(int(caret_col) - 1, len(line_text))
+    if i <= 0:
+        return None
+    j = i - 1
+    # 1) 光标【紧贴】一个标识符字符时才跳过它（那是用户正在打的类型名）。
+    #    光标前面是空白（`New |`）时【不能跳】—— 没有词在打，空白左边
+    #    那个词就是关键字本身。这一步正是原实现的错处：它无条件往回吃，
+    #    把 `Set c = New ` 的 New 当成"正在输入的类型名"吃掉了。
+    if line_text[j].isalnum() or line_text[j] == "_":
+        while j >= 0 and (line_text[j].isalnum() or line_text[j] == "_"):
+            j -= 1
+    # 2) 跳过光标与关键字之间的空白（`As  |`、`As |` 都会到这里）
+    while j >= 0 and line_text[j] in " \t":
+        j -= 1
+    if j < 0:
+        return None
+    # 3) 这个位置必须收尾 `As` / `New`（整词，看前面的边界）
+    if not (line_text[j].isalnum() or line_text[j] == "_"):
+        return None
+    k = j
+    while k >= 0 and (line_text[k].isalnum() or line_text[k] == "_"):
+        k -= 1
+    word = line_text[k + 1:j + 1].lower()
+    if word not in ("as", "new"):
+        return None
+    # 4) 注释 / 字符串里 VBE 不弹，我们照旧弹。
+    #    ★v93：这里原来只查 _in_comment_or_string（只认 `'`），漏了 `Rem` ——
+    #    `Dim x As Integer : Rem a As b` 这种行上，注释里的 `As` 会被当成
+    #    正在填的类型位置（假槽位）。补上后与 _member_list_dot_col 同口径。
+    if _in_rem_comment(line_text, k + 2):
+        return None
+    if _in_comment_or_string(line_text, k + 2):
+        return None
+    return j + 1
 
 
 def _in_type_list_position(line_text, caret_col):
     """光标是否停在 `As ` / `New ` 之后 —— VBE 在这里会弹【类型列表】。
 
     `Dim x As ` / `Set c = New ` 之后敲的第一个字母就会把 VBE 的类型列表唤出来，
-    跟我们的弹窗撞在同一处，同样要让位。判据刻意简单：光标左边（去掉正在输入
-    的那个词之后）以 `As` 或 `New` 收尾即可，不去看整句是不是合法声明 ——
-    `As` / `New` 是关键字，正常代码里不会有别的以它收尾的位置。
+    跟我们的弹窗撞在同一处，同样要让位。判据：光标左边（去掉正在输入的那个词
+    之后）以 `As` 或 `New` 收尾即可，不去看整句是不是合法声明 —— `As` / `New`
+    是关键字，正常代码里不会有别的以它收尾的位置。
+
+    ★v93：实现下沉到 _type_list_kw_end，与 _type_list_anchor 共用同一份。
     """
-    if not line_text or not caret_col or caret_col < 1:
-        return False
-    i = min(caret_col - 1, len(line_text))
-    j = i - 1
-    while j >= 0 and (line_text[j].isalnum() or line_text[j] == "_"):
-        j -= 1
-    head = line_text[:j + 1].rstrip().lower()
-    if not (head.endswith(" as") or head.endswith(" new")):
-        return False
-    # 注释 / 字符串里 VBE 不弹，我们照旧弹
-    return not _in_comment_or_string(line_text, j + 2)
+    return _type_list_kw_end(line_text, caret_col) is not None
 
 
 def vbe_list_expected(line_text, caret_col):
@@ -413,21 +609,11 @@ def vbe_list_expected(line_text, caret_col):
 def _type_list_anchor(line_text, caret_col):
     """`As ` / `New ` 之后填类型名时的【槽位起点列】（1-based）；不在那儿返回 None。
 
-    与 _in_type_list_position 同一套判据（"光标左边去掉正在输入的词之后以 `as` /
-    `new` 收尾"），只是额外把"类型名该从哪一列开始"算出来 —— 供
-    list_slot_anchor 用。纯函数。
+    与 _in_type_list_position 共用 _type_list_kw_end（同一套判据），只是额外把
+    "类型名该从哪一列开始"算出来 —— 供 list_slot_anchor 用。纯函数。
     """
-    if not line_text or not caret_col or caret_col < 1:
-        return None
-    i = min(int(caret_col) - 1, len(line_text))
-    j = i - 1
-    while j >= 0 and (line_text[j].isalnum() or line_text[j] == "_"):
-        j -= 1
-    head = line_text[:j + 1].rstrip().lower()
-    if not (head.endswith(" as") or head.endswith(" new")):
-        return None
-    if _in_comment_or_string(line_text, j + 2):
-        return None
+    e = _type_list_kw_end(line_text, caret_col)
+    return None if e is None else e + 2
     return j + 2
 
 
@@ -448,22 +634,26 @@ def list_slot_anchor(line_text, caret_col):
     第一个槽位上让位失败（VBE 那次恰好没在宽限期内弹出来）会把第二个槽位一起
     拖下水，于是"偶尔"才复现。按槽位记就互不影响：同一个槽位内连续打字锚点不变
     （不会抖），换到另一个槽位锚点就变（重新判定一次让位）。
+
+    ★v93：成员位置这一支下沉到 _member_list_dot_col —— 原先这里自己写了一遍
+    "找点号"，而它**缺了** `vbe_member_list_expected` 已有的两条守卫（`1.5`
+    小数点、注释 / 字符串），于是 `a = 1.5` 与 `' c. foo` 会算出一个根本不存在的
+    槽位。槽位是让位标记 `yield_given_up` 的键，假槽位会把"这一处 VBE 不弹"的
+    记录串到别处 —— 这类时序竞态最难查。现在两处共用同一份判据。
+
+    ⚠️ 这两条守卫对本函数是【必需】的，不能因为"反正 vbe_list_expected 已经判过
+    一次"就省掉：调用方（engine.trigger 算 _ysig）就是拿本函数的返回值当键，
+    它自己不再复核一遍位置合法性。
     """
     if not line_text or not caret_col or caret_col < 1:
         return None
     a = _type_list_anchor(line_text, caret_col)
     if a is not None:
         return a
-    i = min(int(caret_col) - 1, len(line_text))
-    j = i - 1
-    while j >= 0 and (line_text[j].isalnum() or line_text[j] == "_"):
-        j -= 1
-    k = j
-    while k >= 0 and line_text[k] in " \t":
-        k -= 1
-    if k >= 0 and line_text[k] == ".":
-        return k + 2
-    return None
+    k = _member_list_dot_col(line_text, caret_col)
+    if k is None:
+        return None
+    return k + 2
 
 
 def replace_word(line_text, word_start_col, caret_col, completion):
@@ -724,22 +914,11 @@ def _env_int(name, default):
 BUILTIN_SCATTER_MIN = _env_int("VBECOMPLETE_BUILTIN_SCATTER_MIN", 2)
 
 
-def _name_exists_outside_caret(backend, word, line_no, caret_col):
-    """把光标处的词抹掉之后，这个 name 在工程里还存不存在。
-
-    这是区分「真实存在的标识符」与「正在输入的回声」的唯一可靠问法，
-    由后端实现（可选接口 `backend.name_exists_outside_caret(name, caret)`）。
-
-    后端没实现时退化为 False —— 保守起见按"不存在"处理，等价于旧的
-    "不是声明过的名字就剔除本身"语义，行为不会比修复前更糟。
-    """
-    hook = getattr(backend, "name_exists_outside_caret", None)
-    if not callable(hook) or not word or not line_no or not caret_col:
-        return False
-    try:
-        return bool(hook(word, (int(line_no), int(caret_col))))
-    except Exception:
-        return False
+# ★v93：这里原来还有一个 `_name_exists_outside_caret(backend, word, line_no,
+# caret_col)` —— 早先"逐词问一次后端"的接口。它已经被 Completer.
+# _live_names_outside_caret（批量版，一次读模块文本给多个候选复用）完全取代，
+# 全代码库再无调用点（只有它自己的定义）。留着它会误导后来的人以为现场证据
+# 是"一个词一次 COM"，也会让人把回声防护改到那条不生效的路上 —— 删掉。
 
 
 # 弹窗一屏显示几行。**这是窗口高度，不是候选上限** —— 候选再多也不会被丢弃，
@@ -1461,6 +1640,55 @@ class Completer:
                                 and _body
                                 and all((_c.isalnum() or _c == "_")
                                         for _c in _body))
+                    # ★v93：第三种形态 —— VBE 把【已经在打的半截词】换掉了。
+                    #
+                    # 前三条判据的前提是"这一行只被【插入】了一段、其余逐字未动"。
+                    # 这在 VBE 的成员列表里【不总成立】：用户打 `ThisWorkbook.She`
+                    # 时列表给的是 `clearButtonsSheets`，按 Tab 之后 VBE 会把
+                    # `She` 这半截【替换】成它自己的选择 —— 新行是
+                    # `ThisWorkbook.clearButtonsSheets`，与旧行的公共后缀为 0
+                    # （`She` vs `eets` 尾字不同）⇒ `_p + _s >= len(旧文本)` 不成立
+                    # ⇒ 判据判成"这一行被动过"，记忆当场作废 ⇒ 紧接着的【补位】
+                    # 把刚写进去的那个词又弹回来。用户报的正是这个（真机 模块2
+                    # L88：`ThisWorkbook.She` + Tab ⇒ 他看到的弹窗是
+                    # `clearButtonsSheets`）。
+                    #
+                    # 放宽的口径：**光标左边的部分逐字未动**，只有【光标左边那一
+                    # 段标识符】被换成了另一段标识符。
+                    #   * 旧文本 = [前缀 A][正在打的词 W]（W 紧贴行尾，因为 VBE
+                    #     的成员列表只在行尾拼词时弹）；
+                    #   * 新文本 = [同一个前缀 A][VBE 换上的词 V]。
+                    # 判 A 相同即可 —— 用"公共前缀 _p 落在 A 的末尾之后或就在 A
+                    # 末尾"来表达：`_p >= len(A)`。A 就是"旧文本去掉末尾那段标识符"。
+                    #
+                    # ⚠️ 为什么这样不会误伤 `Tab` 缩进：缩进只加空白，`_p` 会一直
+                    # 走到旧文本末尾（`_p == len(_ak_txt)`），也让 V 为空 —— 下面
+                    # 仍要求"新行比旧行长 + V 全是标识符字符"，缩进两条都不过。
+                    # ⚠️ 为什么不会误伤"用户在别处编辑"：`_fresh` 已经锁死了同一
+                    # 行 + TTL 内，且 A 必须逐字相同。
+                    #
+                    # ⚠️⚠️ 为什么必须同时要求"新行【更长】"（v93 第二稿，第一稿
+                    # 漏了这条）：补全这个动作一定是"把半截词换成一个更长的词"。
+                    # 少了这一条，**退格删字**会被误判成"替换成更短的标识符"——
+                    # 用户把 `clearButtonsSheets` 退格成 `clearButto` 时，A 逐字
+                    # 相同、V 也是标识符，判据就成立了 ⇒ 一退格就静默，比 bug 本身
+                    # 还烦。有了它，退格（变短）走不到这一支，照常提示。
+                    if not _hit and _fresh and len(_now_txt) > len(_ak_txt):
+                        _a = len(_ak_txt)
+                        while (_a > 0
+                               and (_lo[_a - 1].isalnum() or _lo[_a - 1] == "_")):
+                            _a -= 1
+                        if _p >= _a and len(_now_txt) > _a:
+                            _v = _now_txt[_a:]
+                            _vb = _v[1:] if _v[:1] == "." else _v
+                            # 换上的词必须比被换掉的半截词【长】—— 否则"用户自己
+                            # 把词改短"也会被当成一次确认。
+                            _w_old = _ak_txt[_a:]
+                            _hit = bool(_vb
+                                        and _p >= _a
+                                        and len(_v) > len(_w_old)
+                                        and all((_c.isalnum() or _c == "_")
+                                                for _c in _vb))
             except Exception:
                 _hit = False
             if _hit:
