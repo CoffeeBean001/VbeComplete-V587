@@ -11221,16 +11221,25 @@ def main():
               [_r70c, (_u70d.shown, _k70d.current_matches())],
               expect_contain=[(False, []), (True, [u"类1"])])
 
-        # ---- 70.4 只活一次 ----
+        # ---- 70.4 ★v92：命中之后记忆【不再当场消费】，而是"钉住"VBE 留下的那一行 ----
+        # v91 之前这里是"只活一次"（命中即消费）。v92 发现真机上一次 Tab 会引来
+        # 【不止一次】trigger：第 1 次（补位）就把记忆吃掉之后，跟着来的那一次
+        # 无据可依，把刚写进去的词弹了回来 —— 用户报的"后面还是会提示"。
+        # 现在命中只是把锚换成"VBE 留下的那一行"（第二段），继续看着。
         _k70e, _u70e, _c70e, _p70e = _mk70(_AFTER70)
         _note70(_k70e)
         _k70e.trigger(False)
-        _r70e1 = (_k70e._accept_key, _u70e.shown)
+        _r70e1 = (_u70e.shown, _k70e._accept_pinned, _k70e._accept_key[1:])
+        _p70e.CodeModule.lines[2] = "    Set s1 = New Cl"    # 用户动过手：退格
+        _p70e.SetSelection(3, 19, 3, 19)
         _k70e.trigger(False)
-        check("70.4 这条记忆【只活一次】：命中那一刻就被消费掉（用户接着正常"
-              "输入时照常提示）—— 与 v90 一样，它不是永久屏蔽",
-              [_r70e1, (_k70e._accept_key, _u70e.shown)],
-              expect_contain=[(None, False), (None, True)])
+        check("70.4 ★v92：命中那一刻【不再消费】记忆，而是把它钉到\"VBE 留下的"
+              "那一行\"上（行号 + 行文本原样）—— 真机上一次 Tab 引来的 trigger "
+              "不止一次，只活一段就会漏；而用户一动过手（这一行不再是那个样子）"
+              "-> 记忆当场作废、v37 老口径立刻恢复",
+              [_r70e1, (_k70e._accept_key, _k70e._accept_pinned, _u70e.shown)],
+              expect_contain=[(False, True, (3, _AFTER70)),
+                              (None, False, True)])
 
         # ---- 70.5 ★对照（记忆不许赖着不走）：陈旧 / 换行 ----
         # v91：TTL 从 1.5s 放宽到 3.0s（记账与判据被消费之间隔着动作队列，
@@ -11576,13 +11585,14 @@ def main():
               "代码窗格（注释里刻意留着这两个名字讲缘由，所以只看代码行）；"
               "③记账时写一行日志，把\"压根没记\"和\"记了但判据没命中\"分开；"
               "④engine 判据里必须有\"插入段全是标识符字符\"这一条 —— 它是"
-              "放开门槛的唯一代价承担者",
+              "放开门槛的唯一代价承担者（v92 起那一段先去掉一个开头的点号，"
+              "落在 `_body` 上比，见 72.6）",
               [[("_vbe_list_showing_now" not in _code71),
                 ("com_backoff_remaining" not in _code71),
                 ("in_vbe_code_area()" in _code71),
                 ("post(completer.note_accept_key" in _code71),
                 ("hook: Tab 按下" in _branch71),
-                ("bool(_ins)" in _key71),
+                ("_body" in _key71),
                 ("isalnum()" in _key71)]],
               expect_contain=[[True] * 7])
 
@@ -11590,6 +11600,311 @@ def main():
         E71.Completer._vbe_popup_showing = _pyshow71
     except Exception as _e71:
         check("第 71 节异常: %s" % _e71, [True], expect_contain=[False])
+
+    # =====================================================================
+    # ★v92（用户报的）：按了 Tab，词已经写进编辑器，但【后面】还是提示。
+    #
+    # 用户截图那次是 `With Target.Validation` 里的 `.Delete` —— 点号成员位置，
+    # 我们全程让位（同 71 节），弹回来的是我们自己的候选 `deleteAllFiles`。
+    #
+    # v91 的判据本身没问题，坏在【记账只活一次】：真机上一次 Tab 会引来
+    # 【不止一次】trigger ——
+    #   ① Tab 按下 -> 钩子记下"按下前的那一行"；
+    #   ② VBE 把这个词写进编辑器；
+    #   ③ 轮询发现这一行变了 -> trigger(True) 走【让位】返回（不判据、不消费）；
+    #   ④ 同一轮轮询里，先前那次让位的宽限正好到期、VBE 的列表已关
+    #      -> confirm_yield(False) -> 补位 trigger(False)：判据命中 -> 静默；
+    #   ⑤ 但补位那一下把"已放弃让位"标记清了/记上了，随后 `_run_trigger` 又
+    #      补了一次 trigger(True)：宽限刚记过"这一处 VBE 不会弹"，它不再让位、
+    #      直接走到判据 —— 而记忆已被第 ④ 步吃掉（"只活一次"）-> 光标处的
+    #      `Delete` 是"工程里真实存在的" -> v37 的"打全名照样提示"把它弹了
+    #      回来（弹窗就在 Tab 之后紧接着出现，正是用户说的"后面还是会提示"）。
+    #
+    # 本节把"Tab 之后这一次写入引来的每一次 trigger 都要静默"钉死；两处放宽
+    # （大小写、开头的点号）与一处收紧（第二段改成"一个字都没再动过"）一并钉。
+    # =====================================================================
+    print("\n=== 72. v92：Tab 之后一次写入引来的【多次】trigger 都要静默 ===")
+    try:
+        import engine as E72
+        import vbe_bridge as VB72
+
+        class _UI72(object):
+            def __init__(self):
+                self.shown = False
+
+            def show(self, *a, **k):
+                self.shown = True
+
+            def hide(self, *a, **k):
+                self.shown = False
+
+            def update_selection(self, *a, **k):
+                pass
+
+            def contains_point(self, *a, **k):
+                return False
+
+        class _CM72(object):
+            def __init__(self, comp, text):
+                self._comp = comp
+                self.lines = list(text)
+
+            @property
+            def Name(self):
+                return self._comp.Name
+
+            @property
+            def Parent(self):
+                return self._comp
+
+            @property
+            def CountOfLines(self):
+                return len(self.lines)
+
+            def Lines(self, start, count):
+                s0 = max(0, int(start) - 1)
+                return "\r\n".join(self.lines[s0:s0 + int(count)])
+
+            def ReplaceLine(self, n, text):
+                self.lines[int(n) - 1] = str(text).rstrip("\r\n")
+
+        class _Comp72(object):
+            def __init__(self, name, ctype, text):
+                self.Name = name
+                self.Type = ctype
+                self.CodeModule = _CM72(self, text)
+
+        class _Proj72(object):
+            def __init__(self, comps):
+                self.Name = "VBAProject"
+                self.VBComponents = list(comps)
+
+        class _Pane72(object):
+            def __init__(self, cm, sel):
+                self.CodeModule = cm
+                self.sel = sel
+
+            def GetSelection(self):
+                return self.sel
+
+            def SetSelection(self, sl, sc, el, ec):
+                self.sel = (sl, sc, el, ec)
+
+        class _VBE72(object):
+            def __init__(self, comps, pane):
+                self.ActiveVBProject = _Proj72(comps)
+                self.ActiveCodePane = pane
+
+        _orig72 = VB72._get_vbe_cached
+        _pyshow72 = E72.Completer._vbe_popup_showing
+        # 同 71 节：这一节的落点是【文本判据】，真机的 Win32 让位查询会随
+        # "此刻 VBE 有没有画着成员列表"摇摆，一律当"列表不在屏幕上"。
+        E72.Completer._vbe_popup_showing = lambda self: False
+
+        _BEFORE72 = "    NoExplicitPub.getTi"
+        _AFTER72 = "    NoExplicitPub.getTitle"
+        _MEMBERS72 = ["Public abcDef As Long",
+                      "Public Function getTitle() As String",
+                      "    getTitle = \"\"",
+                      "End Function"]
+
+        def _wire72(line_text, line=3, col=None):
+            _c72 = _Comp72("M1", 1,
+                           ["Sub Work()",
+                            "    Dim s1 As Object",
+                            line_text,
+                            "End Sub",
+                            ""] + _MEMBERS72)
+            _comps72 = [_c72, _Comp72("NoExplicitPub", 1, _MEMBERS72)]
+            _n72 = int(col if col is not None else len(line_text))
+            _p72 = _Pane72(_c72.CodeModule, (line, _n72, line, _n72))
+            VB72._get_vbe_cached = lambda: _VBE72(_comps72, _p72)
+            return _c72, _p72
+
+        def _mk72(line_text, **kw):
+            _c72, _p72 = _wire72(line_text, **kw)
+            _ui72 = _UI72()
+            _k72 = E72.Completer(VB72.VbeBackend(), _ui72)
+            return _k72, _ui72, _c72, _p72
+
+        def _note72(k, ts=0.0, line=3, text=_BEFORE72):
+            """模拟"按下 Tab 那一刻"：main 的钩子线程把快照交给 engine。"""
+            k.note_accept_key((time.time() + ts, line, text))
+
+        def _round72(k):
+            """真机一轮：轮询发现变化 -> 语法让位 -> 宽限到 VBE 没弹 -> 补位。"""
+            k.trigger(True)
+            _y = k.yield_pending is not None
+            k.confirm_yield(False)
+            k.trigger(False)
+            return _y
+
+        # ---- 72.1 ★核心（用户报的那一下的完整时序）----
+        # 真机上 Tab 之后这一次写入会引来【两轮】"让位 -> 宽限到 -> 补位"。
+        # ⚠️ 两轮【必须分开 check】：check() 是"期望元素出现在 got 里"的子集
+        # 匹配，两轮的期望值一模一样时，第 1 轮的 got 会把两条期望一起满足 ——
+        # 也就是"第 2 轮弹了弹窗也照样绿"（v92 写这条时正是被它骗过一次，
+        # 与 70.5 记录的同一个坑）。
+        _k72, _u72, _c72, _p72 = _mk72(_AFTER72)
+        _note72(_k72)
+        _y72a = _round72(_k72)
+        _r72a = (_u72.shown, _k72.current_matches())
+        # 第 2 轮之前要把"已放弃让位"的标记清掉 —— 真机上 VBE 的成员列表在确认
+        # 之后还会闪一下（`_vbe_popup_showing()` 为真那条会把 `yield_given_up`
+        # 清掉），于是紧接着那一次 trigger(True) 会【重新让位】、0.25s 后再补位
+        # 一次。这一步正是 v91 漏掉的那一次（白盒地把那个状态摆出来）。
+        _k72.yield_given_up = None
+        _y72b = _round72(_k72)
+        _r72b = (_u72.shown, _k72.current_matches())
+        check("72.1a ★核心·第 1 轮（v91 已挡住的那一轮）：`NoExplicitPub.getTi` "
+              "处按 Tab、VBE 把 `getTitle` 补进来，轮询那次让位、宽限到 VBE "
+              "没弹、补位回来那一次不该把刚写进去的词提示一遍",
+              [(_y72a, _r72a)],
+              expect_contain=[(True, (False, []))])
+        check("72.1b ★核心·第 2 轮（v92 修的正是这一轮）：紧接着 `_run_trigger` "
+              "又让位一次、宽限到之后第 2 次补位 —— 它也不许弹。记账\"只活一次\""
+              "时，记忆在第 1 轮就被吃掉了，这一轮无据可依 -> 正是用户看到的"
+              "\"后面还是会提示\"",
+              [(_y72b, _r72b)],
+              expect_contain=[(True, (False, []))])
+
+        # ---- 72.2 ★真机那条更短的路径（也是用户那次实际走的）----
+        # 宽限这一轮刚记过"这一处 VBE 不会弹"，随后的 trigger(True) 便【不再
+        # 让位】、直接落到判据上 —— 补位那一次已经把记忆吃掉了，于是这里弹窗。
+        # 白盒地把那个状态摆出来（真机上它就是 confirm_yield(False) 的后效）。
+        _k72b, _u72b, _c72b, _p72b = _mk72(_AFTER72)
+        _note72(_k72b)
+        _k72b.trigger(False)                 # 补位（第 1 次）：静默
+        _s72b1 = _u72b.shown
+        _k72b.yield_given_up = ("M1", 3,
+                                E72.list_slot_anchor(_AFTER72, len(_AFTER72)))
+        _k72b.yield_given_up_at = time.time()
+        _k72b.trigger(True)                  # 紧接着轮询那次：不再让位，直判
+        _s72b2 = (_u72b.shown, _k72b.current_matches())
+        check("72.2 ★真机那条更短的路：补位（第 1 次）静默之后，轮询那次"
+              "trigger(True) 因为\"这一处 VBE 不会弹\"而不再让位、直接落到判据"
+              "—— 它也不许弹。这一支才是用户截图那一下（弹窗紧跟着 Tab 出现）",
+              [_s72b1, _s72b2],
+              expect_contain=[False, (False, [])])
+
+        # ---- 72.3 ★对照：没按过 Tab，同样两轮 -> 照常提示 ----
+        _k72c, _u72c, _c72c, _p72c = _mk72(_AFTER72)
+        _round72(_k72c)
+        _round72(_k72c)
+        check("72.3 ★对照：没按过 Tab（同一处、同样走两轮让位->补位）-> 照常"
+              "提示。证明 72.1/72.2 挡的是\"刚确认的那一次录入\"，不是这一处"
+              "压根给不出候选",
+              [(_u72c.shown, _k72c.current_matches())],
+              expect_contain=[(True, ["getTitle"])])
+
+        # ---- 72.4 ★钉住之后"用户一动手就恢复"（第二段的收紧）----
+        _k72d, _u72d, _c72d, _p72d = _mk72(_AFTER72)
+        _note72(_k72d)
+        _k72d.trigger(False)
+        _r72d1 = (_u72d.shown, _k72d._accept_pinned)
+        _c72d.CodeModule.lines[2] = "    NoExplicitPub.getTitl"   # 退格
+        _p72d.SetSelection(3, 25, 3, 25)
+        _k72d.trigger(False)
+        check("72.4 ★第二段（钉住）的边界：这一行只要被动过一下就当场作废 —— "
+              "①VBE 刚写完那一下静默（锚换成\"VBE 留下的那一行\"）；②用户退格"
+              "一个字符 -> 记忆作废、v37 老口径立刻恢复。它【不是】永久屏蔽",
+              [_r72d1, (_u72d.shown, _k72d.current_matches(),
+                        _k72d._accept_key)],
+              expect_contain=[(False, True), (True, ["getTitle"], None)])
+
+        # ---- 72.5 ★VBE 按自己的书写改写已打片段 ----
+        # 用户打的是 `.getti`，VBE 的成员列表把它改写成 `getTitle` —— 原样
+        # （区分大小写）比对会判成"这一行被动过"，白漏一次静默。
+        _k72e, _u72e, _c72e, _p72e = _mk72(_AFTER72)
+        _note72(_k72e, text="    NoExplicitPub.getti")
+        _k72e.trigger(False)
+        check("72.5 ★判据按小写比：`.getti` 被 VBE 改写成 `.getTitle`（大小写"
+              "不同）也算命中 -> 不提示",
+              [(_u72e.shown, _k72e.current_matches())],
+              expect_contain=[(False, [])])
+
+        # ---- 72.6 ★快照慢一拍：按下前那一行还没带上点号 ----
+        # 快照来自 100ms 轮询，用户手快（或当时 COM 在退避、cur_ctx 停更）时
+        # "按下前那一行"可能还没带上那个点号，于是插进来的一段是 `.getTitle`。
+        # Tab 缩进插的是空格 / `\t`，永远不会带点号 —— 所以放宽这一格不影响
+        # 71.3 的防护。
+        _k72f, _u72f, _c72f, _p72f = _mk72(_AFTER72)
+        _note72(_k72f, text="    NoExplicitPub")
+        _k72f.trigger(False)
+        _k72g, _u72g, _c72g, _p72g = _mk72("    abc", col=5)
+        _note72(_k72g, text="abc")           # 行首 Tab 缩进（插 4 个空格）
+        _k72g.trigger(False)
+        check("72.6 ★插入段允许一个开头的点号（快照慢一拍）：①旧文本还没带"
+              "点号、插进来的是 `.getTitle` -> 仍算命中、不提示；②而 Tab 缩进"
+              "插的是空格（连点号都没有）-> 该照常提示（71.3 的防护不许被这条"
+              "放宽伤到）",
+              [(_u72f.shown, _k72f.current_matches()),
+               (_u72g.shown, _k72g.current_matches())],
+              expect_contain=[(False, []), (True, ["abcDef"])])
+
+        # ---- 72.7 ★对照：钉住之后 TTL 到 -> 照常提示 ----
+        _k72h, _u72h, _c72h, _p72h = _mk72(_AFTER72)
+        _note72(_k72h)
+        _k72h.trigger(False)                 # 命中 -> 钉住
+        _ts72, _ln72, _txt72 = _k72h._accept_key
+        _k72h._accept_key = (_ts72 - 9.0, _ln72, _txt72)   # 假装 9s 过去了
+        _k72h.trigger(False)
+        _r72h = (_u72h.shown, _k72h.current_matches(), _k72h._accept_key)
+        check("72.7 ★对照（第二段也不是永久屏蔽）：TTL(3.0s) 一到 -> 记忆作废、"
+              "照常提示",
+              [_r72h],
+              expect_contain=[(True, ["getTitle"], None)])
+
+        # ---- 72.8 ★缩进那笔当场作废（不许赖着不走）----
+        _k72i, _u72i, _c72i, _p72i = _mk72("    abc", col=5)
+        _note72(_k72i, text="abc")
+        _k72i.trigger(False)                 # 缩进那一下：判据不成立 -> 作废
+        _r72i = (_k72i._accept_key, _k72i._accept_pinned)
+        _c72i.CodeModule.lines[2] = "    abcd"    # 用户接着打字
+        _p72i.SetSelection(3, 9, 3, 9)
+        _k72i.trigger(False)
+        check("72.8 ★缩进那笔当场作废（不许赖着不走）：Tab 缩进留下的记忆在"
+              "判据不成立时就清掉，用户接着打字照常提示",
+              [_r72i, (_u72i.shown, _k72i.current_matches())],
+              expect_contain=[(None, False), (True, ["abcDef"])])
+
+        # ---- 72.9 ★接线护栏 ----
+        _root72 = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        _engsrc72 = io.open(os.path.join(_root72, "engine.py"),
+                            encoding="utf-8").read()
+        _key72s = _engsrc72.split(
+            "if self._accept_key is not None and not manual:")[1].split(
+            "    def can_space_confirm")[0]
+        _note72s = _engsrc72.split(
+            "    def note_accept_key(self, snapshot):")[1].split(
+            "    def accept(self):")[0]
+        _hide72s = _engsrc72.split("    def hide(self):")[1].split(
+            "    def maybe_hide_on_outside_click")[0]
+        check("72.9 ★接线护栏：①判据分两段（`if self._accept_pinned:`）；②命中"
+              "那一支【不】消费记忆 —— 它把两段标记置 True、并把锚换成"
+              "\"VBE 留下的那一行\"（沿用原来的时刻，所以 TTL 仍然从那一次 Tab "
+              "起算）；③作废只发生在对不上那一支（`_accept_key = None` 排在"
+              "\"置 True\"之后）；④`note_accept_key` 里两段标记复位；⑤`hide()` "
+              "里不许出现这两个名字（与 v90/v90b 同坑）；⑥判据里两处放宽"
+              "（按小写比、允许一个开头的点号）也必须在",
+              [[("if self._accept_pinned:" in _key72s),
+                ("self._accept_pinned = True" in _key72s),
+                ("self._accept_key = (_ak_ts" in _key72s),
+                (_key72s.index("self._accept_pinned = True")
+                 < _key72s.index("self._accept_key = None")),
+                ("self._accept_pinned = False" in _key72s),
+                ("self._accept_pinned = False" in _note72s),
+                ("_accept_key" not in _hide72s),
+                ("_accept_pinned" not in _hide72s),
+                (".lower()" in _key72s),
+                ('_ins[:1] == "."' in _key72s),
+                ("按 Tab 那一笔对不上" in _key72s)]],
+              expect_contain=[[True] * 11])
+
+        VB72._get_vbe_cached = _orig72
+        E72.Completer._vbe_popup_showing = _pyshow72
+    except Exception as _e72:
+        check("第 72 节异常: %s" % _e72, [True], expect_contain=[False])
 
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))

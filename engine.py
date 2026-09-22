@@ -773,6 +773,14 @@ class Completer:
         # 用户报的"选中 类1 之后按 Tab，我们还会提示 类1"。
         # 判据见 trigger()：这一行【只被插入了一段、其余逐字未动】才认。
         self._accept_key = None
+        # ★v92：上面这笔记忆是【两段式】的，这个标记说它现在处在哪一段 ——
+        #   False = 第一段：锚的是【按下前】那一行，判据是"这一行只被插入了一段
+        #           【标识符】"（那一下就是 VBE 替用户补进来的词）；
+        #   True  = 第二段：锚的换成【VBE 留下的那一行】，判据收成"这一行一个
+        #           字都没再动过"。
+        # 为什么要分两段：见 trigger() 里那段 ★v92 的长注 —— 一次 Tab 会引来
+        # 【不止一次】trigger，只活一段就会漏。
+        self._accept_pinned = False
         self.shown_at = 0.0       # 最近一次真正弹出的时刻（供"刚弹出保护期"使用）
         # 当前候选各自的命中下标：{名字: [下标, ...]}，供 UI 把命中的字符标红。
         # 由 trigger() 填写、hide() 清空。UI 通过 completer 读取，不占用 show() 签名。
@@ -1401,44 +1409,101 @@ class Completer:
         # 那时拿一份很旧的快照去比，可能把用户后来的正常输入误认成那次录入。
         if self._accept_key is not None and not manual:
             _ak = self._accept_key
-            self._accept_key = None       # 只活一次：无论成立与否都消费掉
             _hit = False
             _ins = ""
             try:
                 _ak_ts, _ak_ln, _ak_txt = _ak
                 _now_txt = str(ctx.get("line_text") or "")
-                _p = 0
-                while (_p < len(_ak_txt) and _p < len(_now_txt)
-                       and _ak_txt[_p] == _now_txt[_p]):
-                    _p += 1
-                _s = 0
-                while (_s < len(_ak_txt) - _p and _s < len(_now_txt) - _p
-                       and _ak_txt[-1 - _s] == _now_txt[-1 - _s]):
-                    _s += 1
-                # ★v91：把"新插进去的那一段"抠出来，看它是不是【一个标识符】。
-                #
-                # 为什么必须有这一条：v91 起钩子侧不再要求"探到 VBE 的成员列表
-                # 窗"，于是用户按 Tab 【缩进】也会记下快照（Tab 在 VBE 里两种
-                # 用途：确认列表 / 缩进）。缩进插进来的是 `\t` 或空格，前后缀一
-                # 算同样满足"旧文本 = 新文本的公共前缀 + 公共后缀"——没有这条，
-                # 用户在行首按 Tab 缩进之后那一下就白静默一次。
-                # 反过来，真正的确认插进来的一定是标识符字符（`getTitle` / `类1`
-                # / `xlUp`），所以这条既挡住缩进，又不误伤真场景。
-                _ins = _now_txt[_p:len(_now_txt) - _s]
-                _hit = ((time.time() - _ak_ts) <= ACCEPT_KEY_TTL
-                        and int(ctx.get("line_no") or 0) == _ak_ln
-                        and len(_now_txt) > len(_ak_txt)
-                        and _p + _s >= len(_ak_txt)
-                        and bool(_ins)
-                        and all((_c.isalnum() or _c == "_") for _c in _ins))
+                _fresh = (int(ctx.get("line_no") or 0) == _ak_ln
+                          and (time.time() - _ak_ts) <= ACCEPT_KEY_TTL)
+                if self._accept_pinned:
+                    # 【第二段】锚的是"VBE 留下的那一行"：只要它一个字都没再
+                    # 动过，就还是那次录入的回声。
+                    _hit = bool(_fresh and _now_txt == _ak_txt)
+                else:
+                    # 【第一段】锚的是"按下前那一行"：算公共前缀 / 后缀，抠出
+                    # 中间多出来的那一段。
+                    #
+                    # ⚠️ 比较一律【按小写】：VBE 的成员列表按它自己的书写改写
+                    # 词 —— 用户打 `.de`、它给你补成 `.Delete`。原样（区分大小
+                    # 写）比就会被判成"这一行被动过"，白漏一次静默。
+                    _lo = _ak_txt.lower()
+                    _nl = _now_txt.lower()
+                    _p = 0
+                    while (_p < len(_lo) and _p < len(_nl)
+                           and _lo[_p] == _nl[_p]):
+                        _p += 1
+                    _s = 0
+                    while (_s < len(_lo) - _p and _s < len(_nl) - _p
+                           and _lo[-1 - _s] == _nl[-1 - _s]):
+                        _s += 1
+                    # ★v91：把"新插进去的那一段"抠出来，看它是不是【一个标识符】。
+                    #
+                    # 为什么必须有这一条：v91 起钩子侧不再要求"探到 VBE 的成员列表
+                    # 窗"，于是用户按 Tab 【缩进】也会记下快照（Tab 在 VBE 里两种
+                    # 用途：确认列表 / 缩进）。缩进插进来的是 `\t` 或空格，前后缀一
+                    # 算同样满足"旧文本 = 新文本的公共前缀 + 公共后缀"——没有这条，
+                    # 用户在行首按 Tab 缩进之后那一下就白静默一次。
+                    # 反过来，真正的确认插进来的一定是标识符字符（`getTitle` / `类1`
+                    # / `xlUp`），所以这条既挡住缩进，又不误伤真场景。
+                    #
+                    # ★v92：允许多出一个【开头的点号】。快照来自 100ms 轮询，
+                    # 用户手快（或当时 COM 正在退避、cur_ctx 停更）时"按下前那一
+                    # 行"可能还没带上那个点号，于是插进来的一段是 `.Delete` —— 只
+                    # 因多一个点就把整笔作废，代价太大（用户看到的正是"已经写进
+                    # 去了还是提示"）。Tab 缩进插的是空格 / `\t`，永远不会带点号，
+                    # 所以放宽这一格不影响缩进的防护（71.3）。
+                    _ins = _now_txt[_p:len(_now_txt) - _s]
+                    _body = _ins[1:] if _ins[:1] == "." else _ins
+                    _hit = bool(_fresh
+                                and len(_now_txt) > len(_ak_txt)
+                                and _p + _s >= len(_ak_txt)
+                                and _body
+                                and all((_c.isalnum() or _c == "_")
+                                        for _c in _body))
             except Exception:
                 _hit = False
             if _hit:
-                _log("trigger: 这一行刚被确认键补进 %r -> 本次录入已完成，"
-                     "不提示自己（行=%r）"
-                     % (_ins, int(ctx.get("line_no") or 0)))
+                if self._accept_pinned:
+                    _log("trigger: 这一行还是 VBE 留下的样子 -> 仍是本次录入的"
+                         "回声，不提示自己（行=%r）"
+                         % (int(ctx.get("line_no") or 0),))
+                else:
+                    _log("trigger: 这一行刚被确认键补进 %r -> 本次录入已完成，"
+                         "不提示自己（行=%r）"
+                         % (_ins, int(ctx.get("line_no") or 0)))
                 self.hide()
+                # ★v92：命中【不再当场消费】这笔记忆，而是把它【钉住】继续看
+                # 着 —— 一次 Tab 引来的 trigger 不止一次，而它们要挡的是同一
+                # 件事，只活一段就会漏。
+                #
+                # 用户报的（原话）："我按了 tab，delete 写入到编辑器，但是后面
+                # 还是会提示。"真机时序（`With Target.Validation` 里 `.Delete`
+                # 这种点号位置我们全程让位、从不弹自己的窗）：
+                #   ① Tab 按下 -> 钩子记下"按下前的那一行"；
+                #   ② VBE 把这个词写进编辑器；
+                #   ③ 轮询发现这一行变了 -> trigger(True) 走【让位】返回（不判
+                #      据，因此也不消费）；
+                #   ④ 同一轮轮询里，先前那次让位的宽限正好到期、VBE 的列表已关
+                #      -> confirm_yield(False) -> 补位 trigger(False)：判据命中
+                #      -> 静默（v91 到这儿是对的）；
+                #   ⑤ 但补位那一下把"已放弃让位"标记清了，随后 `_run_trigger`
+                #      又补了一次 trigger(True) -> 再次让位 -> 0.25s 后宽限到、
+                #      VBE 的列表早没了 -> 【第二次补位】trigger(False)；
+                #   ⑥ 这一次记忆已被第 ④ 步吃掉 -> 判据根本走不到 -> 光标处的
+                #      `Delete` 是"在工程里真实存在的" -> v37 的"打全名照样提
+                #      示"把它弹了回来（弹窗比 Tab 晚约 0.3s，正是用户说的
+                #      "后面还是会提示"）。
+                # 现在命中后把锚换成【VBE 留下的那一行】继续看着（第二段），直
+                # 到这一行真的被动过、或 TTL 到。用户只要一动手（退格 / 换行 /
+                # 打别的字符）对照就失败、记忆当场作废 —— 与 v90 一样，它不是
+                # "永久屏蔽这个名字"。
+                self._accept_pinned = True
+                self._accept_key = (_ak_ts, _ak_ln, _now_txt)
                 return
+            # 对不上（这一行被动过）或已过期 -> 这笔记忆作废
+            self._accept_key = None
+            self._accept_pinned = False
             _log("trigger: 按 Tab 那一笔对不上（插入段=%r 行=%r）-> 照常提示"
                  % (_ins, int(ctx.get("line_no") or 0)))
         # ★v90：刚由 Tab 写进编辑器的那个词，不再当候选提示回来（用户报的）。
@@ -1866,12 +1931,18 @@ class Completer:
         一段、其余逐字未动（见 trigger）。
 
         这里**不判**"该不该静默"，只负责把快照存下来；判据在 trigger() 里。
+
+        ★v92：记账同时把两段式标记复位（`_accept_pinned = False`）—— 这一笔
+        是崭新的"按下前那一行"，还没被任何一次 trigger 认过，所以从第一段起
+        看。判据的两段见 trigger() 里那段 ★v92 的长注。
         """
         try:
             _ts, _ln, _txt = snapshot
             self._accept_key = (float(_ts), int(_ln), str(_txt))
+            self._accept_pinned = False
         except Exception:
             self._accept_key = None
+            self._accept_pinned = False
 
     def accept(self):
         if not self.visible or not self.matches:
