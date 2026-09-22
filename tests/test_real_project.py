@@ -11233,18 +11233,27 @@ def main():
               expect_contain=[(None, False), (None, True)])
 
         # ---- 70.5 ★对照（记忆不许赖着不走）：陈旧 / 换行 ----
+        # v91：TTL 从 1.5s 放宽到 3.0s（记账与判据被消费之间隔着动作队列，
+        # 那一头可能正堵着一次全量重解析）。这里的"已经过期"相应取 -9.0s，
+        # 别贴着边界（-3.0 在 `<=` 口径下正好还算数，v91 改 TTL 时踩到过）。
+        #
+        # ⚠️ 这两问【必须分开 check】：check() 是"期望元素出现在 got 里"的
+        # 子集匹配，合成一条时第一问的期望会被第二问的 got 满足 —— 也就是
+        # "TTL 失效了也照样绿"（v91 改 TTL 时正是被这条假绿骗过一次）。
         _k70f, _u70f, _c70f, _p70f = _mk70(_AFTER70)
-        _note70(_k70f, ts=-3.0)
+        _note70(_k70f, ts=-9.0)
         _k70f.trigger(False)
-        _r70f = (_u70f.shown, _k70f.current_matches())
+        check("70.5a ★对照（记忆不许赖着不走）：快照已陈旧（TTL 过期 —— "
+              "COM 退避时 cur_ctx 会停更）-> 照常提示",
+              [(_u70f.shown, _k70f.current_matches())],
+              expect_contain=[(True, ["Cls1"])])
         _k70g, _u70g, _c70g, _p70g = _mk70(_AFTER70)
         _note70(_k70g, line=9)
         _k70g.trigger(False)
-        check("70.5 ★对照（记忆不许赖着不走）：①快照已陈旧（TTL 过期 —— "
-              "COM 退避时 cur_ctx 会停更）-> 照常提示；②行号对不上（用户换行"
-              "了）-> 照常提示",
-              [_r70f, (_u70g.shown, _k70g.current_matches())],
-              expect_contain=[(True, ["Cls1"]), (True, ["Cls1"])])
+        check("70.5b ★对照（记忆不许赖着不走）：行号对不上（用户换行了）"
+              "-> 照常提示",
+              [(_u70g.shown, _k70g.current_matches())],
+              expect_contain=[(True, ["Cls1"])])
 
         # ---- 70.6 ★对照（用户一动过手，v37 老口径立刻恢复）----
         # 按【真实时序】摆：Tab 插入那一行变化总会先被轮询发现、触发一次
@@ -11276,16 +11285,19 @@ def main():
               [(_u70j.shown, _k70j.current_matches())],
               expect_contain=[(True, ["Cls1"])])
 
-        # ---- 70.8 ★接线护栏 ----
+        # ---- 70.8 ★接线护栏（v91 修订：门槛收干净）----
         _root70 = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         _mainsrc70 = io.open(os.path.join(_root70, "main.py"),
                              encoding="utf-8").read()
         _engsrc70 = io.open(os.path.join(_root70, "engine.py"),
                             encoding="utf-8").read()
-        _helper70 = _mainsrc70.split("def _vbe_list_showing_now():")[1].split(
-            "    def post_trigger():")[0]
         _branch70 = _mainsrc70.split("elif (vk == VK_TAB")[1].split(
             "if suppress:")[0]
+        # 只看【代码行】：v91 的注释里刻意写着 `_vbe_list_showing_now` /
+        # `com_backoff_remaining` 这些名字（讲清为什么把它们从条件里去掉），
+        # 断言不能被注释里的字样带偏。
+        _code70 = "\n".join(_l for _l in _branch70.splitlines()
+                            if not _l.strip().startswith("#"))
         _note70src = _engsrc70.split(
             "    def note_accept_key(self, snapshot):")[1].split(
             "    def accept(self):")[0]
@@ -11293,21 +11305,16 @@ def main():
             "    def can_space_confirm")[0]
         _key70 = _trg70.split(
             "if self._accept_key is not None and not manual:")[1]
-        check("70.8 ★接线护栏：①钩子线程里只读 state[\"_popup_sig\"] 那份本地"
-              "缓存判\"VBE 的成员列表在不在屏幕上\"（绝不碰 COM）；②那一支排在"
-              "`completer.is_visible()` 之后（我们的窗可见时走 accept，不重复"
-              "记账）；③刻意【不吞键】—— 分支里没有 suppress = True，这一下 "
-              "Tab 照旧交给 VBE 去插入；④交给 engine 的是 (时刻, 行号, 行文本)，"
-              "【不带光标列】；⑤engine 那条判据在 `not manual` 之内、命中即 "
-              "hide + return，且排在 v90 那条【之前】",
-              [[("state.get(\"_popup_sig\")" in _helper70),
-                ("VBE_YIELD_CLASSES" in _helper70),
-                ("get_context" not in _helper70),
-                ("backend" not in _helper70),
-                ("post(completer.note_accept_key" in _branch70),
+        check("70.8 ★接线护栏：①那一支排在 `completer.is_visible()` 之后"
+              "（我们的窗可见时走 accept，不重复记账）；②刻意【不吞键】—— "
+              "分支里没有 suppress = True，这一下 Tab 照旧交给 VBE 去插入；"
+              "③交给 engine 的是 (时刻, 行号, 行文本)，【不带光标列】；"
+              "④engine 那条判据在 `not manual` 之内、命中即 hide + return，"
+              "且排在 v90 那条【之前】",
+              [[("post(completer.note_accept_key" in _branch70),
                 ("_snap[1], _snap[2]" in _branch70),
                 ("_snap[3]" not in _branch70),
-                ("suppress = True" not in _branch70),
+                ("suppress = True" not in _code70),
                 (_mainsrc70.index("elif completer.is_visible():")
                  < _mainsrc70.index("elif (vk == VK_TAB")),
                 ("_ts, _ln, _txt = snapshot" in _note70src),
@@ -11317,7 +11324,7 @@ def main():
                  < _trg70.index(
                      "if self._accepted is not None and not manual:")),
                 ("self.hide()" in _key70)]],
-              expect_contain=[[True] * 14])
+              expect_contain=[[True] * 10])
 
         # ---- 70.9 ★反坑护栏：hide() 里不许清这条记忆 ----
         _hide70 = _engsrc70.split("    def hide(self):")[1].split(
@@ -11332,6 +11339,257 @@ def main():
         VB70._get_vbe_cached = _orig70
     except Exception as _e70:
         check("第 70 节异常: %s" % _e70, [True], expect_contain=[False])
+
+    # =====================================================================
+    # ★v91（用户报的）：`模块名.成员名` 这种【点号成员补全】上按 Tab 确认后，
+    # 那个词又被提示了一遍。
+    #
+    # 与 70 节（v90b）的差别不在判据，而在【这一次触发是谁发起的】：
+    #   70 节的落点是"Tab 之后轮询发现这一行变了"那一次 trigger；
+    #   v91 报的落点是【让位宽限到、VBE 没弹 -> 自己把候选补回来】那一次
+    #   trigger(False)（v73 的补位路径）。
+    # 点号位置上 `vbe_list_expected` 恒为真（实测：连 `NoExplicitPub.getTitle`
+    # 这种"词已写完"的行也算真），所以我们全程让位、从不弹自己的窗 ——
+    # 于是每一次行变化都会走一遍"待定让位 -> 宽限到 -> 补位"。
+    #
+    # 为什么 70 节没能兜住：钩子侧记快照还要求 `_vbe_list_showing_now()`
+    # （上一轮 100ms 轮询采到的窗口签名里有 NameListWndClass）。那一格没采上
+    # 就压根没记账，补位那一次便无据可依。v91 把门槛收成"裸 Tab + 焦点在
+    # 代码窗格"，代价是 Tab【缩进】也会记账 —— 由判据第 4 条（插入段必须
+    # 全是标识符字符）挡掉，见 71.3 / 71.4。
+    # =====================================================================
+    print("\n=== 71. v91：点号成员按 Tab 确认后不再提示自己（含缩进不误伤）===")
+    try:
+        import engine as E71
+        import vbe_bridge as VB71
+
+        class _UI71(object):
+            def __init__(self):
+                self.shown = False
+
+            def show(self, *a, **k):
+                self.shown = True
+
+            def hide(self, *a, **k):
+                self.shown = False
+
+            def update_selection(self, *a, **k):
+                pass
+
+            def contains_point(self, *a, **k):
+                return False
+
+        class _CM71(object):
+            def __init__(self, comp, text):
+                self._comp = comp
+                self.lines = list(text)
+
+            @property
+            def Name(self):
+                return self._comp.Name
+
+            @property
+            def Parent(self):
+                return self._comp
+
+            @property
+            def CountOfLines(self):
+                return len(self.lines)
+
+            def Lines(self, start, count):
+                s0 = max(0, int(start) - 1)
+                return "\r\n".join(self.lines[s0:s0 + int(count)])
+
+            def ReplaceLine(self, n, text):
+                self.lines[int(n) - 1] = str(text).rstrip("\r\n")
+
+        class _Comp71(object):
+            def __init__(self, name, ctype, text):
+                self.Name = name
+                self.Type = ctype
+                self.CodeModule = _CM71(self, text)
+
+        class _Proj71(object):
+            def __init__(self, comps):
+                self.Name = "VBAProject"
+                self.VBComponents = list(comps)
+
+        class _Pane71(object):
+            def __init__(self, cm, sel):
+                self.CodeModule = cm
+                self.sel = sel
+
+            def GetSelection(self):
+                return self.sel
+
+            def SetSelection(self, sl, sc, el, ec):
+                self.sel = (sl, sc, el, ec)
+
+        class _VBE71(object):
+            def __init__(self, comps, pane):
+                self.ActiveVBProject = _Proj71(comps)
+                self.ActiveCodePane = pane
+
+        _orig71 = VB71._get_vbe_cached
+        _pyshow71 = E71.Completer._vbe_popup_showing
+        # 这一节的落点是【文本判据】。真机上的 Win32 让位查询会随"此刻 VBE
+        # 有没有画着成员列表"摇摆，测起来不稳定；一律当"列表不在屏幕上"。
+        E71.Completer._vbe_popup_showing = lambda self: False
+
+        _BEFORE71 = "    NoExplicitPub.getTi"
+        _AFTER71 = "    NoExplicitPub.getTitle"
+        _MEMBERS71 = ["Public abcDef As Long",
+                      "Public Function getTitle() As String",
+                      "    getTitle = \"\"",
+                      "End Function"]
+
+        def _wire71(line_text, line=3, col=None):
+            _c71 = _Comp71("M1", 1,
+                           ["Sub Work()",
+                            "    Dim s1 As Object",
+                            line_text,
+                            "End Sub",
+                            ""] + _MEMBERS71)
+            _comps71 = [_c71, _Comp71("NoExplicitPub", 1, _MEMBERS71)]
+            _n71 = int(col if col is not None else len(line_text))
+            _p71 = _Pane71(_c71.CodeModule, (line, _n71, line, _n71))
+            VB71._get_vbe_cached = lambda: _VBE71(_comps71, _p71)
+            return _c71, _p71
+
+        def _mk71(line_text, **kw):
+            _c71, _p71 = _wire71(line_text, **kw)
+            _ui71 = _UI71()
+            _k71 = E71.Completer(VB71.VbeBackend(), _ui71)
+            return _k71, _ui71, _c71, _p71
+
+        def _note71(k, ts=0.0, line=3, text=_BEFORE71):
+            k.note_accept_key((time.time() + ts, line, text))
+
+        def _ins71(before, after):
+            """复算判据第 4 条看的那个量：新插入的那一段。"""
+            _p = 0
+            while (_p < len(before) and _p < len(after)
+                   and before[_p] == after[_p]):
+                _p += 1
+            _s = 0
+            while (_s < len(before) - _p and _s < len(after) - _p
+                   and before[-1 - _s] == after[-1 - _s]):
+                _s += 1
+            return after[_p:len(after) - _s], (_p + _s >= len(before))
+
+        # ---- 71.1 ★核心（用户报的那一下）----
+        # 按真实时序摆：Tab 之后这一行变了 -> 轮询 trigger(True) 走语法让位
+        # -> 宽限到、VBE 没弹 -> trigger(False) 补位。
+        _k71, _u71, _c71, _p71 = _mk71(_AFTER71)
+        _note71(_k71)
+        _k71.trigger(True)
+        _r71_yield = _k71.yield_pending is not None
+        _k71.confirm_yield(False)
+        _k71.trigger(False)
+        check("71.1 ★核心（用户报的）：`NoExplicitPub.getTi` 处按 Tab、VBE 把"
+              "`getTitle` 补进来之后 —— 轮询那次先让位（点号位置 VBE 会弹列表），"
+              "宽限到 VBE 没弹、候选补回来那一次【不该】把刚写进去的词提示一遍",
+              [(_r71_yield, _u71.shown, _k71.current_matches())],
+              expect_contain=[(True, False, [])])
+
+        # ---- 71.2 ★对照：同一条行、同一个光标，只是【没有】这条记忆 ----
+        _k71b, _u71b, _c71b, _p71b = _mk71(_AFTER71)
+        _k71b.trigger(True)
+        _k71b.confirm_yield(False)
+        _k71b.trigger(False)
+        check("71.2 ★对照：没按过 Tab（同一处，同样走一遍让位->补位）-> 照常"
+              "提示。证明 71.1 挡的是\"刚确认的那一次录入\"，不是这一处压根"
+              "给不出候选",
+              [(_u71b.shown, _k71b.current_matches())],
+              expect_contain=[(True, ["getTitle"])])
+
+        # ---- 71.3 ★判据第 4 条：Tab 缩进不许被误当成"一次录入" ----
+        # v91 把钩子门槛放宽成"裸 Tab 就记账"，于是 Tab 缩进那一下也记账了。
+        # 缩进插进来的是空格 / 制表符 —— 前三条判据（同一行 + 这一行变长 +
+        # 旧文本 = 新文本的前缀+后缀）**全都成立**，只靠第 4 条挡住。
+        _k71c, _u71c, _c71c, _p71c = _mk71("    abc", col=5)
+        _note71(_k71c, text="abc")          # 行首缩进：abc -> "    abc"
+        _k71c.trigger(False)
+        check("71.3 ★缩进不误伤：行首按 Tab 缩进（插进来的是 4 个空格）-> "
+              "该照常提示，不许因为\"这一行变长了\"就白静默一次",
+              [(_u71c.shown, _k71c.current_matches())],
+              expect_contain=[(True, ["abcDef"])])
+
+        # ---- 71.4 ★判据第 4 条到底在看什么（把中间量摆出来）----
+        _i71a, _f71a = _ins71(_BEFORE71, _AFTER71)
+        _i71b, _f71b = _ins71("abc", "    abc")
+        _i71c, _f71c = _ins71("    abc def", "    abc\t def")
+        check("71.4 ★判据第 4 条看的量：①成员确认 -> 插入段 `tle`（全是标识符"
+              "字符，认作一次录入）；②行首 Tab 缩进 -> 4 个空格；③行中间 Tab "
+              "-> `\\t`。②③ 的\"前缀+后缀\"判据都成立，只有第 4 条能把它们"
+              "挡掉 —— 这正是放开钩子门槛的代价所在",
+              [[(_i71a, _f71a,
+                 all((_x.isalnum() or _x == "_") for _x in _i71a)),
+                (_i71b, _f71b,
+                 all((_x.isalnum() or _x == "_") for _x in _i71b)),
+                (_i71c, _f71c,
+                 all((_x.isalnum() or _x == "_") for _x in _i71c))]],
+              expect_contain=[[("tle", True, True),
+                               ("    ", True, False),
+                               ("\t", True, False)]])
+
+        # ---- 71.5 ★中文 / 全角也无碍 ----
+        _k71e, _u71e, _c71e, _p71e = _mk71(u"    Set s = NoExplicitPub.getTitle")
+        _note71(_k71e, text=u"    Set s = NoExplicitPub.getTi")
+        _k71e.trigger(False)
+        check("71.5 ★中文 / 全角也无碍：判据只用文本、一个列都不碰"
+              "（显示列 vs 字符列的坑见 70.8 与第 70 节开头）-> 不提示",
+              [(_u71e.shown, _k71e.current_matches())],
+              expect_contain=[(False, [])])
+
+        # ---- 71.6 ★TTL 放宽到 3.0s ----
+        _k71f, _u71f, _c71f, _p71f = _mk71(_AFTER71)
+        _note71(_k71f, ts=-2.5)
+        _k71f.trigger(False)
+        _k71g, _u71g, _c71g, _p71g = _mk71(_AFTER71)
+        _note71(_k71g, ts=-9.0)
+        _k71g.trigger(False)
+        check("71.6 ★TTL（v91：1.5s -> 3.0s）：①2.5s 前的快照仍算数 —— 按下"
+              "那一刻记账、与判据被消费之间隔着动作队列，那一头可能正堵着一次"
+              "全量重解析 -> 不提示；②9s 前的快照已过期（COM 退避时 cur_ctx "
+              "会停更）-> 照常提示",
+              [(_u71f.shown, _k71f.current_matches()),
+               (_u71g.shown, _k71g.current_matches())],
+              expect_contain=[(False, []), (True, ["getTitle"])])
+
+        # ---- 71.7 ★接线护栏（门槛只剩"裸 Tab + 焦点在代码窗格"）----
+        _root71 = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        _mainsrc71 = io.open(os.path.join(_root71, "main.py"),
+                             encoding="utf-8").read()
+        _engsrc71 = io.open(os.path.join(_root71, "engine.py"),
+                            encoding="utf-8").read()
+        _branch71 = _mainsrc71.split("elif (vk == VK_TAB")[1].split(
+            "if suppress:")[0]
+        _code71 = "\n".join(_l for _l in _branch71.splitlines()
+                            if not _l.strip().startswith("#"))
+        _key71 = _engsrc71.split("def trigger(self,")[1].split(
+            "    def can_space_confirm")[0].split(
+            "if self._accept_key is not None and not manual:")[1]
+        check("71.7 ★接线护栏：①钩子那一支的条件里【不再】依赖"
+              "`_vbe_list_showing_now`（100ms 轮询的窗口缓存 —— 用户这次报的"
+              "正是它没采上）与 `com_backoff_remaining`；②只剩裸 Tab + 焦点在"
+              "代码窗格（注释里刻意留着这两个名字讲缘由，所以只看代码行）；"
+              "③记账时写一行日志，把\"压根没记\"和\"记了但判据没命中\"分开；"
+              "④engine 判据里必须有\"插入段全是标识符字符\"这一条 —— 它是"
+              "放开门槛的唯一代价承担者",
+              [[("_vbe_list_showing_now" not in _code71),
+                ("com_backoff_remaining" not in _code71),
+                ("in_vbe_code_area()" in _code71),
+                ("post(completer.note_accept_key" in _code71),
+                ("hook: Tab 按下" in _branch71),
+                ("bool(_ins)" in _key71),
+                ("isalnum()" in _key71)]],
+              expect_contain=[[True] * 7])
+
+        VB71._get_vbe_cached = _orig71
+        E71.Completer._vbe_popup_showing = _pyshow71
+    except Exception as _e71:
+        check("第 71 节异常: %s" % _e71, [True], expect_contain=[False])
 
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))

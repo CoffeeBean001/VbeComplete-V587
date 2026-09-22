@@ -107,7 +107,15 @@ SUPPRESS_AFTER_ACCEPT = 0.35
 # VBE 插了什么词，所以只能靠【按下前的位置快照 + 这一行只被插入了一段】
 # 来认。TTL 只负责兜"陈旧快照"（COM 退避时 cur_ctx 会停更），不是主判据 ——
 # 主判据是内容（那一行除了插入段之外逐字未动）。
-ACCEPT_KEY_TTL = 1.5
+#
+# ★v91：1.5s -> 3.0s。按下那一刻记账（钩子线程）与判据被消费（主线程的
+# trigger）之间隔着动作队列，而那一头**可能正堵着一次全量重解析**（用户报的
+# `NoExplicitPub.getTi` 场景里，Tab 之后紧跟的正是"让位宽限到 -> 补位"那次
+# trigger，它排在重解析后面）。1.5s 会把这类"晚到但内容完全对得上"的情形
+# 判成过期，于是刚写进去的词又被提示一遍。放宽到 3.0s 的代价可以忽略：
+# 判据本身要求"同一行 + 这一行只被插入了一段标识符 + 其余逐字未动"，
+# 而且**只活一次**（命中与否都当场消费），不存在"永久屏蔽这个名字"。
+ACCEPT_KEY_TTL = 3.0
 
 
 def extract_word_before(line_text, caret_col):
@@ -1375,8 +1383,12 @@ class Completer:
         #   * 同一行（行号一致）；
         #   * 这一行【变长了】；
         #   * 旧行文本恰好等于"新行文本的公共前缀 + 公共后缀"（`_p + _s >= len`）
-        #     ⇒ 这一行除了被插入了一段之外，一个字都没动。
-        # 三条一起成立 ⇒ 那一段就是 VBE 刚替用户补进来的词，v37 的"打全名照样
+        #     ⇒ 这一行除了被插入了一段之外，一个字都没动；
+        #   * ★v91：**被插入的那一段本身必须全是标识符字符**（`_ins`）。
+        #     有了这一条，钩子侧才敢把"够不够格记这一笔"的门槛降到最低（裸 Tab
+        #     就记，见 main.py）——Tab 在 VBE 里还有【缩进】这一用途，缩进插进来
+        #     的是 `\t` / 空格，前三条照样成立，没有第 4 条就会白静默一次。
+        # 四条一起成立 ⇒ 那一段就是 VBE 刚替用户补进来的词，v37 的"打全名照样
         # 提示"在这儿必须让路。用户只要动过手（退格、换行、在别处编辑）对照就
         # 失败 —— 与 v90 一样，这不是永久屏蔽，只活一次。
         #
@@ -1391,6 +1403,7 @@ class Completer:
             _ak = self._accept_key
             self._accept_key = None       # 只活一次：无论成立与否都消费掉
             _hit = False
+            _ins = ""
             try:
                 _ak_ts, _ak_ln, _ak_txt = _ak
                 _now_txt = str(ctx.get("line_text") or "")
@@ -1402,17 +1415,32 @@ class Completer:
                 while (_s < len(_ak_txt) - _p and _s < len(_now_txt) - _p
                        and _ak_txt[-1 - _s] == _now_txt[-1 - _s]):
                     _s += 1
+                # ★v91：把"新插进去的那一段"抠出来，看它是不是【一个标识符】。
+                #
+                # 为什么必须有这一条：v91 起钩子侧不再要求"探到 VBE 的成员列表
+                # 窗"，于是用户按 Tab 【缩进】也会记下快照（Tab 在 VBE 里两种
+                # 用途：确认列表 / 缩进）。缩进插进来的是 `\t` 或空格，前后缀一
+                # 算同样满足"旧文本 = 新文本的公共前缀 + 公共后缀"——没有这条，
+                # 用户在行首按 Tab 缩进之后那一下就白静默一次。
+                # 反过来，真正的确认插进来的一定是标识符字符（`getTitle` / `类1`
+                # / `xlUp`），所以这条既挡住缩进，又不误伤真场景。
+                _ins = _now_txt[_p:len(_now_txt) - _s]
                 _hit = ((time.time() - _ak_ts) <= ACCEPT_KEY_TTL
                         and int(ctx.get("line_no") or 0) == _ak_ln
                         and len(_now_txt) > len(_ak_txt)
-                        and _p + _s >= len(_ak_txt))
+                        and _p + _s >= len(_ak_txt)
+                        and bool(_ins)
+                        and all((_c.isalnum() or _c == "_") for _c in _ins))
             except Exception:
                 _hit = False
             if _hit:
-                _log("trigger: 这一行刚被确认键补进一段 -> 本次录入已完成，"
-                     "不提示自己（%r）" % (str(ctx.get("line_text") or "")[-40:],))
+                _log("trigger: 这一行刚被确认键补进 %r -> 本次录入已完成，"
+                     "不提示自己（行=%r）"
+                     % (_ins, int(ctx.get("line_no") or 0)))
                 self.hide()
                 return
+            _log("trigger: 按 Tab 那一笔对不上（插入段=%r 行=%r）-> 照常提示"
+                 % (_ins, int(ctx.get("line_no") or 0)))
         # ★v90：刚由 Tab 写进编辑器的那个词，不再当候选提示回来（用户报的）。
         #
         # 用户口径（原话）："当我按下 tab 键之后，提示词打印到编辑器里，那么本次

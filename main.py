@@ -705,22 +705,6 @@ def main():
         state["popup_manual"] = False
         completer.trigger(True)
 
-    def _vbe_list_showing_now():
-        """上一轮轮询采到的 VBE 提示窗签名里，有没有【成员列表】（v90b）。
-
-        刻意只读 state["_popup_sig"] 这份本地缓存：win32_filter 跑在键盘钩子
-        线程里，那里绝不能碰 COM，也要尽量少做 Win32 调用（每次按键都会走）。
-        这份签名由 poll_editor 每轮（100ms）无条件采样，而用户停在 VBE 的成员
-        列表上挑项的时间远长于一个轮询周期，所以按下那一刻它一定是最新的。
-        """
-        try:
-            for _cls, _l, _t, _r, _b in (state.get("_popup_sig") or ()):
-                if _cls in vbe_bridge.VBE_YIELD_CLASSES:
-                    return True
-        except Exception:
-            pass
-        return False
-
     def post_trigger():
         """把"内容变了，重整候选"排进主线程队列，并做【合并】。
 
@@ -1008,9 +992,7 @@ def main():
                 elif (vk == VK_TAB
                         and not _mod_down()
                         and not _shift_down()
-                        and com_backoff_remaining() <= 0
-                        and in_vbe_code_area()
-                        and _vbe_list_showing_now()):
+                        and in_vbe_code_area()):
                     # ★v90b（用户报的）：这一下 Tab 是压给【VBE 自己的成员列表】
                     # 的 —— 我们的弹窗早就让位隐藏了（VBE 的列表画在屏幕上时我们
                     # 一律让位），所以上面那条 `completer.is_visible()` 的
@@ -1018,22 +1000,46 @@ def main():
                     #
                     # 麻烦在于我们看不见 VBE 插了什么词：等这一行变了被轮询发现而
                     # 触发时，光标处那个词已经是"在工程里真实存在的"（就是 VBE
-                    # 刚写进去的，比如 `类1`），v37 的"打全名照样提示"就把它弹了
-                    # 出来。用户口径（原话）："按 tab 键，就意味着本次录入完成，
-                    # 不需要去匹配提示词。"
+                    # 刚写进去的，比如 `类1` / `getTitle`），v37 的"打全名照样
+                    # 提示"就把它弹了出来。用户口径（原话）："按 tab 键，就意味着
+                    # 本次录入完成，不需要去匹配提示词。"
+                    #
+                    # ★v91（用户报的"点号成员补全后按 Tab 仍提示自己"）：把
+                    # "够不够格记这一笔"的门槛收干净。原先还额外要求
+                    # `_vbe_list_showing_now()`（上一轮轮询采到的窗口签名里得有
+                    # NameListWndClass）与 `com_backoff_remaining() <= 0`，两条都
+                    # 站不住：
+                    #   * 窗口签名是 100ms 轮询的【缓存】。用户按 Tab 那一刻它未必
+                    #     新鲜（主线程正忙在一次全量重解析上、或 VBE 的列表窗刚
+                    #     重建过句柄），一没采上这一笔就压根没记 —— 随后"让位宽限
+                    #     到、VBE 没弹 -> trigger(False) 补候选"这条【补位路径】
+                    #     就把刚写进去的 `getTitle` 又弹了一遍（用户报的正是
+                    #     "已经打印进去了，但还是提示"）。
+                    #   * COM 退避与本支无关：这里只读本地快照、又不吞键，不做任何
+                    #     COM 动作，没理由因为退避就不记账。
+                    # 现在只剩"裸 Tab + 焦点在代码窗格"。纯缩进那一下也会被记进来
+                    # —— 判据侧（engine.trigger）要求"插入的那一段【全是标识符
+                    # 字符】"，`\t` / 空格构成的那一段会被它挡掉，所以不误伤。
                     #
                     # 这里只做一件事：记下【按下前】那一刻的位置快照（吃
                     # state["cur_ctx"] —— 钩子线程不能碰 COM，理由同
                     # _enter_indent_key_ok）。刻意**不带光标列**：cur_ctx 里那一
                     # 列是 VBE 的显示列，而触发时的 ctx["caret_col"] 是字符列，
                     # 混着比中文名字会对不上（engine.note_accept_key 有详注）。
-                    # 真正的判据在 engine.trigger 里：这一行只被插入了一段、
-                    # 其余逐字未动，才认作那次录入。
+                    # 真正的判据在 engine.trigger 里：这一行只被插入了一段
+                    # 【标识符】、其余逐字未动，才认作那次录入。
                     # 刻意【不】吞键：这一下 Tab 照旧交给 VBE 去插入。
                     _snap = state.get("cur_ctx")
                     if _snap and len(_snap) >= 3:
+                        # 只在按 Tab 时写一行（频率极低）；VBECOMPLETE_LOG 关掉时
+                        # log() 直接返回，零开销。排查"这次为什么没记住"时，
+                        # 有这一行才能把"压根没记"和"记了但判据没命中"分开。
+                        _log("hook: Tab 按下 -> 记下按下前的行快照 行=%r 文本=%r"
+                             % (_snap[1], str(_snap[2])[-40:]))
                         post(completer.note_accept_key,
                              (time.time(), _snap[1], _snap[2]))
+                    else:
+                        _log("hook: Tab 按下但拿不到 cur_ctx 快照 -> 本次不记账")
                 if suppress:
                     state["swallowed"].add(vk)
 
