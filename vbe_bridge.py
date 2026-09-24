@@ -364,6 +364,37 @@ def _indent_end_col(indent, sem_info=None):
     return _disp_width(indent, 4, False) + 1
 
 
+def _eol_caret_col(line_text, sem_info=None):
+    """行尾光标的【列】（1-based），按编辑器自己的列语义给（v94）。
+
+    用途：删掉一个空行之后，光标要落到【上一行行尾】—— 与 VBE 原生"空行上按
+    退格"的落点一致（原生是把换行符吃掉、两行并成一行，光标停在上一行末尾）。
+
+    两条语义：
+      * 字符列 -> len + 1；
+      * 显示列 -> Tab 展开到 tab stop、全角按 wide2 计 2 格。
+    行内既无 Tab 也无全角时两者相同 —— 绝大多数行走这一档，不需要语义信息。
+
+    ⚠️ 只在行内真的有 Tab / 全角时才去取 sem_info：那条路会碰 COM（探测列语义
+    时要移动光标再还原），能不碰就不碰。拿不到语义信息就按显示列 +
+    (tabw=4, wide2=False) 兜底 —— 与 _indent_end_col 同一个口径（比按字符列算
+    更贴近 VBE 实际行为）。
+    """
+    t = line_text or ""
+    if not ("\t" in t or any(_is_wide(c) for c in t)):
+        return len(t) + 1
+    info = sem_info if sem_info else _sem_cache.get("info")
+    if info:
+        try:
+            sem, tabw, wide2 = info
+            if sem == "disp":
+                return _disp_width(t, tabw, wide2) + 1
+            return len(t) + 1
+        except Exception:
+            pass
+    return _disp_width(t, 4, False) + 1
+
+
 # ---- 回车后的自动缩进（v79） ----
 #
 # 用户口径两条：
@@ -1042,6 +1073,41 @@ def enter_indent_wanted(line_text, caret_ec):
         # 纯 ASCII（无 Tab）：显示列 == 字符列，直接比
         return False
     return bool(_is_comment_only(t) or opens_block(t))
+
+
+def blank_line_delete_wanted(line_text, caret_ec=None, tabw=4):
+    """钩子线程用的纯判据：这一下退格要不要由我们接管 —— 整行【只有空白】就
+    删掉整行（v94）。
+
+    用户口径：「按退格的时候，如果整行是空行，能删除整行，IDEA 里写 Java 就有
+    这个功能」。
+
+    需要我们的正是 VBE 自己按回车继承缩进造出来的那种行（`    `）：原生退格
+    一次只吃掉**一个**空格，要按 4 下才空、第 5 下才并到上一行去。
+
+    三道门槛（拿不准就一律 False，放行给 VBE，与 enter_indent_wanted 同口径）：
+      * 【真空行】（`""`）不接管 —— 光标必然在第 1 列，VBE 原生退格就是"并到
+        上一行"，结果和我们删整行**一模一样**，没必要抢（多一次 COM 往返、
+        也多一处出错的可能）；
+      * 【有内容的行】不接管 —— 那是普通删字，一个字都不许碰；
+      * 光标必须在【这行空白的末尾】。停在缩进中间说明用户多半是想改缩进量，
+        那一档照旧交给 VBE 一次删一格。
+
+    ⚠️ 光标列两种语义都认（`ec == len+1` 或 `ec == 行尾显示列`）：VBE 报告的是
+    **显示列**，Tab 缩进的行在两种语义下数值不同，只认一种会让整条功能在 Tab
+    缩进的工程里静默失效。两种口径都指向"行尾"这同一个位置，不会误判（一个
+    Tab 内部的列值 VBE 根本不会报出来）。
+    """
+    t = line_text or ""
+    if not t or t.strip():
+        return False
+    try:
+        ec = int(caret_ec or 0)
+    except Exception:
+        return False
+    if ec <= 0:
+        return False
+    return ec == len(t) + 1 or ec == _eol_disp_col(t, tabw)
 
 
 def _unterminated_string(line_text):
@@ -3768,6 +3834,82 @@ class VbeBackend:
         finally:
             # 与 apply_completion 同理：写过代码（VBAProject 变脏），立刻放开
             # 手里的 COM 代理，别拖住 Excel 的退出/写回。
+            _release_vbe_proxy()
+
+    # ---- 退格删整行（v94：整行只有空白时，一次退格删掉整行） ----
+    def delete_blank_line_here(self):
+        """光标所在的【空行】（只有空白）整行删掉，光标落到【上一行行尾】。
+
+        用户口径：「按退格的时候，如果整行是空行，能删除整行，IDEA 里写 Java
+        就有这个功能」。钩子侧的纯判据见 blank_line_delete_wanted —— 那里已经
+        按轮询快照筛过一遍，这里是**真正的权威**：再读一次真实行文本确认，
+        因为快照最多是 100ms 前的（用户可能刚粘贴完就按退格）。
+
+        落点刻意选【上一行行尾】：与 VBE 原生"空行上按退格"完全一致（原生是
+        吃掉换行符、两行并成一行，光标停在上一行末尾）。删完之后用户接着按
+        退格删的就是上一行的字 —— 正是他按住退格时期待的行为。
+
+        ⚠️ 这些情形一律返回 False（交给 VBE 原生退格，调用方会把这一下按键
+        原样还给系统，绝不会出现"吞了按键却什么都没发生"）：
+          * 有选区：退格是"删选区"，语义完全不同；
+          * 真空行（`""`）：原生退格的结果与删整行一模一样，没必要抢；
+          * 行里有内容：那是普通删字；
+          * 取不到 COM / 模块只读 / 出任何异常。
+
+        单行一次写：只在确认完毕之后调一次 DeleteLines（绝不边读边写、也绝不
+        在 finally 里补写）。落光标单独 try —— DeleteLines 已经成了却因为落
+        光标失败而返回 False，会让调用方再补一次退格、多删一个字符。
+        """
+        try:
+            vbe = _get_vbe_cached()
+            if vbe is None:
+                return False
+            cp = vbe.ActiveCodePane
+            if cp is None:
+                return False
+            cm = cp.CodeModule
+            sl, sc, el, ec = cp.GetSelection()
+            if int(sl) != int(el) or int(sc) != int(ec):
+                return False                    # 有选区：那是"删选区"
+            anchor = int(sl)
+            if anchor <= 0:
+                return False
+            try:
+                n_lines = int(cm.CountOfLines)
+            except Exception:
+                n_lines = 0
+            if anchor > n_lines:
+                return False
+            raw = str(cm.Lines(anchor, 1)).rstrip("\r\n")
+            # 权威复核：判据与钩子侧【同一份实现】（blank_line_delete_wanted），
+            # 只是喂进去的是【此刻真读到的】行与列 —— 快照最多是 100ms 前的，
+            # 中间用户可能用鼠标把光标点到缩进中间（那时他要的是"退一格"，
+            # 不是删整行），也可能刚粘贴进一整段代码。这里一票否决，调用方会把
+            # 这一下退格原样还给系统，绝不会误删。
+            if not blank_line_delete_wanted(raw, ec):
+                return False
+            prev_no = anchor - 1
+            if prev_no >= 1:
+                prev_raw = str(cm.Lines(prev_no, 1)).rstrip("\r\n")
+                if "\t" in prev_raw or any(_is_wide(c) for c in prev_raw):
+                    # 只有真需要列语义时才去取（那条路会碰 COM）
+                    _col = _eol_caret_col(
+                        prev_raw, _resolve_sem_info(cm, cp, prev_no))
+                else:
+                    _col = len(prev_raw) + 1
+                _line = prev_no
+            else:
+                # 删的是第 1 行：没有"上一行"，光标落在新首行行首
+                _line, _col = 1, 1
+            cm.DeleteLines(anchor, 1)
+            try:
+                cp.SetSelection(_line, _col, _line, _col)
+            except Exception:
+                pass
+            return True
+        except Exception:
+            return False
+        finally:
             _release_vbe_proxy()
 
     # ---- 按行移动光标（Shift+↑ / Shift+↓） ----

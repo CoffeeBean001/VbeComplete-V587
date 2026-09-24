@@ -12210,6 +12210,190 @@ def main():
     except Exception as _e73:
         check("第 73 节异常: %s" % _e73, [True], expect_contain=[False])
 
+    # ---- 74. v94：退格删整行（整行只有空白 -> 一次退格删掉整行） ----
+    #
+    # 用户口径："当我按退格键的时候，如果整行是空行，能删除整行，IDEA 里写 Java
+    # 就有这个功能。"
+    #
+    # 需要我们的正是 VBE 自己按回车继承缩进造出来的那种行（`    `）：原生退格
+    # 一次只吃掉一个空格，要按 4 下才空、第 5 下才并到上一行去。
+    #
+    # 三处设计要点（各有一条用例钉住）：
+    #   ① 真空行（`""`）不接管 —— 原生退格的结果与删整行一模一样，抢了没好处；
+    #   ② 光标必须在空白末尾 —— 停在缩进中间说明用户想改缩进量，那是"退一格"；
+    #   ③ 删完当场作废轮询快照 —— 否则按住退格（键盘重复约 33ms）会拿【删之前
+    #      那一行的旧快照】再判一次，把下面那一行也删掉。
+    print("\n=== 74. v94：退格删整行（IDEA 风格） ===")
+    try:
+        import vbe_bridge as VB74
+
+        class _CM74(object):
+            def __init__(self, lines):
+                self.lines = list(lines)
+                self.Name = "M1"
+
+            @property
+            def CountOfLines(self):
+                return len(self.lines)
+
+            def Lines(self, start, count):
+                s0 = max(0, int(start) - 1)
+                return "".join(l + "\n"
+                               for l in self.lines[s0:s0 + int(count)])
+
+            def DeleteLines(self, start, count=1):
+                s0 = max(0, int(start) - 1)
+                del self.lines[s0:s0 + int(count)]
+
+        class _Pane74(object):
+            def __init__(self, cm, sel):
+                self.CodeModule = cm
+                self.sel = sel
+
+            def GetSelection(self):
+                return self.sel
+
+            def SetSelection(self, sl, sc, el, ec):
+                self.sel = (sl, sc, el, ec)
+
+        class _VBE74(object):
+            def __init__(self, pane):
+                self.ActiveCodePane = pane
+
+        _orig74 = VB74._get_vbe_cached
+
+        def _run74(lines, line_no, col, sel=None):
+            """按 mock 的代码窗跑一次 delete_blank_line_here，返回 (ok, 行表, 选区)。
+
+            ⚠️ 光标列按【字符列】给 —— 脚手架里的行一律用 ASCII（真机
+            GetSelection 给的是**显示列**，全角占两格会偏；第 65 节同一处提醒）。
+            """
+            cm74 = _CM74(lines)
+            pane74 = _Pane74(cm74, sel if sel is not None else
+                             (int(line_no), int(col), int(line_no), int(col)))
+            VB74._get_vbe_cached = lambda: _VBE74(pane74)
+            try:
+                ok74 = VB74.VbeBackend().delete_blank_line_here()
+            finally:
+                VB74._get_vbe_cached = _orig74
+            return (ok74, cm74.lines, pane74.sel)
+
+        # ---- 74.1 ★判据（用户报的场景）：缩进空行 + 光标在行尾 ----
+        check("74.1 ★判据（用户报的场景）：`    ` 这种【只有空白】的行、光标停在"
+              "行尾（VBE 按回车继承缩进造出来的正是这种行）-> 接管；同一行光标"
+              "落在缩进【中间】或行首 -> 不接管（那时用户多半是想改缩进量，"
+              "交给 VBE 一次删一格）",
+              [VB74.blank_line_delete_wanted("    ", 5),
+               VB74.blank_line_delete_wanted("    ", 3),
+               VB74.blank_line_delete_wanted("    ", 1)],
+              expect_contain=[True, False, False])
+
+        # ---- 74.2 真空行交给 VBE 原生（结果一样，不抢）----
+        check("74.2 ★真空行（`\"\"`）不接管：光标必然在第 1 列，VBE 原生退格就是"
+              "【并到上一行】，结果与删整行一模一样 —— 抢了只多一次 COM 往返和"
+              "一处出错的可能",
+              [VB74.blank_line_delete_wanted("", 1),
+               VB74.blank_line_delete_wanted("", 0)],
+              expect_contain=[False, False])
+
+        # ---- 74.3 有内容的行 = 普通删字，一个字都不许碰 ----
+        check("74.3 ★有内容的行不接管（那是普通删字）：代码行 / 整行注释 / 行尾"
+              "带空格的代码行 一律 False —— 判据只认【整行只有空白】",
+              [VB74.blank_line_delete_wanted("    x = 1", 10),
+               VB74.blank_line_delete_wanted("    ' 注释", 8),
+               VB74.blank_line_delete_wanted("Sub F1()", 9)],
+              expect_contain=[False, False, False])
+
+        # ---- 74.4 Tab 缩进的工程：两种列语义都要认 ----
+        # VBE 报告的是【显示列】，Tab 缩进的行在两种语义下数值不同（`\t` 显示列
+        # 是 5、字符列是 2）。只认一种会让整条功能在 Tab 缩进的工程里静默失效。
+        check("74.4 ★Tab 缩进的工程照旧生效：`\\t` 空行的行尾列在【显示列】语义下"
+              "是 5、在【字符列】语义下是 2 —— 两种都认（都指向同一个\"行尾\"，"
+              "而一个 Tab 内部的列值 VBE 根本不会报出来）",
+              [VB74.blank_line_delete_wanted("\t", 5),
+               VB74.blank_line_delete_wanted("\t", 2),
+               VB74.blank_line_delete_wanted("\t\t", 3)],
+              expect_contain=[True, True, True])
+
+        # ---- 74.5 ★集成：整行删掉，光标落到【上一行行尾】----
+        _L74 = ["Sub F1()", "    x = 0", "    ", "    y = 1", "End Sub"]
+        check("74.5 ★集成（用户报的场景）：`    x = 0` 与 `    y = 1` 中间夹着一个"
+              "缩进空行，光标停在它行尾按退格 -> 整行消失，光标落到【上一行行尾】"
+              "（第 2 行第 10 列，正是 `    x = 0` 的末尾）—— 与 VBE 原生\"空行上"
+              "按退格（吃掉换行、两行并一行）\"的落点完全一致",
+              [_run74(_L74, 3, 5)],
+              expect_contain=[(True,
+                               ["Sub F1()", "    x = 0", "    y = 1", "End Sub"],
+                               (2, 10, 2, 10))])
+
+        # ---- 74.6 有选区 -> 那是"删选区"，一个字符都不许动 ----
+        check("74.6 ★有选区不接管：退格在有选区时是【删掉选区】，语义完全不同 —— "
+              "后端必须原样退回（调用方会把这一下退格还给系统），行表一个字没变",
+              [_run74(["Sub F1()", "    ", "End Sub"], 2, 5, sel=(2, 1, 3, 1))],
+              expect_contain=[(False, ["Sub F1()", "    ", "End Sub"],
+                               (2, 1, 3, 1))])
+
+        # ---- 74.7 ★后端复核（快照可能过期）：光标此刻不在行尾 -> 不删 ----
+        # 钩子判据吃的是 100ms 前的轮询快照：用户可能刚用鼠标把光标点到缩进
+        # 中间（他要的是"退一格"），也可能刚粘贴进一整段代码。后端必须拿【此刻
+        # 真读到的】行与列再判一次 —— 同一份 blank_line_delete_wanted。
+        check("74.7 ★后端权威复核判据：快照说\"空行\"、可此刻光标停在缩进【中间】"
+              "（鼠标刚点过）-> 不接管，行表一个字符都没删（判据与钩子侧同一份"
+              "实现，只是喂进去的是此刻真读到的数据）",
+              [_run74(["Sub F1()", "    x = 0", "        ", "End Sub"], 3, 3)],
+              expect_contain=[(False,
+                               ["Sub F1()", "    x = 0", "        ", "End Sub"],
+                               (3, 3, 3, 3))])
+
+        # ---- 74.8 删的是第 1 行（没有"上一行"）----
+        check("74.8 删第 1 行（没有上一行可落光标）：整行照样删掉，光标落到新的"
+              "首行行首，不抛异常、也不返回 False（返回 False 会让调用方再补一次"
+              "退格、多删一个字符）",
+              [_run74(["    ", "Sub F1()"], 1, 5)],
+              expect_contain=[(True, ["Sub F1()"], (1, 1, 1, 1))])
+
+        # ---- 74.9 ★接线护栏（源码断言）----
+        _root74 = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        _src74 = io.open(os.path.join(_root74, "main.py"),
+                         encoding="utf-8").read()
+        _vbr74 = io.open(os.path.join(_root74, "vbe_bridge.py"),
+                         encoding="utf-8").read()
+        _fn74 = _src74.split("def _delete_blank_line_here(")[1].split(
+            "\n    def ")[0]
+        check("74.9 ★接线护栏：①钩子侧判据在 win32_filter 里被调用，且排在"
+              "`completer.is_visible()` 那条分支【之前】（空行上挂着候选也要收掉）；"
+              "②判据在【退格】上才判（VK_BACK）；③动作里删不成就 `send_vk(VK_BACK)` "
+              "把这一下退格原样还给系统（绝不\"吞了按键却什么都没发生\"）",
+              [[("_bs_delete_line_key_ok(vk)" in _src74),
+                (_src74.index("_bs_delete_line_key_ok(vk)")
+                 < _src74.index("elif completer.is_visible():")),
+                ("vk != VK_BACK" in _src74),
+                ("send_vk(VK_BACK)" in _fn74)]],
+              expect_contain=[[True, True, True, True]])
+
+        check("74.10 ★按住退格不许连删：删完【当场作废轮询快照】"
+              "（`state[\"cur_ctx\"] = None`）—— 快照 100ms 刷一次、键盘重复却约 "
+              "33ms 一次，不作废的话第二次重复会拿【删之前那一行的旧快照】再判"
+              "一次\"整行是空行\"，把下面那一行也删掉；作废后到下次轮询为止退格走"
+              "VBE 原生（删上一行最后一个字符），正是用户按住退格时期待的行为",
+              [('state["cur_ctx"] = None' in _fn74)],
+              expect_contain=[True])
+
+        _bs74 = _vbr74.split("def delete_blank_line_here(")[1].split(
+            "\n    def ")[0]
+        check("74.11 ★判据只有一份实现：vbe_bridge 里 `blank_line_delete_wanted` "
+              "只定义一次，后端 delete_blank_line_here 【复用它】做权威复核"
+              "（不再自己写第二遍\"是不是空行\"）—— 同一条语义两份实现是本仓库"
+              "的惯犯（v87 可见性 / v93 成员位置都栽过）；另：先 `DeleteLines` "
+              "后单独 try 落光标（DeleteLines 已成却因落光标失败而返回 False，"
+              "会让调用方再补一次退格、多删一个字符）",
+              [[(_vbr74.count("def blank_line_delete_wanted(") == 1),
+                ("blank_line_delete_wanted(raw, ec)" in _bs74),
+                ("cm.DeleteLines(anchor, 1)" in _bs74)]],
+              expect_contain=[[True, True, True]])
+    except Exception as _e74:
+        check("第 74 节异常: %s" % _e74, [True], expect_contain=[False])
+
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))
     if FAILURES:

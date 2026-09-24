@@ -21,6 +21,9 @@ VbeComplete 主入口（修复版）
   - Shift+Enter  在当前行下方【新起一行】：当前行不拆分（光标右侧的代码留在
     原行），新行缩进与上一行代码起始位置对齐，光标落在新行缩进之后。等价于
     "先把光标移到行尾再按回车"，但一步到位（光标在行中间时同样适用）；
+  - 退格     整行【只有空白】时（VBE 按回车继承缩进造出来的那种空行），一次
+    退格把整行删掉，光标落到上一行行尾 —— IDEA 里写 Java 的手感。想关掉：
+    设 VBECOMPLETE_NO_BS_DELLINE=1。
   - Esc     取消；鼠标单击/双击候选也可确认；
   - ← / →   移动光标即收起列表（与"鼠标点到别处"同义），按键照常放行；
   - Ctrl+Space  手动触发。
@@ -83,6 +86,7 @@ WM_SYSKEYDOWN = 0x0104
 WM_SYSKEYUP = 0x0105
 
 VK_TAB = 0x09
+VK_BACK = 0x08         # v94：整行只有空白时，退格 = 删掉整行
 VK_RETURN = 0x0D
 VK_SHIFT = 0x10         # 只用来查"Shift 是否按住"（Shift+Enter = 新起一行）
 VK_ESCAPE = 0x1B
@@ -317,6 +321,25 @@ try:
                                    "0").strip() != "1")
 except Exception:
     ENTER_INDENT = True
+
+# ---- v94：退格删整行（IDEA 风格）----
+#
+# 用户口径：「按退格的时候，如果整行是空行，能删除整行，IDEA 里写 Java 就有
+# 这个功能」。
+#
+# VBE 自己按回车会继承上一行缩进，于是"不要这一行"要按 4 下退格才空、第 5 下
+# 才并上去 —— 这一下退格替用户把整行收掉，光标落到【上一行行尾】（与 VBE 原生
+# "空行上按退格"的落点完全一致）。
+#
+# 判据是纯函数 vbe_bridge.blank_line_delete_wanted，跑在键盘钩子线程里（只读
+# 轮询留下的快照，绝不碰 COM）；真正的删除在主线程，删不成就把这一下退格
+# 【原样还给系统】—— 绝不会"吞了按键却什么都没发生"。
+# 想关掉（退格完全回到 VBE 原生）：set VBECOMPLETE_NO_BS_DELLINE=1
+try:
+    BS_DELETE_BLANK_LINE = (os.environ.get("VBECOMPLETE_NO_BS_DELLINE",
+                                           "0").strip() != "1")
+except Exception:
+    BS_DELETE_BLANK_LINE = True
 
 # 钩子里判"要不要接管回车"时，轮询快照最多允许多旧（秒）。
 # 快照是每轮轮询刷新的（100ms 一次），但空闲时会降频到 2s。超过这个年纪就
@@ -795,6 +818,29 @@ def main():
             _log("enterindent: 未接管 -> 回车原样还给系统")
             send_vk(VK_RETURN)
 
+    def _delete_blank_line_here():
+        """退格删整行（v94）：先收窗，再删；没删成就把这一下退格原样还给系统。
+
+        ★删完必须当场把快照作废（state["cur_ctx"] = None）。快照是 100ms 轮询
+        刷的，而按住退格时键盘重复大约 33ms 一次 —— 不作废的话，第二次重复会拿
+        【删之前那一行的旧快照】再判一次"整行是空行"，于是把下面那一行也删掉
+        （连续按几下凭空少好几行）。作废之后到下一次轮询为止退格走 VBE 原生
+        （删上一行最后一个字符）—— 正是用户按住退格时期待的行为。
+        """
+        try:
+            completer.hide()
+        except Exception:
+            pass
+        _ok = False
+        try:
+            _ok = backend.delete_blank_line_here()
+        except Exception:
+            _ok = False
+        state["cur_ctx"] = None
+        if not _ok:
+            _log("bsdelline: 未接管 -> 退格原样还给系统")
+            send_vk(VK_BACK)
+
     def _move_caret_here(delta):
         """Shift+↑/↓（候选窗可见时）：收起我们的窗，光标上/下移一行（v78）。
 
@@ -885,6 +931,38 @@ def main():
         except Exception:
             return False
 
+    def _bs_delete_line_key_ok(vk):
+        """这一下退格要不要由我们接管（v94，跑在键盘钩子线程里，绝不碰 COM）。
+
+        与 _enter_indent_key_ok 同一副骨架：只吃【轮询留下的快照】，过期就一律
+        不接管 —— 宁可这一次不删整行（原生退格删一个空格，无害），也绝不拿旧
+        行文本去赌用户正在敲的那一行（快照说"空行"、其实刚粘贴进来一整段，
+        那会把用户的代码删掉）。
+
+        ⚠️ pending_keys > 0 必须挡在前面：那是"按了可能写字的键、文档却还没变"
+        （输入法正在组字 / 刚敲的字还没落进文档）。此时快照必然是旧的，抢这一
+        下退格会连用户刚敲的字一起删掉。
+        """
+        try:
+            if not BS_DELETE_BLANK_LINE or vk != VK_BACK:
+                return False
+            if _shift_down() or _mod_down():
+                # Ctrl+Backspace 在 VBE 里是"删上一个词"，语义完全不同
+                return False
+            if int(state.get("pending_keys") or 0) > 0:
+                return False
+            if com_backoff_remaining() > 0 or not in_vbe_code_area():
+                return False
+            ctx = state.get("cur_ctx")
+            if not ctx:
+                return False
+            ts, _ln, text, ec = ctx
+            if time.time() - float(ts) > ENTER_CTX_MAX_AGE:
+                return False
+            return bool(vbe_bridge.blank_line_delete_wanted(text, ec))
+        except Exception:
+            return False
+
     def win32_filter(msg, data):
         """
         Windows 低层键盘钩子的事件过滤器（运行在钩子线程）。
@@ -936,6 +1014,17 @@ def main():
                     # 回车原样交给 VBE）。真正的写入在主线程，写不成会把这一下
                     # 回车原样还给系统。
                     action = (_enter_indent_here, ())
+                    suppress = True
+                elif _bs_delete_line_key_ok(vk):
+                    # v94 退格删整行：整行只有空白（VBE 按回车继承缩进造出来的
+                    # 那种 `    `）时，一次退格把整行收掉。判据全在钩子线程里用
+                    # 纯函数算完（只读快照、不碰 COM）；真正的删除在主线程，
+                    # 删不成就把这一下退格原样还给系统。
+                    #
+                    # 刻意排在 completer.is_visible() 那条分支【之前】：空行上不
+                    # 该有候选，真挂着（刚把字删光的那一瞬间）也会由动作里的
+                    # completer.hide() 收掉，与另外几条改写文本的路一致。
+                    action = (_delete_blank_line_here, ())
                     suppress = True
                 elif (_pair_ch
                         and not _mod_down()
