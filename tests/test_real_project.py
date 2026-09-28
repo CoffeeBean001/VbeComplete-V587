@@ -12254,7 +12254,20 @@ def main():
                 return self.sel
 
             def SetSelection(self, sl, sc, el, ec):
-                self.sel = (sl, sc, el, ec)
+                # ★忠实模拟真 VBE 的两条行为（缺了任一条都测不出 v94b 那个 bug）：
+                #   ① 列是【显示列】（全角占 2 格、Tab 展开）—— v93 实测；
+                #   ② 超出行尾的列会被**钳到行尾**。
+                # 后者正是 vbe_bridge._vbe_measure 与 move_caret_line 赖以成立
+                # 的前提（`move_caret_line` 的注释明写"目标行较短时由 VBE 自己
+                # 钳到行尾"）；v94b 的落点也改成了求它 —— 自己算就会少算全角。
+                ln = max(1, min(int(sl), len(self.CodeModule.lines)))
+                try:
+                    _t74 = self.CodeModule.lines[ln - 1]
+                except Exception:
+                    _t74 = ""
+                _eol74 = VB74._disp_width(_t74, 4, True) + 1
+                self.sel = (ln, max(1, min(int(sc), _eol74)),
+                            ln, max(1, min(int(ec), _eol74)))
 
         class _VBE74(object):
             def __init__(self, pane):
@@ -12391,6 +12404,48 @@ def main():
                 ("blank_line_delete_wanted(raw, ec)" in _bs74),
                 ("cm.DeleteLines(anchor, 1)" in _bs74)]],
               expect_contain=[[True, True, True]])
+
+        # ---- 74.12 ★用户报的 bug：上一行含【汉字】时，光标落在中文中间 ----
+        # 复现口径：本会话里第一次列语义探测碰巧落在【纯 ASCII 且无 Tab】的行上，
+        # VBE 报的 EOL 列恰好 == len+1，_fit_semantics 就得出 ("char", 4, False)
+        # —— 这句其实只说明"这一行上两种语义数值相同、分不出来"，可它被当成
+        # "VBE 用字符列"缓存了下来。于是含汉字的行按 len+1 给列，VBE 却按显示列
+        # 解释 -> 少算【全角字符个数】格 -> 光标落在 `完成` 两个字中间。
+        #
+        # `    MsgBox "完成"`：15 个字符 / 显示宽 17 -> 行尾显示列 18（真值）；
+        # 老口径（字符列）给 16，正好差 2 = 两个汉字的格数 —— 与用户报的症状一致。
+        _sem74 = VB74._sem_cache.get("info")
+        try:
+            VB74._sem_cache["info"] = ("char", 4, False)   # 复现那条错结论的缓存
+            check("74.12 ★用户报的场景：上一行是 `    MsgBox \"完成\"`，删掉下面的缩进"
+                  "空行后光标必须落在【真行尾】第 18 列（显示列、全角占 2 格）—— "
+                  "按'字符列'算只有 16，VBE 会把它当显示列解释，光标正好停在两个"
+                  "汉字中间。落点的列**不许自己算**，交给 VBE 自己钳到行尾",
+                  [_run74(["Sub F1()", '    MsgBox "完成"', "    ", "End Sub"],
+                          3, 5)],
+                  expect_contain=[(True,
+                                   ["Sub F1()", '    MsgBox "完成"', "End Sub"],
+                                   (2, 18, 2, 18))])
+
+            check("74.13 ★同一处根因的 Tab 版：上一行 `\\tx = 1`，行尾显示列是 10"
+                  "（Tab 展开到 4）+ `x = 1` 5 列；缓存被错记成'字符列'时老口径只给 "
+                  "7（len+1），光标歪在 Tab 后面 —— 落点同样由 VBE 钳定",
+                  [_run74(["Sub F1()", "\tx = 1", "    ", "End Sub"], 3, 5)],
+                  expect_contain=[(True, ["Sub F1()", "\tx = 1", "End Sub"],
+                                   (2, 10, 2, 10))])
+        finally:
+            VB74._sem_cache["info"] = _sem74
+
+        check("74.14 ★落点不再自己算（源码护栏）：`_caret_to_line_end` 只定义一次、"
+              "且被 delete_blank_line_here 调用；`_eol_caret_col`（按列语义算）"
+              "在该函数里只剩【兜底】一处；顺带 `_resolve_sem_info` 不该再出现 —— "
+              "那条路会为了探测【移动光标】（退格路上多做一次\"移走再还原\"，"
+              "本身就是\"光标偶尔自己跳\"的隐患）",
+              [[(_vbr74.count("def _caret_to_line_end(") == 1),
+                ("_caret_to_line_end(cp, cm, prev_no, prev_raw)" in _bs74),
+                (_bs74.count("_eol_caret_col(") == 1),
+                ("_resolve_sem_info" not in _bs74)]],
+              expect_contain=[[True, True, True, True]])
     except Exception as _e74:
         check("第 74 节异常: %s" % _e74, [True], expect_contain=[False])
 

@@ -364,8 +364,67 @@ def _indent_end_col(indent, sem_info=None):
     return _disp_width(indent, 4, False) + 1
 
 
+def _caret_to_line_end(cp, cm, line_no, line_text=None):
+    """把光标移到 line_no 行的【行尾】—— 列号交给 VBE 自己夹，一行都不算。
+
+    ★v94b 修的是用户报的"上一行含汉字时，删完空行光标落在上一行中间"：
+    落点原本靠 `_eol_caret_col` 按【列语义】算，而列语义这套东西在这件事上
+    根本不可靠 ——
+
+      * 真 VBE 报的是**显示列**（全角占 2 格，v93 实测：`    For 每个元素 = 1 To 10`
+        光标在字符列 18 时报的显示列是 22）；
+      * 可列语义是**一次性缓存**的（_sem_cache），命中与否取决于"会话里第一次
+        走到探测时碰巧是哪一行"。若那行是**纯 ASCII 且无 Tab**，VBE 报的 EOL 列
+        恰好 == len+1，`_fit_semantics` 的结论就是 `("char", 4, False)` ——
+        这句翻译过来是"VBE 用字符列"，可真相是"这一行上两种语义数值相同，
+        **分不出来**"。缓存于是带着错结论留到下一次；
+      * 等到上一行含汉字时，`_eol_caret_col` 按"字符列"给 len+1，VBE 却把它当
+        **显示列**解释 => 少算【全角字符个数】格 => 光标落在中文中间；
+      * 缓存为空 / 探测被判 broken 时兜底也是 `_disp_width(t, 4, False)`，
+        同样按"全角占 1 格"算，症状一模一样。
+
+    与其把这套语义继续猜下去，不如**问 VBE 自己**：`SetSelection` 给一个远超
+    行尾的列，VBE 会把它夹回行尾（本文件 `_vbe_measure` 就是靠这个特性反推
+    列语义的）。无论内部是字符列还是显示列、全角算 1 还是 2、Tab 多宽，落点
+    都是 VBE 自己认的行尾 —— 不需要任何换算。
+
+    返回 True 表示光标已经落在目标行行尾；False 表示这条路没走通（拿不到
+    COM / 该编辑器不夹列），调用方按老口径兜底。
+    """
+    try:
+        ln = int(line_no)
+    except Exception:
+        return False
+    if line_text is None:
+        try:
+            line_text = str(cm.Lines(ln, 1)).rstrip("\r\n")
+        except Exception:
+            line_text = ""
+    # 远超行尾：不管 VBE 内部怎么算，这个值都一定越过它的行长。
+    far = len(line_text or "") + 512
+    try:
+        cp.SetSelection(ln, far, ln, far)
+        sl, sc, el, ec = cp.GetSelection()
+    except Exception:
+        return False
+    try:
+        if int(sl) != ln or int(el) != ln:
+            return False
+        if int(sc) != int(ec) or int(sc) < 1 or int(sc) >= far:
+            # sc >= far：该编辑器根本不夹列（WPS 的兼容编辑器有这种表现），
+            # 光标会停在远超行尾的地方 -> 交给调用方按算出来的列兜底。
+            return False
+    except Exception:
+        return False
+    return True
+
+
 def _eol_caret_col(line_text, sem_info=None):
     """行尾光标的【列】（1-based），按编辑器自己的列语义给（v94）。
+
+    ⚠️★v94b：这只是**兜底**。首选路径是 `_caret_to_line_end`（让 VBE 自己夹列），
+    因为列语义可能压根没探测出来、或探测时用的行恰好是纯 ASCII 而得出错误结论
+    （详见 `_caret_to_line_end` 的说明）。只有那条路走不通时才退到这里。
 
     用途：删掉一个空行之后，光标要落到【上一行行尾】—— 与 VBE 原生"空行上按
     退格"的落点一致（原生是把换行符吃掉、两行并成一行，光标停在上一行末尾）。
@@ -3849,6 +3908,10 @@ class VbeBackend:
         吃掉换行符、两行并成一行，光标停在上一行末尾）。删完之后用户接着按
         退格删的就是上一行的字 —— 正是他按住退格时期待的行为。
 
+        ★v94b 落点的【列】不再由我们算：交给 VBE 自己钳（`_caret_to_line_end`
+        给一个远超行尾的列，VBE 夹回行尾）。原先按列语义算，上一行含汉字时会
+        少算全角的格数，光标落在中文中间 —— 详见那里的说明。
+
         ⚠️ 这些情形一律返回 False（交给 VBE 原生退格，调用方会把这一下按键
         原样还给系统，绝不会出现"吞了按键却什么都没发生"）：
           * 有选区：退格是"删选区"，语义完全不同；
@@ -3889,21 +3952,18 @@ class VbeBackend:
             if not blank_line_delete_wanted(raw, ec):
                 return False
             prev_no = anchor - 1
+            prev_raw = ""
             if prev_no >= 1:
                 prev_raw = str(cm.Lines(prev_no, 1)).rstrip("\r\n")
-                if "\t" in prev_raw or any(_is_wide(c) for c in prev_raw):
-                    # 只有真需要列语义时才去取（那条路会碰 COM）
-                    _col = _eol_caret_col(
-                        prev_raw, _resolve_sem_info(cm, cp, prev_no))
-                else:
-                    _col = len(prev_raw) + 1
-                _line = prev_no
-            else:
-                # 删的是第 1 行：没有"上一行"，光标落在新首行行首
-                _line, _col = 1, 1
             cm.DeleteLines(anchor, 1)
             try:
-                cp.SetSelection(_line, _col, _line, _col)
+                if prev_no < 1:
+                    # 删的是第 1 行：没有"上一行"，光标落在新首行行首
+                    cp.SetSelection(1, 1, 1, 1)
+                elif not _caret_to_line_end(cp, cm, prev_no, prev_raw):
+                    # 兜底：该编辑器不夹列 -> 才回去按列语义算（见 docstring）
+                    _c = _eol_caret_col(prev_raw, _sem_cache.get("info"))
+                    cp.SetSelection(prev_no, _c, prev_no, _c)
             except Exception:
                 pass
             return True
