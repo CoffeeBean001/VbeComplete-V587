@@ -315,6 +315,14 @@ def _resolve_sem_info(cm, cp, line_no):
         ec = int(ec)
     except Exception:
         ec = 0
+    # ★v95：这一行既无 Tab 也无全角 => 两种列语义在它上面【数值完全相同】，
+    # 探测只能得到一个"碰巧成立"的结论（几乎必然是 ("char",4,False)），
+    # 而它会被写进 _sem_cache 留给后面**含中文的行**用 —— 那些行按字符列算就
+    # 少算全角格数，光标落在变量名中间（v94b / v95 两个 bug 同一个根因）。
+    # 这里提前收工：调用方（`_indent_end_col`）遇到不含 Tab 的缩进本来就
+    # 用不上语义信息，返回 None 不损失任何东西，还省掉一次"移动光标再还原"。
+    if not ("\t" in line_text or any(_is_wide(c) for c in line_text)):
+        return None
     try:
         info = _detect_semantics_passive(line_text, ec)
         if info is None:
@@ -1201,6 +1209,14 @@ def _probe_semantics(cm, cp, line_no, line_text):
       1) 有缓存就直接返回，整个会话最多探测一次；
       2) try/finally 保证一定执行还原，且还原后读回校验（不符再还原一次）；
       3) 校验始终失败 -> 标记 probe_broken，此后永久禁用探测，退回被动判定。
+
+    ⚠️★v95 **缓存里装的是"某一次探测的结论"，不是"编辑器的真理"**：若那次探测
+    的行恰好【没有判别力】（既无 Tab 也无全角，两种语义数值相同），结论就是猜的
+    —— 这种结论会被喂给后面**含中文的行**并算错（v94b / v95 两个 bug 同一个根因）。
+    因此：
+      * 调用方**别在拿不准的行上探测**（见 `_resolve_sem_info` 的行类别闸门）；
+      * 凡"要把光标摆到某个位置"的地方，别信缓存，在本行上重新量
+        （见 `apply_completion` 与 `_caret_to_line_end`）。
     """
     if _sem_cache["probe_broken"]:
         return _sem_cache["info"]
@@ -1246,13 +1262,18 @@ def _vbe_measure(cm, cp, line_no, line_text):
 
     注意：本函数会【移动光标】。除 apply_completion（随后本来就要设置光标）
     之外，请一律改用 _probe_semantics，它会自动还原并校验。
+
+    ★v95：拿不到就返回 **None**（旧实现返回 ("char", 4, False)）。原因是"量不到"
+    与"量出来是用字符列"是两回事 —— 前者是**没有证据**，而旧返回值会被调用方
+    当成证据**写进缓存**，于是"哪儿都没量出来"变成了"全会话都按字符列算"
+    —— 正是 v94b 那个坑的另一种写法。None 让调用方各走各的兜底，不污染缓存。
     """
     n = len(line_text)
     try:
         cp.SetSelection(line_no, n + 100, line_no, n + 100)
         _sl, _sc, _el, ec = cp.GetSelection()
     except Exception:
-        return "char", 4, False
+        return None
     return _fit_semantics(line_text, ec)
 
 
@@ -2331,6 +2352,12 @@ def _caret_char_col(cm, cp, line_no, line_text, ec):
         info = _probe_semantics(cm, cp, line_no, line_text)
     if info is None:
         info = ("char", 4, False)
+    # ⚠️★v95 已知残留（别再凭直觉加"重新探测"去治它）：走到这里时必然
+    # `ec <= len+1`（否则第 1 步的被动判定就出结果了），而"字符列"在这个范围里
+    # **永远不可能被推翻** —— 也就是说，缓存若被污染成 ("char",4,False)，本函数
+    # 在 ec 偏小时看不出来，会把【显示列】当成字符列返回（少算全角格数）。
+    # 想治得靠"缓存只在同一类行之间复用"那一层（见 `apply_completion` 的做法：
+    # 不信任缓存，在本行上重新量），而不是在这里加判据。
     sem, tabw, wide2 = info
     if sem == "disp":
         return (_col_to_char_index(line_text, ec, tabw, wide2) + 1,
@@ -3569,17 +3596,28 @@ class VbeBackend:
             end0 = _skip_into_parens(actual, end0, line_text, end_col)
             end0 = min(end0, len(actual))
 
-            # 关键：列语义探测必须基于「写回之后」的实际行。
-            # 典型故障：用户只打了首字母（纯 ASCII，如 abc中文 只打了 a），
-            # 旧行不含任何全角字符 -> 探测被跳过、默认 'char'（字符列）；
-            # 但补全后的新行含中文，VBE 按显示列计（中文占 2 格），
-            # 于是按字符列定位光标会少算格差，光标落在变量名中间。
+            # 关键：列语义必须在【写回之后】的实际行上量，而且**不能拿缓存**。
+            #
+            # 老故障一（v24 那轮）：用户只打了首字母（纯 ASCII，如 `abc中文` 只打了
+            # `a`），旧行不含全角 -> 探测被跳过、默认 'char'；可补全后的新行含中文，
+            # VBE 按显示列计 => 按字符列定位会少算格差，光标落在变量名中间。
+            #
+            # ★v95 老故障二（用户这次报的）：探测结果被 `_sem_cache` 缓存，而那条
+            # 结论可能是【在纯 ASCII 行上】探出来的 —— 那种行上两种列语义数值相同，
+            # 根本分不出来，却被记成了 'char' 并留给后面所有行用（v94b 同一个坑）。
+            # 于是即使这一行含中文，拿缓存也会算成字符列 —— 症状与上面一模一样，
+            # 但"探测没被跳过"，光修"基于写回后的行"治不了。
+            #
+            # 所以这里**在 actual 这一行上重新量**：它自带 Tab / 全角，证据是
+            # 判别性的，量出来的一定对。用 `_vbe_measure` 而不是 `_probe_semantics`：
+            # 紧接着就要摆光标，不必还原（少两次 COM、也不受 probe_broken 影响）。
+            # 量到的结果反过来写回缓存 —— 等于第一次中文补全就把缓存修好了。
             sem, tabw, wide2 = "char", 4, False
             if "\t" in actual or any(_is_wide(c) for c in actual):
-                # 用带缓存的探测：同一编辑器只探测一次，且会自动还原光标。
-                info = _probe_semantics(cm, cp, line_no, actual)
+                info = _vbe_measure(cm, cp, line_no, actual)
                 if info is not None:
                     sem, tabw, wide2 = info
+                    _sem_cache["info"] = info
 
             def _set_caret(text, off):
                 """按当前列语义把光标放到字符下标 off 之后。"""

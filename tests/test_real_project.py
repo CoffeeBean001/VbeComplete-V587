@@ -12449,6 +12449,147 @@ def main():
     except Exception as _e74:
         check("第 74 节异常: %s" % _e74, [True], expect_contain=[False])
 
+    # ==================================================================
+    # 75. v95：补全【含中文】的名字后，光标要落在名字末尾
+    #
+    # 用户口径：「变量名或函数名里面包含中文字符和英文字符，按 Tab 把提示词
+    # 打印到屏幕后，光标会落在变量名中间位置，不会正确落在变量名末尾……
+    # 之前没有这个 bug 的。」
+    #
+    # 病根与 v94b 是**同一个**：`_sem_cache` 里那条"列语义"结论可能是【猜的】。
+    #   * v93 加的 `_resolve_sem_info` 会在**每个回车**上探测一次，而它探测的那
+    #     一行常常是纯 ASCII 且无 Tab —— 那种行上"字符列"与"显示列"数值完全相同，
+    #     `_fit_semantics` 只能得出 ("char",4,False)，却被当成事实缓存下来；
+    #   * 之后 `apply_completion` 摆光标时直接吃缓存 => 含中文的新行按【字符列】
+    #     给列，VBE 当【显示列】解释 => 少算全角格数 => 光标落在变量名中间。
+    #   * "之前没有"正好对得上：v93 之前没人会在纯 ASCII 行上写缓存。
+    #
+    # 修法两条：
+    #   ① `apply_completion` 摆光标前**在写回后的这一行上重新量**（它自带全角 /
+    #      Tab，证据判别性），不碰缓存；量到的结果反过来写回缓存（自动修好）；
+    #   ② `_resolve_sem_info` 遇到"既无 Tab 也无全角"的行**干脆不探测**（那种行
+    #      上量不出东西，只会污染缓存，而且调用方压根用不上）。
+    # ==================================================================
+    print("\n=== 75. v95：补全含中文的名字后，光标要落在名字末尾 ===")
+    try:
+        import vbe_bridge as VB75
+
+        class _CM75(object):
+            def __init__(self, lines):
+                self.lines = list(lines)
+                self.Name = "Module1"
+
+            @property
+            def CountOfLines(self):
+                return len(self.lines)
+
+            def Lines(self, start, count):
+                return self.lines[int(start) - 1]
+
+            def ReplaceLine(self, line_no, text):
+                self.lines[int(line_no) - 1] = text
+
+        class _Pane75(object):
+            """忠实模拟真 VBE：列是【显示列】，超出行尾的列被钳回行尾。"""
+            def __init__(self, cm, sel=(1, 1, 1, 1)):
+                self.CodeModule = cm
+                self.sel = sel
+
+            def GetSelection(self):
+                return self.sel
+
+            def SetSelection(self, sl, sc, el, ec):
+                ln = max(1, min(int(sl), len(self.CodeModule.lines)))
+                _t = self.CodeModule.lines[ln - 1]
+                _eol = VB75._disp_width(_t, 4, True) + 1
+                self.sel = (ln, max(1, min(int(sc), _eol)),
+                            ln, max(1, min(int(ec), _eol)))
+
+        class _VBE75(object):
+            def __init__(self, pane):
+                self.ActiveCodePane = pane
+
+        def _run75(lines, line_no, start_col, caret_col, completion,
+                   poison=None):
+            """跑一次 apply_completion，返回 (新行文本, 落点列, 事后缓存)。
+
+            poison：预置进 `_sem_cache["info"]` 的【错误】结论，用来复现
+            "缓存被纯 ASCII 行污染"这个现场（None = 不预置）。
+            """
+            _cm75 = _CM75(lines)
+            _pn75 = _Pane75(_cm75)
+            _orig75 = VB75._get_vbe_cached
+            _sem75 = VB75._sem_cache.get("info")
+            VB75._sem_cache["info"] = poison
+            VB75._get_vbe_cached = lambda: _VBE75(_pn75)
+            try:
+                VB75.VbeBackend().apply_completion(
+                    line_no, start_col, caret_col, completion)
+                _cache75 = VB75._sem_cache.get("info")
+            finally:
+                VB75._get_vbe_cached = _orig75
+                VB75._sem_cache["info"] = _sem75
+            return (_cm75.lines[line_no - 1], _pn75.sel[3], _cache75)
+
+        # ---- 75.1 ★用户报的场景：名字本身中英混排 ----
+        # `    x = get订单` -> 补全成 `get订单数量`：真行尾显示列是 20，
+        # 被污染成"字符列"时旧口径只给 16（少算 4 个全角字符的格数）
+        # -> 光标停在 `订` / `单` 之间那一带，正是用户看到的"落在变量名中间"。
+        check("75.1 ★用户报的场景（名字中英混排）：`    x = get订单` 补全成 "
+              "`get订单数量`，光标必须落在【名字末尾】第 20 列（显示列）—— "
+              "缓存被污染成\"字符列\"时只给 16，少算的正是 4 个全角字符占的格数",
+              [_run75(["    x = get订单"], 1, 9, 14, "get订单数量",
+                      poison=("char", 4, False))[:2]],
+              expect_contain=[("    x = get订单数量", 20)])
+
+        # ---- 75.2 ★光标前面就有中文（前缀里含全角）----
+        # 这一条专钉"光标左侧的全角也要算进去"：只认名字自己的宽度会漏掉前缀。
+        check("75.2 ★光标【前面】就有中文：`    总数 = getVa` 补全成 `getValue`，"
+              "左侧两个全角各占 2 格 => 落点第 20 列；按字符列算只有 18 —— "
+              "差的是前缀里那两个汉字的格数",
+              [_run75(["    总数 = getVa"], 1, 10, 15, "getValue",
+                      poison=("char", 4, False))[:2]],
+              expect_contain=[("    总数 = getValue", 20)])
+
+        # ---- 75.3 量出来的结果反过来把缓存修好 ----
+        check("75.3 ★顺带修好缓存：这一行自带全角，量出来的结论是判别性的 "
+              "（\"disp\", 4, True）=> 写回 `_sem_cache`，后面所有行都跟着受益 "
+              "（旧的污染值 (\"char\",4,False) 被顶掉）",
+              [_run75(["    x = get订单"], 1, 9, 14, "get订单数量",
+                      poison=("char", 4, False))[2]],
+              expect_contain=[("disp", 4, True)])
+
+        # ---- 75.4 纯 ASCII 行照旧（回归护栏，别修过头）----
+        check("75.4 纯 ASCII 行不受影响（回归护栏）：`    x = getVa` -> "
+              "`getValue`，两种列语义数值相同 => 落点第 17 列，与旧版一致",
+              [_run75(["    x = getVa"], 1, 9, 14, "getValue",
+                      poison=("char", 4, False))[:2]],
+              expect_contain=[("    x = getValue", 17)])
+
+        # ---- 75.5 源头闸门：拿不准的行不许去探测（污染缓存 + 白移一次光标）----
+        _vbr75 = io.open(os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "vbe_bridge.py"), encoding="utf-8").read()
+        _rs75 = _vbr75.split("def _resolve_sem_info(")[1].split(
+            "\n    def ")[0]
+        _ac75 = _vbr75.split("def apply_completion(")[1].split(
+            "\n    def ")[0]
+        check("75.5 ★源头闸门（源码护栏）：① `_resolve_sem_info` 遇到【既无 Tab "
+              "也无全角】的行直接返回 None（那种行上永远量不出结论，只会把猜的"
+              "结论写进缓存）；② `apply_completion` 摆光标前用的是 `_vbe_measure`"
+              "（在本行上重新量）而不是 `_probe_semantics`（会先去取缓存）；"
+              "③ 量不到时 `_vbe_measure` 返回 **None**，不再伪造 (\"char\",4,False)"
+              " —— 伪造值会被当成证据写进缓存",
+              [[("if not (\"\\t\" in line_text or any(_is_wide(c) "
+                 "for c in line_text)):" in _rs75),
+                ("_vbe_measure(cm, cp, line_no, actual)" in _ac75),
+                ("_probe_semantics(cm, cp, line_no, actual)" not in _ac75),
+                ("return None" in _vbr75.split("def _vbe_measure(")[1].split(
+                    "\n\ndef ")[0])]],
+              expect_contain=[[True, True, True, True]])
+    except Exception as _e75:
+        check("第 75 节异常: %s" % _e75, [True], expect_contain=[False])
+
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))
     if FAILURES:
