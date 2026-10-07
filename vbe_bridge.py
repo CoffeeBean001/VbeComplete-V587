@@ -66,20 +66,28 @@ IMPLICIT_HONOR_OPTION_EXPLICIT = _env_flag(
 
 # VBA 语言自带的名字（内建函数 / 内建数据类型）是否纳入提示。
 #
-# ★v77：**默认关闭**（用户口径）。原话："我觉得提示词太多了……你把提示 vba 本身带的
-# 关键字、函数这块都删掉吧。保留能提示变量名、自定义的函数/过程名、窗体/控件名、
-# 模块名。其他的那些个提示词我也不怎么用到，提示一大堆看起来也不舒服。"
+# 历史（v61 → v77 → ★v96）：
+#   v61  默认 True  —— "VBA 本身自带的函数也加入提示列表，现在不能提示"；
+#   v77  默认 False —— "提示词太多了……vba 本身带的关键字、函数这块都删掉吧。
+#                      保留变量名、自定义函数/过程名、窗体/控件名、模块名"；
+#   v96  默认 True  —— ★用户原话："我想把 vba 关键字、函数名这两部分，也加入到
+#                      提醒列表里。枚举类型就不要加了，枚举加上，就会太多了。"
+#                      ⇒ 收【关键字 + 内建函数 + 内建数据类型】，仍然不收枚举。
 #
-# 于是默认口径收敛成一句话：**只提示"你这个工程里存在的东西"** ——
-#   变量名（含没写 Option Explicit 时用过的名字）、自定义 Sub/Function/Property、
-#   组件名（模块 / 窗体 / 类模块）、窗体控件名；
-#   VBA 自带的四批（内建函数 + 数据类型、语言关键字、vb* 枚举、宿主 xl*/mso* 枚举）
-#   一律不进候选池。
+# ⚠️ **枚举永远是另一批、且默认不收**（见下面 ENABLE_VBA_CONSTANTS /
+#    ENABLE_HOST_ENUMS）—— 用户这次也明确说了"枚举加上就会太多"。
+#    v70 的原话是"内置枚举我基本不用，提示出来只是干扰"，v96 没有改这个判断。
+#
+# 现在默认口径：
+#   * 收 —— 你这个工程里真实存在的东西（变量 / 自定义过程 / 组件名 / 控件名），
+#           **加上** VBA 关键字（Sub / If / Dim / Set …）与内建函数
+#           （MsgBox / Left / Split …）、内建数据类型（`Dim x As Long` 用得上）；
+#   * 不收 —— 一切枚举：VBA 内建 vb*（102 条）与宿主类型库的 xl* / mso*（4538 条）。
 #
 # ⚠️ 只改【收集侧开关】，四份清单本身一个字都没裁（见 vba_builtins.py）——
-# 清单保持完整，测试/诊断仍能看到全貌，需要时一行环境变量立刻收回来。
-# 想开回来：`set VBECOMPLETE_VBA_BUILTINS=1`（内建函数与 `Dim x As <类型>` 一起回来）。
-ENABLE_VBA_BUILTINS = _env_flag("VBECOMPLETE_VBA_BUILTINS", False)
+# 清单保持完整，测试/诊断仍能看到全貌，需要时一行环境变量立刻关掉。
+# 想关回去：`set VBECOMPLETE_VBA_BUILTINS=0`。
+ENABLE_VBA_BUILTINS = _env_flag("VBECOMPLETE_VBA_BUILTINS", True)
 
 # ★v70：VBA 内建的 **枚举常量**（`vbOK` / `vbCrLf` / `vbYes` … 共 102 条）是否纳入提示。
 #
@@ -94,10 +102,12 @@ ENABLE_VBA_CONSTANTS = _env_flag("VBECOMPLETE_VBA_CONSTANTS", False)
 # 独立成一个开关（而不是并进 ENABLE_VBA_BUILTINS）：关键字与内建函数是两拨
 # 东西 —— 前者是语法骨架、后者是可调用的库成员。你想单收一批时用得上。
 #
-# ★v77：**默认关闭**（用户口径："vba 本身带的关键字、函数这块都删掉"）。
-# 想开回来：`set VBECOMPLETE_VBA_KEYWORDS=1`。
+# ★v96：**默认打开**（用户口径："我想把 vba 关键字、函数名这两部分，也加入到提醒
+# 列表里。枚举类型就不要加了。"）—— 与 ENABLE_VBA_BUILTINS 一起回来了，
+# 而两批【枚举】（vb* 内建常量、宿主 xl*/mso*）仍然默认不收。
+# 想关回去：`set VBECOMPLETE_VBA_KEYWORDS=0`。
 # 与 ENABLE_VBA_BUILTINS 是两个独立开关，所以"只收关键字、不收内建函数"也做得到。
-ENABLE_VBA_KEYWORDS = _env_flag("VBECOMPLETE_VBA_KEYWORDS", False)
+ENABLE_VBA_KEYWORDS = _env_flag("VBECOMPLETE_VBA_KEYWORDS", True)
 # 内建名字挂靠的"模块名"。
 #
 # 这是一个【虚拟模块】——VBA 运行时库。之所以要给它一个名字而不是留空：
@@ -3157,16 +3167,16 @@ class VbeBackend:
         # 开回来）。注意裁剪放在【收集侧】而不是改清单本身：清单保持完整，
         # 测试与诊断仍能看到全貌，开关一开立刻生效。
         #
-        # 【v77】连**内建函数与内建数据类型**也默认不收了（ENABLE_VBA_BUILTINS
-        # 默认 False）—— 用户口径："vba 本身带的关键字、函数这块都删掉；保留变量名、
-        # 自定义函数/过程名、窗体/控件名、模块名。" 于是默认口径下候选池里
-        # 只剩"这个工程里真实存在的东西"。
+        # 【v77】曾把**内建函数与内建数据类型**也默认关掉（用户嫌提示太多）。
+        # 【★v96】又收回来了 —— 用户原话："我想把 vba 关键字、函数名这两部分，
+        # 也加入到提醒列表里。枚举类型就不要加了，枚举加上，就会太多了。"
+        # ⇒ ENABLE_VBA_BUILTINS 默认 True，**枚举仍然默认 False**（vb* 那批归
+        # ENABLE_VBA_CONSTANTS、宿主 xl*/mso* 归 ENABLE_HOST_ENUMS，都没动）。
         #
-        # ⚠️ 连带的**唯一**后果（其余一个字没动）：`Dim x As <这里>` 的候选里不再
-        # 出现 Long / String / Integer 这类内建类型名 —— 因为 `As` 位置的候选是
-        # "先出候选、再按 type_names 过滤"，不在池子里就永远显示不出来。
-        # 那一位置现在只剩你自己的类型：窗体 / 类模块 / 模块名 + Type / Enum 名。
-        # 想要回内建类型（含 MsgBox 那批函数）：`set VBECOMPLETE_VBA_BUILTINS=1`。
+        # ⚠️ 引擎侧对这一批有一道收紧（2~3 字符的跳步命中要求首字母对齐，
+        # 见 engine.BUILTIN_SCATTER_MIN）—— 它一直是活的，只是 v77 之后
+        # `_builtin_names()` 默认空集、整段不生效。v96 把这一批放回池子，
+        # 那道收紧也就自动重新起作用了（这正是当初为它们准备的）。
         if ENABLE_VBA_BUILTINS:
             _bn_src = vba_builtins.BUILTIN_FUNCTIONS
             if ENABLE_VBA_CONSTANTS:
@@ -3207,9 +3217,15 @@ class VbeBackend:
         # 关键字同样进 builtin_names —— 它们是语言自带的公共词汇（数量大、什么字母
         # 组合都凑得出子序列），要跟内建函数一样收紧模糊匹配，见 engine.trigger。
         #
-        # 【v77】**默认关闭**（用户口径："vba 本身带的关键字也删掉"）—— 于是默认
-        # 口径下打 `su` 不会冒出 `Sub`、打 `if` 不会冒出 `If`，候选池里只剩你这个
-        # 工程里真实存在的名字。想开回来：`set VBECOMPLETE_VBA_KEYWORDS=1`。
+        # 【v77】曾**默认关闭**（用户口径："vba 本身带的关键字也删掉"）。
+        # 【★v96】又收回来了（用户原话："我想把 vba 关键字、函数名这两部分，
+        # 也加入到提醒列表里。枚举类型就不要加了。"）⇒ ENABLE_VBA_KEYWORDS
+        # 默认 True；想关回去 `set VBECOMPLETE_VBA_KEYWORDS=0`。
+        #
+        # ⚠️ 关键字这一批是"公共词汇"里最松的一批：Set / For / In / To / Is /
+        #    Not / On 这些短词几乎能从任何两三个字母凑出子序列。引擎侧那道
+        #    "2~3 字符的跳步命中要求首字母对齐"的收紧就是为它们准备的
+        #    （见 engine.trigger 与 BUILTIN_SCATTER_MIN）—— 别把它关掉。
         if ENABLE_VBA_KEYWORDS:
             for _kn in vba_builtins.BUILTIN_KEYWORDS:
                 _kl = _kn.lower()

@@ -174,12 +174,17 @@ def check(tag, got, expect_contain=(), expect_absent=()):
 
 
 def main():
-    # v61：VBA 内建名字（内建函数 / 常量 / 数据类型）默认会进候选池
-    # （vbe_bridge.ENABLE_VBA_BUILTINS）；v62 语言关键字另行一组，开关独立
-    # （vbe_bridge.ENABLE_VBA_KEYWORDS）。下面第 1~37 节的断言是"工程内名字的
-    # 候选列表精确比对"（用户要求的防噪音护栏），与它们无关 —— 因此统一在
-    # 【关闭】的前提下跑，护栏强度保持不变；第 38 节专门验内建名字，
-    # 第 39 节专门验关键字。
+    # v61：VBA 内建名字（内建函数 / 常量 / 数据类型）进候选池由
+    # vbe_bridge.ENABLE_VBA_BUILTINS 决定；v62 语言关键字另行一组，开关独立
+    # （vbe_bridge.ENABLE_VBA_KEYWORDS）。★v96 这两个开关的**出厂默认是 True**
+    # （"把 vba 关键字、函数名这两部分也加入到提醒列表里"），而两批枚举仍然
+    # 默认 False（"枚举类型就不要加了，枚举加上，就会太多了"）。
+    #
+    # 下面第 1~37 节的断言是"工程内名字的候选列表精确比对"（用户要求的防噪音
+    # 护栏），与语言自带的名字无关 —— 因此统一在【关闭】的前提下跑，护栏强度
+    # 保持不变（否则 v96 之后每一条都会多出一堆 Sub/If/Long，护栏就废了）；
+    # 第 38 节专门验内建名字，第 39 节专门验关键字，
+    # 第 54 节守 v96 的默认口径（True/True/False/False）。
     try:
         import vbe_bridge as _vb61
         _vb61.ENABLE_VBA_BUILTINS = False
@@ -5717,9 +5722,12 @@ def main():
     # "打开就有"的反向对照 —— 否则"碰巧没有"（比如桩 VBE 解析失败）也能蒙过去。
     #
     # ⚠️ v77：用户接着说"vba 本身带的关键字、函数这块也都删掉"，于是
-    # ENABLE_VBA_BUILTINS / ENABLE_VBA_KEYWORDS 也改成默认 False（本节 47.2 跟着
-    # 改成"四批全关"）。**下面 47.5~47.11 先把这两个开关临时打开再断言** ——
-    # 那一半验的是"机制仍在、开关真有效"，与默认值无关；默认口径由第 54 节专门守。
+    # ENABLE_VBA_BUILTINS / ENABLE_VBA_KEYWORDS 也改成默认 False。
+    # ⚠️ ★v96：又收回来了（"把 vba 关键字、函数名这两部分，也加入到提醒列表里。
+    #    枚举类型就不要加了，枚举加上，就会太多了"）⇒ 这两个默认 True，
+    #    **两批枚举仍默认 False**（本节 47.2 钉的就是这个组合）。
+    #    **下面 47.5~47.11 先把这两个开关临时打开再断言** ——
+    #    那一半验的是"机制仍在、开关真有效"，与默认值无关；默认口径由第 54 节专门守。
     # ==================================================================
     print("\n=== 47. 内置枚举默认不提示（v70）===")
     try:
@@ -5765,13 +5773,13 @@ def main():
             _spec47.loader.exec_module(_fresh47)
         except Exception:
             _fresh47 = None
-        check("47.2 ★出厂默认（v77）：内建函数/数据类型、关键字、内置枚举、"
-              "宿主枚举 —— 四批一律【关】",
+        check("47.2 ★出厂默认（v96）：关键字 + 内建函数/数据类型【开】、"
+              "内置枚举 + 宿主枚举【关】（枚举用户明确说不要）",
               [((_fresh47.ENABLE_VBA_BUILTINS,
                  _fresh47.ENABLE_VBA_KEYWORDS,
                  _fresh47.ENABLE_VBA_CONSTANTS,
                  _fresh47.ENABLE_HOST_ENUMS) if _fresh47 else "干净模块加载失败")],
-              expect_contain=[(False, False, False, False)])
+              expect_contain=[(True, True, False, False)])
 
         # ---- 47.3 清单拆成两组（清单本身不裁剪）----
         _inter47 = set(VB47B.BUILTIN_FUNCTIONS) & set(VB47B.BUILTIN_CONSTANTS)
@@ -7127,30 +7135,36 @@ def main():
         check("第 53 节异常: %s" % _e53, [True], expect_contain=[False])
 
     # ==================================================================
-    # 54. v77：默认只提示「这个工程里真实存在的东西」
+    # 54. 默认提示口径（v77 起；★v96 调整）
     #
-    # 用户口径（原话）："我觉得提示词太多了……你把提示 vba 本身带的关键字、函数这块
-    # 都删掉吧。保留能提示变量名，自定义的函数/过程名，窗体/控件名，模块名。
-    # 其他的那些个提示词，我也不怎么用到，提示一大堆看起来也不舒服。"
+    # v77 用户口径（原话）："我觉得提示词太多了……你把提示 vba 本身带的关键字、函数
+    # 这块都删掉吧。保留能提示变量名，自定义的函数/过程名，窗体/控件名，模块名。"
+    # ⇒ 那时四个开关全部默认 False。
     #
-    # ⇒ 四个开关**全部默认 False**（vbe_bridge.ENABLE_VBA_BUILTINS /
-    #   ENABLE_VBA_KEYWORDS / ENABLE_VBA_CONSTANTS / ENABLE_HOST_ENUMS）。
-    #   默认口径下候选池 = 变量名 + 自定义 Sub/Function/Property + 组件名（模块 /
-    #   窗体 / 类模块）+ 窗体控件名，一条语言自带的名字都没有。
+    # ★v96 用户口径（原话）："我想把 vba 关键字、函数名这两部分，也加入到提醒列表里。
+    #   枚举类型就不要加了，枚举加上，就会太多了。"
+    #   ⇒ 开关组合变成 **(True, True, False, False)**：
+    #      收 —— 工程内名字（变量 / 自定义过程 / 组件名 / 控件名）
+    #           **+ VBA 关键字 + 内建函数 + 内建数据类型**
+    #      不收 —— 一切枚举：VBA 内建 vb*（102 条）、宿主类型库 xl*/mso*（4538 条）。
+    #      （枚举这条是 v70 的判断，v96 明确维持：量大、干扰。）
     #
     # 本节守三件事：
-    #   1) 默认池子里**一条**语言自带的名字都没有，而工程内那四种名字一个不少；
-    #   2) ★反向对照：把开关打开，那些名字立刻回来 —— 证明"没有"是开关造成的，
-    #      不是桩后端/解析碰巧失效（否则"碰巧没有"也能蒙过去）；再验一次
-    #      "开关逐批独立"（只开关键字不开内建函数也做得到）；
-    #   3) ★四份清单**一个字都没裁**，三个收集门也都还在 —— 否则"更安静"会悄悄
-    #      变成"能力删除"，以后想开回来也开不回来（用户的原话是"不要改坏了"）。
+    #   1) 默认池子里【关键字/内建函数/内建类型都在、vb* 枚举一条都没有】，
+    #      而工程内那四种名字一个不少；
+    #   1b) ★反面对照：把两个开关关掉那些名字立刻消失 —— 证明"在"是开关造成的，
+    #       不是桩后端/解析碰巧塞进去的；
+    #   2) ★反向对照：把枚举开关打开 vb* 立刻回来；再验"开关逐批独立"
+    #      （只开关键字不开内建函数也做得到）；
+    #   3) ★四份清单**一个字都没裁**，四个收集门也都还在 —— 否则"收回来"会悄悄
+    #      变成"能力删除"，以后想关也关不回去（v77 时用户的原话是"不要改坏了"）。
     #
-    # ⚠️ 唯一有意的连带后果：`Dim x As <这里>` 不再补内建类型名（Long / String …），
-    #    因为那个位置的候选是"先出候选、再按 type_names 过滤"——不在池子里就永远
-    #    显示不出来。54.5 把它钉成【预期行为】，免得以后被当成 bug 反复"修"。
+    # ⚠️ 54.4b 单独一条 check 钉出厂默认值：上一版把它混在
+    #    `expect_contain=[True]*13` 里，而 `check` 是**子集匹配**、got 是混着
+    #    True/False 的列表 ⇒ 默认值已经翻成 True 了它还报 PASS。**这是假绿。**
+    #    教训：期望值不同的断言，一律分开 check。
     # ==================================================================
-    print("\n=== 54. v77：默认只提示工程内名字（语言自带的四批全关）===")
+    print("\n=== 54. 默认提示口径（v96：关键字+内建函数收 / 枚举不收）===")
     try:
         import vbe_bridge as VB54R
         import vba_builtins as VB54B
@@ -7316,30 +7330,56 @@ def main():
                 return False
 
         def _trig54(word="ms"):
+            """触发一次补全，返回候选列表——**保持引擎的原始排序**。
+
+            ⚠️ 别在这里 sorted()：断言"第 1 个是 X"量的是**引擎的排序**
+            （kind 高者在前），一排序就变成字母序了，`su` 会把 `GoSub`
+            排到 `Sub` 前面（`decl` 把 `Declare` 排到 `declaredVar` 前面，
+            因为 'D' 的码位小于 'd'）—— 量到的就不是引擎行为，而是字符串比较。
+            """
             _c = E54.Completer(_EngineBackend54(VB54R.VbeBackend(),
                                                 word=word), _UI54())
             _c.trigger(True)
-            return sorted(_c.matches or [])
+            return list(_c.matches or [])
 
         try:
-            # ---- 54.1 ★默认口径：语言自带的名字一条都不进池 ----
-            _set54(False, False, False, False)
+            # ---- 54.1 ★默认口径：关键字 + 内建函数/类型【在】，两批枚举【不在】----
+            # ⚠️ ★v96 默认口径变了（见下面 54.1b 的出处说明）：这一条从"四种代表名
+            # 一条都没有"改成"关键字/函数/类型在、vb* 枚举不在"。
+            _set54(True, True, False, False)
             _bk54, _nm54 = _pool54()
-            # 语言自带的四批，各取一个代表（函数 / 关键字 / vb 枚举 / 内建类型）。
-            # 宿主枚举（xl*/mso*）不放进来：打开它要真去加载 Excel 类型库，
-            # 这一节刻意与 Excel 无关（它的开关由 47.4 单独守）。
+            # 关键字 / 内建函数 / 内建类型各取一个代表 —— 这三批默认【该在】。
+            # vb 枚举（vbcrlf / vbyes）取两个代表 —— 这批默认【不该在】。
+            # 宿主枚举（xl*/mso*）不放进来断言"不在"：它关着时收集段整段不跑
+            # （连类型库都不加载），由 47.4 单独守；真要验证"打开它才在"是 44 节。
             _lang54 = ["msgbox", "left", "split", "dim", "sub", "function",
-                       "long", "string", "vbcrlf", "vbyes"]
+                       "long", "string"]
+            _enum54 = ["vbcrlf", "vbyes"]
             # 工程内该有的四种名字（变量 / 自定义过程 / 模块名 / 窗体名 + 控件名）
             _mine54 = ["declaredvar", "loosevar", "foo", "module1",
                        "userform1", "label1", "cmdok"]
-            check("54.1 ★默认口径：语言自带的 %d 个代表名一条都没有（漏进来：%s）"
-                  % (len(_lang54), sorted(set(_lang54) & _nm54)),
-                  [sorted(set(_lang54) & _nm54),
+            check("54.1 ★默认口径：关键字/内建函数/内建类型 %d 个代表名全在；"
+                  "vb* 枚举 %d 个一个都不在（枚举用户明确说不要）；"
+                  "工程内名字一个不少"
+                  % (len(_lang54), len(_enum54)),
+                  [sorted(n for n in _lang54 if n not in _nm54),
+                   sorted(set(_enum54) & _nm54),
                    sorted(n for n in _mine54 if n not in _nm54),
                    dict(_bk54.get_host_enum_names()),
-                   sorted(_bk54.get_builtin_names())],
-                  expect_contain=[[], [], {}, []])
+                   "vbcrlf" in _bk54.get_builtin_names(),
+                   "msgbox" in _bk54.get_builtin_names()],
+                  expect_contain=[[], [], [], {}, False, True])
+
+            # ---- 54.1b ★反面对照：把开关关掉，v96 放回来的那两批立刻消失 ----
+            # 单靠 54.1 只能证明"默认在"；若桩后端/解析碰巧把名字塞进池子，
+            # 54.1 也会绿。这里显式关一次，证明"在"确实是这两个开关造成的。
+            _set54(False, False, False, False)
+            _bk54off, _nm54off = _pool54()
+            check("54.1b ★反面对照：ENABLE_VBA_BUILTINS/KEYWORDS 关掉后，"
+                  "关键字+内建函数+内建类型一条都不在（证明 54.1 是开关在起作用）",
+                  [sorted(set(_lang54) & _nm54off), _bk54off.get_builtin_names()],
+                  expect_contain=[[], []])
+            # 下面 54.2~54.7 各自显式设开关，不依赖这里的残留状态。
 
             # ---- 54.2 ★反向对照：打开开关 -> 那些名字立刻回来 ----
             _set54(True, True, True, False)
@@ -7364,7 +7404,7 @@ def main():
                 os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                 "vbe_bridge.py"), encoding="utf-8").read()
             check("54.4 ★四份清单一个字没裁（函数 %d / 常量 %d / 类型 %d / 关键字 %d）"
-                  "+ 三个收集门都在 + 默认值就是 False"
+                  "+ 三个收集门都在"
                   % (len(VB54B.BUILTIN_FUNCTIONS), len(VB54B.BUILTIN_CONSTANTS),
                      len(VB54B.BUILTIN_TYPE_NAMES), len(VB54B.BUILTIN_KEYWORDS)),
                   [len(VB54B.BUILTIN_FUNCTIONS) >= 150,
@@ -7377,36 +7417,63 @@ def main():
                    _src54.count("if ENABLE_VBA_BUILTINS:") >= 1,
                    _src54.count("if ENABLE_VBA_KEYWORDS:") >= 1,
                    _src54.count("if ENABLE_VBA_CONSTANTS:") >= 1,
-                   _src54.count("if ENABLE_HOST_ENUMS:") >= 1,
-                   '_env_flag("VBECOMPLETE_VBA_BUILTINS", False)' in _src54,
-                   '_env_flag("VBECOMPLETE_VBA_KEYWORDS", False)' in _src54],
-                  expect_contain=[True] * 13)
+                   _src54.count("if ENABLE_HOST_ENUMS:") >= 1],
+                  expect_contain=[True] * 11)
 
-            # ---- 54.5 As 位置的连带后果（钉成预期行为，别再当 bug 修）----
-            _tn54_off = set(str(t).lower() for t in _bk54.get_type_names())
+            # ⚠️ 这两条必须【单独 check】：`check` 是**子集匹配**（`x not in got`），
+            #   而 got 是一个混着 True/False 的列表 —— 把它们塞进上面那个
+            #   `expect_contain=[True]*13` 里，"列表里有 False"根本不会被发现
+            #   （`True in got` 照样成立）。v96 之前就是这样假绿的：默认值已经
+            #   改成 True，54.4 却仍然 PASS。⇒ 期望值不同层/不同值时，一律分开 check。
+            check("54.4b ★出厂默认值：关键字 + 内建函数/数据类型 = True，"
+                  "两批枚举 = False（枚举不收）",
+                  [_src54.count('_env_flag("VBECOMPLETE_VBA_BUILTINS", True)'),
+                   _src54.count('_env_flag("VBECOMPLETE_VBA_KEYWORDS", True)'),
+                   _src54.count('_env_flag("VBECOMPLETE_VBA_CONSTANTS", False)'),
+                   _src54.count('_env_flag("VBECOMPLETE_HOST_ENUMS", False)')],
+                  expect_contain=[1, 1, 1, 1])
+
+            # ---- 54.5 As 位置：内建类型默认【在】，你自己的类型也一直在 ----
+            # ⚠️ v96 之前这里是"默认不在"（那时 _bk54 是全关的池子）。默认改成
+            #   True 之后 _bk54 就是"开"的池子，所以"不在"那一半改用 54.1b
+            #   收的 _bk54off（显式关掉的）来验 —— 两个方向都钉住。
+            _tn54_off = set(str(t).lower() for t in _bk54off.get_type_names())
+            _tn54_def = set(str(t).lower() for t in _bk54.get_type_names())
             _tn54_on = set(str(t).lower() for t in _bk54on.get_type_names())
-            check("54.5 `Dim x As |`：内建类型默认不在，你自己的类型一直在；"
-                  "开关打开就回来",
+            check("54.5 `Dim x As |`：开关关掉时内建类型不在、你自己的类型一直在；"
+                  "★默认（v96）内建类型【已经在了】",
                   ["long" not in _tn54_off, "string" not in _tn54_off,
                    "userform1" in _tn54_off,
-                   "long" in _tn54_on and "string" in _tn54_on,
-                   "userform1" in _tn54_on],
-                  expect_contain=[True] * 5)
+                   "long" in _tn54_def and "string" in _tn54_def,
+                   "userform1" in _tn54_def,
+                   "long" in _tn54_on and "string" in _tn54_on],
+                  expect_contain=[True] * 6)
 
-            # ---- 54.6 ★端到端：默认打 ms 一个候选都不出 ----
+            # ---- 54.6 ★端到端：关掉时打 ms 零候选；默认(开) -> MsgBox 第 1 个 ----
             _set54(False, False, False, False)
             _off54 = _trig54("ms")
             _set54(True, True, False, False)
             _on54 = _trig54("ms")
-            check("54.6 ★端到端：默认打 ms 零候选；打开内建 -> MsgBox（第 1 个）",
+            check("54.6 ★端到端：全关时打 ms 零候选；默认口径(v96) -> MsgBox（第 1 个）",
                   [len(_off54), _on54[:1]],
                   expect_contain=[0, ["MsgBox"]])
 
+            # ---- 54.6b ★端到端：关键字这条路也要能走通（打 su -> Sub）----
+            # v96 把关键字放回默认池子，但它走的是与内建函数**同一段收集代码**
+            # （只差一个开关）—— 这里从引擎端到端钉一次，免得"开关开了但提示不出来"。
+            _set54(True, True, False, False)
+            _kw54 = _trig54("su")
+            check("54.6b ★端到端：默认口径下打 su -> Sub（第 1 个）",
+                  [_kw54[:1], "Sub" in _kw54],
+                  expect_contain=[["Sub"], True])
+
             # 默认口径下"工程内名字"照旧能补（别把保留项一起关没了）
-            _set54(False, False, False, False)
+            _set54(True, True, False, False)
             _proj54 = _trig54("decl")
-            check("54.7 默认口径下工程内名字照旧（decl -> declaredVar）",
-                  ["declaredVar" in _proj54], expect_contain=[True])
+            check("54.7 默认口径下工程内名字照旧（decl -> declaredVar），"
+                  "且排在语言自带的名字前面（不顶掉你的名字）",
+                  ["declaredVar" in _proj54, _proj54[:1]],
+                  expect_contain=[True, ["declaredVar"]])
         finally:
             _set54(*_saved54)
             VB54R._get_vbe_cached = _orig54
@@ -12589,6 +12656,300 @@ def main():
               expect_contain=[[True, True, True, True]])
     except Exception as _e75:
         check("第 75 节异常: %s" % _e75, [True], expect_contain=[False])
+
+    # ==================================================================
+    # 76. v96：关键字 + 内建函数收进默认池，枚举仍然不收
+    #
+    # 用户口径（原话）："我想把 vba 关键字，函数名这两部分，也加入到提醒列表里。
+    # 枚举类型就不要加了，枚举加上，就会太多了。"
+    #
+    # ⇒ 开关组合 (ENABLE_VBA_BUILTINS, ENABLE_VBA_KEYWORDS,
+    #            ENABLE_VBA_CONSTANTS, ENABLE_HOST_ENUMS) = (True, True, False, False)。
+    #    第 47.2 / 54 节已经钉了"开关的出厂值"与"池子里有什么"，本节专钉
+    #    **收回来之后新出现的两个风险**：
+    #
+    #   1) ★排序：语言自带的名字会不会压过用户自己的名字。
+    #      `decl` 同时命中 `declaredVar`（工程内变量）与 `Declare`（关键字），
+    #      两者**命中质量完全一样**（kind 3 前缀 / 起点 0 / 跨度 4），只因
+    #      Declare 名字短 4 个字母，纯排序下关键字赢了 —— 那不是"匹配更好"。
+    #      v96 把评分键改成 `命中质量 > 是不是语言自带 > 名字长度`。
+    #   2) ★噪音：约 260 个公共词汇回到短输入路径上，边界必须仍然收得住
+    #      （首字母对齐那道闸门 + "你的名字优先"）。用户担心的"太多"
+    #      是真实风险，所以这里量的是**具体数字**而不是"感觉还行"。
+    #
+    # ⚠️ 本节的数字是【离线桩】上量出来的真值（不是拍脑袋的阈值）。
+    #    改动模糊匹配或收紧规则时，这里会红 —— 那是提醒你重测一遍，
+    #    不是让你把期望值改成新的输出。
+    # ==================================================================
+    print("\n=== 76. v96：关键字+内建函数默认收，枚举不收；你的名字优先 ===")
+    try:
+        import vba_builtins as VB76B
+        import engine as E76
+        import vbe_bridge as VB76
+
+        # ---- 76.1 出厂开关组合（干净模块，与 47.2 互为对照）----
+        _f76 = None
+        try:
+            import importlib.util as _iu76
+            _sp76 = _iu76.spec_from_file_location(
+                "vbe_bridge_fresh76",
+                os.path.join(os.path.dirname(os.path.dirname(
+                    os.path.abspath(__file__))), "vbe_bridge.py"))
+            _f76 = _iu76.module_from_spec(_sp76)
+            _sp76.loader.exec_module(_f76)
+        except Exception:
+            pass
+        check("76.1 ★出厂开关组合 = (内建函数 True, 关键字 True, vb* 枚举 False, "
+              "宿主枚举 False)",
+              [((_f76.ENABLE_VBA_BUILTINS, _f76.ENABLE_VBA_KEYWORDS,
+                 _f76.ENABLE_VBA_CONSTANTS, _f76.ENABLE_HOST_ENUMS)
+                if _f76 else "干净模块加载失败")],
+              expect_contain=[(True, True, False, False)])
+
+        # ---- 76.2 清单规模：收回来的是"该收的"，枚举两批仍然是关的 ----
+        check("76.2 清单规模：函数 %d / 类型 %d / 关键字 %d 三批都非空"
+              "（收回来了）；枚举清单也仍在（只是开关关着，一个字没裁）"
+              % (len(VB76B.BUILTIN_FUNCTIONS), len(VB76B.BUILTIN_TYPE_NAMES),
+                 len(VB76B.BUILTIN_KEYWORDS)),
+              [len(VB76B.BUILTIN_FUNCTIONS) >= 150,
+               len(VB76B.BUILTIN_TYPE_NAMES) >= 5,
+               len(VB76B.BUILTIN_KEYWORDS) >= 30,
+               len(VB76B.BUILTIN_CONSTANTS) >= 100],
+              expect_contain=[True] * 4)
+
+        # ---- 76.3 ★排序：同质量时工程内名字压过语言自带的名字 ----
+        # 构造一个最小引擎：池子里 declaredVar（工程内）与 Declare / Dim（关键字）。
+        _POOL76 = [("declaredVar", "模块1", None, False),
+                   ("Declare", VB76._BUILTIN_MODULE, None, False),
+                   ("Dim", VB76._BUILTIN_MODULE, None, False),
+                   ("MsgBox", VB76._BUILTIN_MODULE, None, False)]
+        _BL76 = set(n.lower() for n, m, _p, _v in _POOL76
+                    if m == VB76._BUILTIN_MODULE)
+
+        class _B76(object):
+            def get_context(self):
+                _ln = "    decl"
+                return {"line_no": 1, "line_text": _ln,
+                        "caret_col": len(_ln) + 1, "in_string": False,
+                        "in_comment": False, "in_type_position": False,
+                        "in_decl_position": False, "decl_names": [],
+                        "proc_name": None, "module_name": "模块1"}
+
+            def get_identifiers(self):
+                return list(_POOL76)
+
+            def get_declared_names(self):
+                return ["declaredvar"]
+
+            def declared_elsewhere(self, name, module_name):
+                return str(name).lower() in _BL76
+
+            def get_structural_names(self):
+                return sorted(_BL76)
+
+            def get_builtin_names(self):
+                return set(_BL76)
+
+            def get_type_names(self):
+                return list(VB76B.BUILTIN_TYPE_NAMES)
+
+            def get_host_enum_names(self):
+                return {}
+
+            def names_outside_caret(self, caret, scope_only=False):
+                return set(["declaredvar"])
+
+            def apply_completion(self, *a, **k):
+                return None
+
+            def vbe_yield_visible(self):
+                return False
+
+            def vbe_popup_visible(self):
+                return False
+
+            def vbe_popup_info(self):
+                return []
+
+        class _UI76(object):
+            def show(self, rows, sel, c):
+                pass
+
+            def hide(self):
+                pass
+
+            def update_selection(self, sel):
+                pass
+
+            def contains_point(self, x, y):
+                return False
+
+        def _m76(word):
+            _c = E76.Completer(_B76(), _UI76())
+            _c.trigger(True)
+            return list(_c.matches or [])
+
+        _d76 = _m76("decl")
+        # 先确认前提：两者命中质量真的相同（否则本节在验一个不存在的问题）
+        _q76a = E76.fuzzy_match("declaredVar", "decl")[0]
+        _q76b = E76.fuzzy_match("Declare", "decl")[0]
+        check("76.3 ★前提：declaredVar 与 Declare 的【命中质量】三项"
+              "（kind/起点/跨度）完全相同，只有名字长度不同 "
+              "(-11 vs -7) —— 不相同的话 76.4 验的就不是同分让位",
+              [_q76a[:3], _q76b[:3], _q76a[:3] == _q76b[:3],
+               _q76a[3] < _q76b[3]],
+              expect_contain=[(3, 0, -4), (3, 0, -4), True, True])
+
+        check("76.4 ★排序：打 decl -> 候选第 1 个是 declaredVar（你自己的名字），"
+              "不是 Declare（关键字）；Declare 仍作为候选存在",
+              [_d76[:1], "Declare" in _d76],
+              expect_contain=[["declaredVar"], True])
+
+        # 反面对照：把 builtin_names 清空（= 两批开关都关掉），
+        # 排序应退回 v96 之前的行为 —— Declare 因名字短而排到前面。
+        # 这条钉住"改动确实是 v96 那条规则造成的"，不是恰好排成这样。
+        _B76_save = _B76.get_builtin_names
+        _B76.get_builtin_names = lambda: frozenset()
+        try:
+            _d76_off = _m76("decl")
+        finally:
+            _B76.get_builtin_names = _B76_save
+        check("76.4b ★反面对照：builtin_names 为空（开关关）时排序退回旧行为 "
+              "-> Declare 排第 1（证明 76.4 是 v96 那条规则在起作用）",
+              [_d76_off[:1]], expect_contain=[["Declare"]])
+
+        # 精确命中不受影响：打了完整的 declare 就该选 Declare，不能因为它是
+        # "语言自带"就把它往后排。
+        # 走一次真触发（把 line_text 换成打全的），而不是只看 fuzzy_match ——
+        # 免得只量到匹配层、没量到"同分让位"那步排序。
+        class _B76Full(_B76):
+            def get_context(self):
+                _ln = "    declare"
+                return {"line_no": 1, "line_text": _ln,
+                        "caret_col": len(_ln) + 1, "in_string": False,
+                        "in_comment": False, "in_type_position": False,
+                        "in_decl_position": False, "decl_names": [],
+                        "proc_name": None, "module_name": "模块1"}
+
+        _c76 = E76.Completer(_B76Full(), _UI76())
+        _c76.trigger(True)
+        _full76 = list(_c76.matches or [])
+        check("76.5 ★精确命中不受影响：打全 declare -> 第 1 个就是 Declare "
+              "（kind 4，与工程内名字同分也要让 Declare 赢）",
+              [_full76[:1], E76.fuzzy_match("Declare", "declare")[0][0]],
+              expect_contain=[["Declare"], 4])
+
+        # ---- 76.6 ★噪音的正确度量：不是"总数"，是"会不会淹掉你自己的名字" ----
+        # ⚠️ 我第一版把门槛写成"总数 <= 25"，结果 `se` 出 34 条就红了。但那个指标
+        #    本身就问错了：一屏 VIEW_ROWS=15 行，超出的排在窗口外靠上下键/滚轮
+        #    滚动查看（候选**不会**被丢弃，见 engine.VIEW_ROWS 的注释）。
+        #    26~34 条不算失控 —— 真正会伤到用户的是【你自己的名字被挤到一屏之外】。
+        #    池子：工程内 5 个名字 + 语言自带那 260 个。
+        _bl76 = set(n.lower() for n in VB76B.BUILTIN_FUNCTIONS) \
+            | set(n.lower() for n in VB76B.BUILTIN_TYPE_NAMES) \
+            | set(n.lower() for n in VB76B.BUILTIN_KEYWORDS)
+        _MINE76 = ["secondCol", "tempFile", "totalCount", "resultVal", "rowIdx"]
+
+        class _B76Mix(object):
+            def get_context(self):
+                _ln = "    " + self._w
+                return {"line_no": 1, "line_text": _ln,
+                        "caret_col": len(_ln) + 1, "in_string": False,
+                        "in_comment": False, "in_type_position": False,
+                        "in_decl_position": False, "decl_names": [],
+                        "proc_name": None, "module_name": "模块1"}
+
+            def __init__(self, w):
+                self._w = w
+
+            def get_identifiers(self):
+                return ([(n, "模块1", None, False) for n in _MINE76]
+                        + [(n, VB76._BUILTIN_MODULE, None, False)
+                           for n in sorted(_bl76)])
+
+            def get_declared_names(self):
+                return [n.lower() for n in _MINE76]
+
+            def declared_elsewhere(self, name, module_name):
+                return str(name).lower() in _bl76
+
+            def get_structural_names(self):
+                return sorted(_bl76)
+
+            def get_builtin_names(self):
+                return set(_bl76)
+
+            def get_type_names(self):
+                return list(VB76B.BUILTIN_TYPE_NAMES)
+
+            def get_host_enum_names(self):
+                return {}
+
+            def names_outside_caret(self, caret, scope_only=False):
+                return set(n.lower() for n in _MINE76)
+
+            def apply_completion(self, *a, **k):
+                return None
+
+            def vbe_yield_visible(self):
+                return False
+
+            def vbe_popup_visible(self):
+                return False
+
+            def vbe_popup_info(self):
+                return []
+
+        def _rank76(word, mine):
+            """返回 (mine 在第几位 / 一共几条)。"""
+            _c = E76.Completer(_B76Mix(word), _UI76())
+            _c.trigger(True)
+            _ms = list(_c.matches or [])
+            _i = _ms.index(mine) if mine in _ms else -1
+            return _i, len(_ms)
+
+        # 每个前缀都取"自己的名字"：它必须**在列表里**且**排第 1**
+        # （语言自带的同前缀名字都排在它后面 —— 这正是 v96 那条排序规则要保的
+        #  不变式）。⚠️ 这两格必须【同层】且值不同（0 与 True）⇒ 分开 check，
+        #    别塞进一个列表里让子集匹配混过去。
+        _rank_cases76 = [("sec", "secondCol"), ("tem", "tempFile"),
+                         ("tot", "totalCount"), ("res", "resultVal"),
+                         ("row", "rowIdx")]
+        _ranks76 = [_rank76(w, m) for w, m in _rank_cases76]
+        check("76.6 ★你自己的名字不会被语言自带挤掉：5 个常见前缀下，"
+              "同前缀的工程内名字全部排第 1（实测 (名次,总条数) %s）" % (_ranks76,),
+              [[(w, m) for (w, m), r in zip(_rank_cases76, _ranks76)
+                if r[0] != 0]],
+              expect_contain=[[]])
+        check("76.6b ★而且它们都真的在候选列表里（不是被回声防护剔掉了）",
+              [[m for (w, m), r in zip(_rank_cases76, _ranks76) if r[0] < 0]],
+              expect_contain=[[]])
+
+        # 同前缀命中（kind 3）永远在跳步命中（kind 0）之前 —— 收回来 260 个
+        # 公共词汇之后这条不变式最关键：`se` 那种 30 多条的输入里，
+        # 用户真正在找的那个必须排在前面。
+        _c76se = E76.Completer(_B76Mix("se"), _UI76())
+        _c76se.trigger(True)
+        _se76 = list(_c76se.matches or [])
+        _kinds76 = [E76.fuzzy_match(n, "se")[0][0] for n in _se76]
+        _desc76 = all(_kinds76[i] >= _kinds76[i + 1] for i in
+                      range(len(_kinds76) - 1))
+        check("76.6c ★排序不变式：kind 沿列表单调不增（真命中一律在跳步命中之前）；"
+              "`se` 实测 %d 条、kind 序列 %s"
+              % (len(_se76), _kinds76),
+              [_desc76, "secondCol" in _se76],
+              expect_contain=[True, True])
+
+        # 首字母闸门：这两个都是 kind 0 分散命中（"ms" 里没有连续的 s 在开头…），
+        # 引擎侧那道"首字母必须对齐"会把它们滤掉。钉住它们**确实是 kind 0** ——
+        # 若哪天 fuzzy_match 改了口径让它们变成 kind 1，这条会红，那时要重看。
+        check("76.7 首字母闸门的依据：ms->Implements / xl->Explicit 均为 kind 0"
+              " 分散命中（引擎正是按这一档把它们滤掉的）",
+              [[(n, E76.fuzzy_match(n, w)[0][0]) for n, w in
+                (("Implements", "ms"), ("Explicit", "xl"))]],
+              expect_contain=[[("Implements", 0), ("Explicit", 0)]])
+    except Exception as _e76:
+        check("第 76 节异常: %s" % _e76, [True], expect_contain=[False])
 
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))

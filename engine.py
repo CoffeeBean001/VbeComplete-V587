@@ -1912,11 +1912,12 @@ class Completer:
         # 这条只作用于【内建公共词汇】；你自己工程里的名字一直不受限
         # （getse3 -> getSettingTitle3 照旧）。
         #
-        # ⚠️ v77：内建函数/数据类型/关键字/枚举四批**默认全部不收**（只剩工程内名字
-        # 与组件名、控件名）⇒ `_builtin_names()` 默认是空集，**这一整段默认不会
-        # 生效**（对任何名字都不收紧）。规则本身留着、不许退化：把
-        # `set VBECOMPLETE_VBA_BUILTINS=1` 或 `_VBA_KEYWORDS=1` 打开后它立刻恢复
-        # 作用（第 48 节那批"公共词汇收紧"断言钉的就是它）。
+        # ⚠️ v77：内建函数/数据类型/关键字/枚举四批曾**默认全部不收**（只剩工程内名字
+        # 与组件名、控件名）⇒ `_builtin_names()` 默认是空集、**这一整段不生效**。
+        # 规则本身留着、不许退化。
+        # ⚠️ ★v96：关键字与内建函数/类型**又收进默认池**了（枚举仍然不收）⇒
+        #    `_builtin_names()` 默认非空，**下面这段重新变成活的**，
+        #    紧接着那条"同分时工程内名字优先"也是。
         if len(word) < 4:
             _bl = self._builtin_names()
             if _bl:
@@ -1931,8 +1932,49 @@ class Completer:
                     scored = [t for t in scored
                               if t[0][0] >= 1 or t[1].lower() not in _bl
                               or t[1].lower().startswith(_w0)]
-        # sorted 稳定：同分时保持后端原来的顺序
-        scored.sort(key=lambda t: t[0], reverse=True)
+
+        # ★v96：★【你自己的名字】要排在【语言自带的名字】前面。
+        #
+        # 触发场景（用户口径"把 vba 关键字、函数名也加入到提醒列表里"之后立刻
+        # 暴露的）：`decl` 同时命中两个候选，**命中质量完全一样** ——
+        #   declaredVar  (kind 3, 起 0, 跨度 4)   前缀命中
+        #   Declare      (kind 3, 起 0, 跨度 4)   同上
+        # 评分键的最后那个分量是 `-名字长度`（-11 vs -7），Declare 只有 7 个字母
+        # 比 declaredVar 短 4 个，于是纯排序下**关键字压过了用户的变量**。
+        # 那不是"匹配得更好"，只是"名字更短"—— 这个分量本来是给同前缀候选
+        # 分先后的兜底（xlCellType vs xlCell 这种，短的更像想找的）。
+        #
+        # ⇒ 判据是【命中质量相同】：kind / 首个命中位置 / 命中跨度 三者全同，
+        #   就不看名字长度，**直接按"是不是语言自带"分档**。
+        #   ⚠️ 别拿整个 `t[0]` 比（我第一版就是这么写的，结果永远不相等 ⇒ 死规则，
+        #      白加）：`t[0]` 末位就是名字长度，它一参与比较这条路就自动失效。
+        #      同理也别把 builtin 标志塞在 `t[0]` **后面**当次级键 —— 那样它只在
+        #      完全同分时才轮得到，等于没生效。
+        #
+        # 为什么不用"语言自带的一律靠后"：
+        #   * 精确命中（kind 4）必须仍然靠前 —— 打了 `msgbox` 就该选 MsgBox，
+        #     它比任何工程内的 8 字母变量都更像用户要的（kind 不同，走不到本条）；
+        #   * 用户在工程里真有 `Function Declare(...)` 时，两边都算工程内名字，
+        #     仍由名字长度决定先后，不受影响。
+        #   * （`_builtin_names()` 只含"语言自带的公共词汇"，宿主枚举那批不在
+        #     里面，所以这条不会去动 xl*/mso* 的排序。）
+        try:
+            _bl_sort = self._builtin_names()
+        except Exception:
+            _bl_sort = frozenset()
+        if _bl_sort:
+            # ⚠️ `reverse=True` 是降序，而 `True > False` ⇒ 想要"非 builtin 在前"
+            #    就必须把这个标志**取反**（`not in` -> True 表示工程内名字）。
+            #    别写成 `in _bl_sort` —— 那等于"关键字优先"，正好与本条相反。
+            #    键的顺序 = 命中质量(k3) > 你的名字 > 名字长度(降序：短在前)。
+            #    _bl_sort 为空时退化成原来的单键排序（行为逐字不变）。
+            scored.sort(key=lambda t: (t[0][0], t[0][1], t[0][2],
+                                       t[1].lower() not in _bl_sort,
+                                       t[0][3]),
+                        reverse=True)
+        else:
+            # sorted 稳定：同分时保持后端原来的顺序
+            scored.sort(key=lambda t: t[0], reverse=True)
         matches = [name for _, name, _ in scored]
         # 每个候选的命中下标，交给 UI 高亮（键是名字，值是下标列表）
         self.match_hits = {name: pos for _, name, pos in scored}
