@@ -1,5 +1,7 @@
 ﻿# VbeComplete
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 **IntelliJ IDEA–style autocomplete for the VBA editor.**
 
 VbeComplete brings modern, IDE-grade code completion to the VBA editor (VBE) shipped with
@@ -188,6 +190,10 @@ run_tests.bat
   VBE's own member list, which needs the object's type to be resolvable. Compile the project
   (*Debug → Compile*) so the VBE can resolve it.
 - **Dependency installation failed** — run `python main.py` in a console to see the exact error.
+
+## License
+
+Released under the [MIT License](LICENSE).
 
 ## Credits
 
