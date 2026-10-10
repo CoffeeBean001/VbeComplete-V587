@@ -1876,6 +1876,56 @@ class Completer:
             except Exception:
                 _hit = False
             if _hit:
+                # ★v100（用户报）：`Call judge` 里按 Tab 不补括号。
+                #
+                # 根因不在补括号逻辑本身（那两条判据与位置都对，`Call` 后
+                # `_is_call_site` 放行、`judge` 也真在 `get_proc_names` 里），
+                # 而是**这一下 Tab 根本没走到我们的 accept()**：光标在 `Call `
+                # 之后时 VBE 自己就弹着【自动列出成员】，我们全程让位、弹窗已
+                # 经隐藏 ⇒ `completer.is_visible()` 那条分支轮不到我们 ⇒
+                # VBE 自己把 `judge` 插进去，而**它插名字是不带括号的**。
+                # 与 v90b/v91 记的是同一个坑（让位期间 Tab 打给 VBE 的列表），
+                # 但那次要解决的是"别再提示自己"，这次要解决的是"该补的括号
+                # 没人补"。
+                #
+                # ⇒ 在这儿补：这一段已经判据确证是"VBE 刚插进来的那个词"
+                # （`_hit` 的四条全过），把它交给与 accept() 同一个后端动作
+                # （`apply_completion(..., want_parens=True)`）——判据与动作
+                # 都不另写一份，改完立刻生效。
+                #
+                # ⚠️ 只在【第一段】补：第二段（`_accept_pinned`）锚的是"VBE
+                # 留下的那一行"，那一行一个字都没再动过，补括号会变成改坏代码。
+                #
+                # ★★要补的词**不是 `_ins`**，而是 ctx 里光标处的【整个词】：
+                # VBE 的列表是把你已经打的半截词**补长**（`jud` → `judge`），
+                # 不是插进一个新词 ⇒ 公共前缀/后缀一算，抠出来的 `_ins` 只是差量
+                # （`Call jud` → `Call judge` 得 `_ins == "ge"`）。拿 `_ins` 去
+                # 判"是不是过程名"必然判否（`ge` 当然不是过程）⇒ 必须用光标处
+                # 那个整词。v93 记的"第三种形态"讲的就是同一件事。
+                if not self._accept_pinned:
+                    try:
+                        # 光标左边的词（1-based 字符列）。拿不到就退到 `_ins`
+                        # 去掉可能带的头点号 —— 但那条只是兜底，判据不依赖它。
+                        _ws100 = int(ctx.get("word_start_col") or 0)
+                        _we100 = int(ctx.get("word_end_col") or 0)
+                        _ln100 = int(ctx.get("line_no") or 0)
+                        _word100 = str(ctx.get("word") or "")
+                        if not _word100 and _ws100 > 0 and _we100 >= _ws100:
+                            _word100 = _now_txt[_ws100 - 1:_we100 - 1]
+                        if _word100[:1] == ".":
+                            _word100 = _word100[1:]
+                        if (_word100 and _ln100 > 0 and _ws100 > 0
+                                and self._is_callable_name(_word100)):
+                            self.backend.apply_completion(
+                                _ln100, _ws100, _ws100 + len(_word100),
+                                _word100, True)
+                            _log("trigger: VBE 列表补进的 %r 是过程名 "
+                                 "-> 补上括号" % (_word100,))
+                    except Exception:
+                        # 补不上就算了，绝不因为补括号把这次静默判定弄坏
+                        # （下面的 hide / 钉住逻辑必须照常走）。
+                        _log("trigger: 给 VBE 补进的 %r 补括号失败（不影响"
+                             "本次静默）" % (_word100,))
                 if self._accept_pinned:
                     _log("trigger: 这一行还是 VBE 留下的样子 -> 仍是本次录入的"
                          "回声，不提示自己（行=%r）"

@@ -204,6 +204,14 @@ def _pair_char_for_key(vk, shift_down):
     刻意去问系统「这个 vk 在当前键盘布局下的基础字符是什么」
     （MapVirtualKeyW），而不是写死 vk 常量：布局不同也不会配错。
     小键盘（NumLock 下按 9 就是数字 9）一律不管。
+
+    ⚠️ 踩过的坑（已回退，留在注释里免得再犯一次）：曾试过用
+    `MapVirtualKeyW(vk, 0)`（"带修饰键的真实字符"）来摆脱对 `shift_down` 的依赖
+    —— **实测 mode 0 返回的是扫描码不是字符**（vk=0x39 得 `'\n'`、0x30 得
+    `'\x0b'`、0xBB 得 `'\r'`），用它判字符会**全盘失效**：左括号键 vk=0x39 认不出、
+    而 vk=0xDE 会被误认成 `(`。mode 2 才是"当前布局下该键的基础字符"。
+    ⇒ 要真正摆脱 Shift 依赖，得走 `ToUnicodeEx`（带当前键盘状态做死译），
+    不是换 MapVirtualKeyW 的 mode。**未做，先记坑。**
     """
     if not shift_down:
         return None
@@ -1136,6 +1144,8 @@ def main():
                     # —— 依然不会"吞掉按键却什么都没发生"。
                     action = (_auto_pair_here, (_pair_ch,))
                     suppress = True
+                    _log("autopair: 钩子接管 vk=0x%X -> %r"
+                         % (vk, _pair_ch))
                 elif completer.is_visible():
                     if not in_vbe_code_pane():
                         # 焦点已离开 VBE：收起弹窗，按键照常放行

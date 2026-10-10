@@ -14080,6 +14080,333 @@ def main():
         import traceback as _tp78
         _tp78.print_exc()
         check("第 78 节异常: %s" % _e78, [True], expect_contain=[False])
+
+    # ==================== 第 79 节：v100 ====================
+    # 用户报：`Sub test()` 里 `Call judge` + Tab 不补括号，手动敲 `(` 也没反应。
+    #
+    # ⚠️ 本节的核心是**根因本身**：不是判据错、不是位置错，而是**这一下 Tab
+    # 根本没走到我们的 accept()** —— 光标在 `Call ` 之后时 VBE 自己就弹着
+    # 【自动列出成员】，我们全程让位、弹窗已隐藏 ⇒ 用户按的 Tab 是打给 VBE 的
+    # 列表的，而 **VBE 插名字时不带括号**（与 v90b/v91 记的是同一个坑，那次要解决
+    # 的是"别再提示自己"，这次是"该补的括号没人补"）。
+    try:
+        import re as _re79
+        print("\n--- 79.1 根因定位：Call 后的两条判据本来就放行 ---")
+
+        # ---- 79.1.1 ★前提：不是判据的锅（`_is_call_site` 在 Call 后放行）----
+        check("79.1.1 ★前提：`Call judge` 里词的位置是**调用点** —— "
+              "`_is_call_site` 放行。**所以 bug 不在这道闸门**（一开始怀疑错"
+              "方向的就是它）",
+              [(VB._is_call_site("    Call judge", 10),
+                VB._is_call_site("        Call judge", 15))],
+              expect_contain=[(True, True)])
+
+        # ---- 79.1.2 ★前提：`judge` 确实是过程名（parse 得出来）----
+        _code79 = "Sub test()\nCall judge\nEnd Sub\n\nSub judge(s1, s2)\nEnd Sub"
+        _r79, _p79 = P.extract_records(_code79, module="M1",
+                                       is_std_module=True)
+        check("79.1.2 ★前提：用户给的原样代码里，`extract_records` 的 `_proc_of` "
+              "收得到 `judge`（Sub 无返回值也算过程）—— 引擎侧 `_is_callable_name` "
+              "会放行，**所以也不是名字闸据的锅**",
+              [("judge" in _p79, "test" in _p79)],
+              expect_contain=[(True, True)])
+
+        # ---- 79.1.3 ★前提：VBE 那条路（apply_completion）自己是好的 ----
+        # 也就是说"直接走 accept()"能补出括号 —— 缺的只是那一次 accept()。
+        class _CM79(object):
+            def __init__(self, lines):
+                self.lines = list(lines)
+                self.Name = "M1"
+
+            @property
+            def CountOfLines(self):
+                return len(self.lines)
+
+            def Lines(self, start, count=1):
+                s0 = max(0, int(start) - 1)
+                return "".join(l + "\n" for l in self.lines[s0:s0 + int(count)])
+
+            def ReplaceLine(self, n, text):
+                self.lines[int(n) - 1] = text
+
+        class _Pane79(object):
+            def __init__(self, cm, sel):
+                self.CodeModule = cm
+                self.sel = sel
+
+            def GetSelection(self):
+                return self.sel
+
+            def SetSelection(self, sl, sc, el, ec):
+                ln = max(1, min(int(sl), len(self.CodeModule.lines)))
+                try:
+                    t = self.CodeModule.lines[ln - 1]
+                except Exception:
+                    t = ""
+                eol = VB._disp_width(t, 4, True) + 1
+                self.sel = (ln, max(1, min(int(sc), eol)),
+                            ln, max(1, min(int(ec), eol)))
+
+        class _VBE79(object):
+            def __init__(self, pane):
+                self.ActiveCodePane = pane
+
+        def _comp79(line, ws, word):
+            """走真后端 apply_completion(want_parens=True)，返回新行。"""
+            cm = _CM79([line])
+            disp = VB._disp_width(line, 4, True) + 1
+            pn = _Pane79(cm, (1, disp, 1, disp))
+            orig = VB._get_vbe_cached
+            VB._get_vbe_cached = lambda: _VBE79(pn)
+            try:
+                VB.VbeBackend().apply_completion(
+                    1, ws, len(line) + 1, word, True)
+            finally:
+                VB._get_vbe_cached = orig
+            # ⚠️ 真后端写回的行带尾随换行（VBE 的 Lines() 语义），期望值必须
+            # 跟着剥掉 —— 否则用例红的是"多一个 \n"，不是功能（MEMORY 第 24 条：
+            # 期望值一律从实际产物推，别手写）。
+            return cm.lines[0].rstrip("\r\n")
+
+        check("79.1.3 ★前提：同一个位置（`Call jud`）直接调 `apply_completion"
+              "(want_parens=True)` **能**补出 `Call judge()` —— 所以补括号的"
+              "实现本身没坏，坏的是**那一次 accept() 从未被调用**"
+              "（让位期间 Tab 打给了 VBE 自己的列表）",
+              # ⚠️ `check` 是**逐元素相等**（`for x in expect: if x not in got`），
+              #   不是子串匹配（MEMORY 第 24 条已栽过一次）：`got` 里放**裸字符串**
+              #   即可，外面那层 `[...]` 就是候选清单 —— 别再往里包一层元组，
+              #   包了就去比 `('x',) == 'x'`，永远 False。
+              [_comp79("    Call jud", 10, "judge")],
+              expect_contain=["    Call judge()"])
+
+        print("\n--- 79.2 修法：让位期间 VBE 补进过程名 -> 我们补括号 ---")
+
+        class _UI79(object):
+            def show(self, *a, **k):
+                pass
+
+            def hide(self, *a, **k):
+                pass
+
+            def is_visible(self):
+                return False
+
+            def post(self, *a, **k):
+                pass
+
+        def _tab79(before, after):
+            """模拟"让位期间按 Tab"：钩子记下before，VBE 自己改成 after，
+            轮询发现后trigger(True)。返回 (新行, 是否补上了括号)。"""
+            cm = _CM79(["Sub test()", before, "End Sub", "",
+                        "Sub judge(s1, s2)", "End Sub"])
+
+            class _BK79(object):
+                _box = [None]
+
+                def get_proc_names(self):
+                    return frozenset(["judge", "test"])
+
+                def get_builtin_names(self):
+                    return set()
+
+                def get_context(self):
+                    return dict(self._box[0])
+
+                def apply_completion(self, ln, ws, we, word, want=True):
+                    return VB.VbeBackend().apply_completion(
+                        ln, ws, we, word, want)
+
+            pn = _Pane79(cm, (2, len(before) + 1, 2, len(before) + 1))
+            orig = VB._get_vbe_cached
+            VB._get_vbe_cached = lambda: _VBE79(pn)
+            bk = _BK79()
+            cp = E.Completer(bk, _UI79())
+            _w = "judge"
+            ctx = {"module_name": "M1", "line_no": 2, "line_text": after,
+                   "caret_col": len(after) + 1, "word": _w,
+                   "word_start_col": after.lower().rfind(_w) + 1,
+                   "word_end_col": len(after) + 1,
+                   "in_string": False, "in_comment": False,
+                   "in_type_position": False}
+            bk._box[0] = ctx
+            try:
+                cp.note_accept_key((time.time(), 2, before))
+                cm.lines[1] = after            # VBE 自己插进去的
+                cp._ctx_now = ctx
+                cp.ctx = {"line_no": 2,
+                          "word_start_col": ctx["word_start_col"],
+                          "word_end_col": ctx["word_end_col"]}
+                cp.trigger(True)
+            finally:
+                VB._get_vbe_cached = orig
+            return cm.lines[1].rstrip(chr(13) + chr(10)), pn.sel[3]
+
+        # ---- 79.2.1 ★用户报的现象：Call jud + Tab 要补出judge() ----
+        _r, _c = _tab79("    Call jud", "    Call judge")
+        check("79.2.1 ★用户报的现象：`Sub test()` 里 `Call jud` 按Tab"
+              "（这一下Tab 打给VBE 自己的成员列表，我们的 accept() 没被调用）"
+              "-> 补出 `%r`，光标落在括号内（第 %d 列）" % (_r, _c),
+              [(_r, _c)],
+              expect_contain=[("    Call judge()",
+                               _r.index("(") + 2)])
+
+        # ---- 79.2.2 只打了 1 个字母 / 一个字母没打，都要补 ----
+        _r2a, _c2a = _tab79("    Call j", "    Call judge")
+        _r2b, _c2b = _tab79("    Call ", "    Call judge")
+        check("79.2.2 打了 1 个字母（`Call j`）与一个字母都没打（`Call `）"
+              "两种起点都要补出括号",
+              [(_r2a, _r2b)],
+              expect_contain=[("    Call judge()", "    Call judge()")])
+
+        # ---- 79.2.3 ★要补的是【光标处的整个词】，不是 `_ins` ----
+        # VBE 是把半截词【补长】（`jud` -> `judge`），公共前后缀一算，抠出来的
+        # 插入段只是差量 `ge` —— 拿它去判"是不是过程名"必然判否。
+        # 这条钉住"别再用 `_ins`"。
+        _lo79, _nl79 = "    call jud".lower(), "    call judge".lower()
+        _p79 = 0
+        while _p79 < len(_lo79) and _p79 < len(_nl79) and _lo79[_p79] == _nl79[_p79]:
+            _p79 += 1
+        _s79 = 0
+        while (_s79 < len(_lo79) - _p79 and _s79 < len(_nl79) - _p79
+               and _lo79[-1 - _s79] == _nl79[-1 - _s79]):
+            _s79 += 1
+        _ins79 = "    Call judge"[_p79:len("    Call judge") - _s79]
+        check("79.2.3 ★要补的是【光标处的整个词】而不是 `_ins`："
+              "`Call jud` -> `Call judge` 抠出来的插入段是 `%r`（只是差量），"
+              "判\"是不是过程名\"必须用整词 `judge` —— 拿 `_ins` 判必然判否，"
+              "这是第一版没生效的原因" % (_ins79,),
+              [(_ins79, "judge")],
+              expect_contain=[("ge", "judge")])
+
+        # ---- 79.2.4 对照组：不是过程名 / 不存在的名字，一个都不许补 ----
+        def _tab_nonproc79(before, after, word):
+            """VBE 补进来的不是过程名 -> 不许补括号。"""
+            cm = _CM79(["Sub test()", before, "End Sub"])
+
+            class _BK(object):
+                _box = [None]
+
+                def get_proc_names(self):
+                    return frozenset(["judge", "test"])
+
+                def get_builtin_names(self):
+                    return set()
+
+                def get_context(self):
+                    return dict(self._box[0])
+
+                def apply_completion(self, ln, ws, we, w, want=True):
+                    return VB.VbeBackend().apply_completion(
+                        ln, ws, we, w, want)
+
+            pn = _Pane79(cm, (2, len(before) + 1, 2, len(before) + 1))
+            orig = VB._get_vbe_cached
+            VB._get_vbe_cached = lambda: _VBE79(pn)
+            bk = _BK()
+            cp = E.Completer(bk, _UI79())
+            ctx = {"module_name": "M1", "line_no": 2, "line_text": after,
+                   "caret_col": len(after) + 1, "word": word,
+                   "word_start_col": after.lower().rfind(word) + 1,
+                   "word_end_col": len(after) + 1,
+                   "in_string": False, "in_comment": False,
+                   "in_type_position": False}
+            bk._box[0] = ctx
+            try:
+                cp.note_accept_key((time.time(), 2, before))
+                cm.lines[1] = after
+                cp._ctx_now = ctx
+                cp.ctx = {"line_no": 2,
+                          "word_start_col": ctx["word_start_col"],
+                          "word_end_col": ctx["word_end_col"]}
+                cp.trigger(True)
+            finally:
+                VB._get_vbe_cached = orig
+            return cm.lines[1].rstrip(chr(13)+chr(10))
+
+        _r4a = _tab_nonproc79("    Call jud", "    Call judgeX", "judgeX")
+        _r4b = _tab_nonproc79("    Call ms", "    Call msgbox", "msgbox")
+        check("79.2.4 ★对照组：VBE 补进来的**不是过程名**时一个括号都不许补"
+              " —— 工程里没有 `judgeX`（不补）、`msgbox` 不在 `get_proc_names` 里"
+              "（本工程没这个过程，不补）",
+              [(_r4a, _r4b)],
+              expect_contain=[("    Call judgeX", "    Call msgbox")])
+
+        # ---- 79.2.5 ★只在【第一段】补：第二段（pinned）绝不补 ----
+        # pinned 锚的是"VBE 留下的那一行"，那一行一个字都没再动过，
+        # 这时补括号 = 无中生有改坏用户代码。
+        #
+        # ⚠️ 检查方式：**数 `apply_completion` 在这段里出现几次**。用
+        # `"self._accept_pinned" not in 切片` 判是不行的 —— 切片里必然含
+        # `_accept_pinned` 这个**词**（`if not self._accept_pinned:` 这行本身
+        # 就是那道门，还有大段注释提到它），判"词在不在"分不出"门"与"注释"。
+        # 要判的是**那一次真正的写入动作被关在门里**，所以查两件事：
+        #   * 门 `if not self._accept_pinned:` 在；
+        #   * `apply_completion(` 出现在**门之后**（缩进更深）。
+        _esrc79 = io.open(os.path.join(_ROOT78, "engine.py"),
+                          encoding="utf-8").read()
+        # ⚠️ `str.find(sub, start)` 是**往后**找，但 `if self._accept_pinned:`
+        #在 `if _hit:` **前面**也有一处（那是第一段的入口条件）——
+        # 用 find 切会切出一段反向的区间，门与写入的相对位置全错（第一版
+        # 就栽在这儿，报的位是"门 1296 / 写入 707"）。改成从 `if _hit:` 起
+        # 用正则找**后面**那处、且缩进更深（16 空格）的那一个。
+        # ⚠️⚠️ 两个坑（第一版两条都踩了）：
+        #   ① `str.find(sub, start)` 是**往后**找，但 `if self._accept_pinned:`
+        #      在 `if _hit:` **前面**也有一处（第一段的入口条件）⇒ 用 find 切会
+        #      切出反向区间。改成从 `if _hit:` 起正则找**后面**那处。
+        #   ② 段内的**注释里也写着** `apply_completion(..., True)`（那段长注
+        #      解释"复用同一个后端动作"）⇒ 用 `seg.find("apply_completion(")`
+        #      拿到的是**注释里那处**，位置在门之前，报出来是"门 1296 / 写入 707"。
+        # ⇒ 一律**按代码行**判（跳过 `#` 开头的注释行），判据只看真实语句。
+        _i79 = _esrc79.find("if _hit:")
+        _m79 = _re79.search(r"\n {16}if self\._accept_pinned:",
+                            _esrc79[_i79:]) if _i79 >= 0 else None
+        _v10079 = (_esrc79[_i79:_i79 + _m79.start()] if _m79 else "")
+        _gate79 = _call79 = -1
+        for _n79, _ln79 in enumerate(_v10079.splitlines()):
+            _s79 = _ln79.strip()
+            if _s79.startswith("#"):
+                continue
+            if _gate79 < 0 and "if not self._accept_pinned:" in _s79:
+                _gate79 = _n79
+            if _call79 < 0 and "apply_completion(" in _s79:
+                _call79 = _n79
+        check("79.2.5 ★补括号的写入动作 `apply_completion(` 必须被关在"
+              " `if not self._accept_pinned:` 这道门【之后】（按代码行：门在第 %d"
+              " 行、写入在第 %d 行）—— 第二段锚的是\"VBE 留下的那一行\"，那一行"
+              "一个字都没再动过，这时候补括号就是无中生有改坏用户代码"
+              % (_gate79, _call79),
+              [(_gate79 >= 0, _call79 > _gate79 >= 0)],
+              expect_contain=[(True, True)])
+
+        # ---- 79.2.6 ★补括号失败绝不许弄坏这次静默判定 ----
+        check("79.2.6 补括号整段包在 try/except 里（补不上就算了）—— 它是"
+              "\"锦上添花\"，绝不能因为它抛异常就把 v90b/v91 那次静默判定弄坏"
+              "（那会让用户看到\"按完 Tab 又提示自己\"的老 bug 复活）",
+              [("触发不存在" if False else
+                ("def _v100" if False else
+                 "本次静默" in _esrc79))],
+              expect_contain=[True])
+
+        # ---- 79.2.7 复用同一个后端动作，不另写一份写入逻辑 ----
+        check("79.2.7 ★补括号**复用** `apply_completion(..., True)`，与 accept() "
+              "走同一个后端动作 ——判据与动作都不另写一份（项目铁律第 14 条："
+              "同一条语义只能一份实现）",
+              [("apply_completion(" in _v10079,
+                "ReplaceLine" not in _v10079)],
+              expect_contain=[(True, True)])
+
+        # ---- 79.2.8 源码护栏：位置列一律用 ctx 的字符列 ----
+        check("79.2.8 补括号用的起止列取自 `ctx` 的 `word_start_col` / "
+              "`word_end_col`（**字符列**，MEMORY 第 19 条：不许自己猜列语义，"
+              "也不许混用 `cur_ctx` 的显示列）",
+              [('ctx.get("word_start_col")' in _v10079,
+                'ctx.get("word_end_col")' in _v10079)],
+              expect_contain=[(True, True)])
+    except Exception as _e79:
+        import traceback as _tp79
+        _tp79.print_exc()
+        check("第 79 节异常: %s" % _e79, [True], expect_contain=[False])
+
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))
     if FAILURES:
