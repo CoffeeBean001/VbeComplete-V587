@@ -49,12 +49,28 @@ _RE_BUILTIN_CONST = re.compile(r"^(?:vb|xl|mso|db|wd|pp|ol|ac|wpp)[A-Z]")
 _RE_CONTINUATION = re.compile(r"(?<=[ \t])_[ \t]*\r?\n")  # 行继续符 _
 _RE_DECL = re.compile(r"\b(?:Dim|Private|Public|Global|Friend|Static|ReDim)\b", re.I)
 _RE_CONST = re.compile(r"\bConst\b", re.I)
+# ★v103：过程名之后允许的三种收尾。MS 官方语法是
+#     `[Public|Private|Friend|Static] Sub name [(arglist)] [As type]`
+# —— **arglist 连括号都可以省**，于是这三种全是合法代码：
+#     `Sub Foo()`           带括号的参数表
+#     `Sub Foo`             既无参数也无返回类型
+#     `Function Compute As Long`   无括号、但有返回类型（旧写法漏认的正是这种）
+# 另外 VBA 允许在名字末尾写类型声明符（`Function Foo$()` / `Function Bar%`），
+# `_IDENT` 不含 `% & ! # @ $`，所以也得在这里放行。
+#
+# ⚠️ 漏认 `Function Compute As Long` 的后果远不止"少一个候选"：这一行不被当成
+#   过程头，`cur_proc` 就不会置位，**它体内的 `Dim` 全被记成模块级**
+#   （`proc=None`）⇒ 过程局部变量泄漏到本模块的其它过程（实测：`Function
+#   Compute As Long` 里的 `secretLocal` 出现在 `Sub Caller` 的候选里）。
+_RE_PROC_NAME_TAIL = r"\s*[%&!#@$]?\s*(?:\(|$|As\b)"
+
+
 _RE_SUB = re.compile(
     r"^\s*(?:(?:Public|Private|Friend|Global|Static)\s+)*(?:Sub|Function)\s+("
-    + _IDENT + r")\s*(?:\(|$)", re.I)
+    + _IDENT + r")" + _RE_PROC_NAME_TAIL, re.I)
 _RE_PROP = re.compile(
     r"^\s*(?:(?:Public|Private|Friend|Global|Static)\s+)*Property\s+(?:Get|Let|Set)\s+("
-    + _IDENT + r")\s*(?:\(|$)", re.I)
+    + _IDENT + r")" + _RE_PROC_NAME_TAIL, re.I)
 # 事件声明：Public Event Foo(ByVal x As Long)
 _RE_EVENT = re.compile(
     r"^\s*(?:(?:Public|Private|Friend|Global|Static)\s+)*Event\s+(" + _IDENT
@@ -214,7 +230,14 @@ def _params_inside(paren_text):
         if not part:
             continue
         # 形如 ByVal ws As Worksheet / Optional retries As Long = 3
-        m = re.match(r"(?:ByVal|ByRef|Optional|ParamArray)\s+(" + _IDENT + r")", part, re.I)
+        #
+        # ★v103：修饰词必须允许【连用】。旧写法 `(?:ByVal|ByRef|Optional|
+        # ParamArray)\s+(ident)` 只吃**一个**修饰词，于是 `Optional ByVal x`
+        # 这种连写（VBA 里很常见）把第二个修饰词 `ByVal` 当成了参数名 ——
+        # 后果是两边都错：伪候选 `ByVal` 进了池子（输入 `by` 就弹出来），
+        # 真正的参数 `x` 反而丢了。改成 `(?:修饰词\s+)*` 逐个吃掉。
+        m = re.match(r"(?:(?:ByVal|ByRef|Optional|ParamArray)\s+)*("
+                     + _IDENT + r")", part, re.I)
         if m:
             names.append(m.group(1))
             continue
@@ -222,6 +245,40 @@ def _params_inside(paren_text):
         if m:
             names.append(m.group(0))
     return names
+
+
+def extract_proc_signatures(code):
+    """从模块源码里提取 {小写过程名: "(s1, s2)"}。★v103。纯文本、不碰 COM。
+
+    用途：候选窗的"详情行"显示形参表 —— 仿 IDEA 在补全列表里就把参数列出来
+    （用户不必先确认、再回头回忆这个子过程要几个参数）。
+
+    只取形参【名字】，不取类型：类型那一段要处理 `As` / 数组括号 / 默认值 /
+    Optional，而用户在这一眼里真正要看的是"有几个参数、都叫什么"。
+
+    ⚠️ 与 `extract_records` 用**同一批**过程头正则（_RE_SUB / _RE_PROP /
+    _RE_DECLARE）—— 两边认出来的过程必须完全一致，否则会出现"有候选没签名"
+    或"有签名没候选"。所以这里刻意不另写一套正则。
+    ⚠️ 形参表跨行（VBA 的行继续符 `_`）时这一行里找不到 `(...)`，那就**不产出
+    签名**：宁可不显示，也不显示一个错的 `()`。
+    """
+    out = {}
+    for line in str(code or "").split("\n"):
+        if not line.strip():
+            continue
+        m = (_RE_SUB.match(line) or _RE_PROP.match(line)
+             or _RE_DECLARE.match(line))
+        if not m:
+            continue
+        pm = re.search(r"\(([^)]*)\)", line)
+        if not pm:
+            continue
+        try:
+            names = _params_inside(pm.group(1))
+        except Exception:
+            names = []
+        out[str(m.group(1)).lower()] = "(" + ", ".join(names) + ")"
+    return out
 
 
 def extract_records(code, module=None, is_std_module=True, caret=None):
@@ -352,7 +409,16 @@ def extract_records(code, module=None, is_std_module=True, caret=None):
             pm = re.search(r"\((.*)\)", line)
             if pm:
                 for p in _params_inside(pm.group(1)):
-                    add(p, cur_proc, False)
+                    # ★v103：形参必须挂在【这个 Declare 自己的名字】上，不能
+                    # 用 `cur_proc` —— Declare 一定在模块级，那时 `cur_proc`
+                    # 是 None ⇒ 形参被记成【模块级、priv=False】⇒ 本模块**每个
+                    # 过程**里都能裸名引用到它（实测 `Private Declare Sub Sleep
+                    # Lib "kernel32" (ByVal dwMilliseconds As Long)` 之后，
+                    # `dwMilliseconds` 会出现在任意过程的候选里）。
+                    # 与 Sub/Function 的形参同口径：挂在自己名下 ⇒ 只有当
+                    # "当前过程"等于这个名字时才可见，而 Declare 的过程体不存在，
+                    # 于是它天然不可见 —— 这正符合 VBA 语义（它只是声明里的形参名）。
+                    add(p, proc_key(m_decl.group(1)), False)
             continue
 
         # Sub / Function：过程名模块级，参数属于该过程
@@ -402,6 +468,12 @@ def extract_records(code, module=None, is_std_module=True, caret=None):
             kind = KIND_VAR
             priv = _is_private(kind, has_priv_kw, has_pub_kw, is_std_module)
             body = _RE_DECL.sub("", line, count=1).strip()
+            # ★v103：`ReDim Preserve arr(1 To 10)` —— `_RE_DECL` 只吃掉了
+            # `ReDim`，剩下的 `Preserve arr(...)` 交给 _decl_names 取首标识符，
+            # 于是收录出**伪名字 `Preserve`**（它是关键字、不在 stopword 表里，
+            # 输入 `pre` 就会以 kind 3 前缀命中弹出来）。
+            # 这里补一刀：`ReDim` 后面紧跟的 `Preserve` 一并吃掉。
+            body = re.sub(r"^Preserve\b[ \t]*", "", body, flags=re.I).strip()
             for nm in _decl_names(body):
                 # 过程内 Dim/Static = 局部
                 if cur_proc:

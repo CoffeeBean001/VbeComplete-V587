@@ -571,7 +571,13 @@ class Popup:
         list_w = name_x0 + text_w + sb_v_w + PAD_X
         list_bg_right = name_x0 + text_w + PAD_X
 
-        # 详情行：当前"活动"候选被省略时，显示其完整名字（悬停优先，否则选中项）
+        # 详情行：当前"活动"候选（悬停优先，否则选中项）。
+        #   * 名字被省略（超 30 字符）-> 显示完整名字；
+        #   * ★v103 是过程/函数 -> 名字后面接上【形参表】（如 `judge  (s1, s2)`）
+        #     —— 仿 IDEA：在补全列表里就能看到"这个子过程要几个参数、都叫什么"，
+        #     不用先确认再回头翻定义。两条都成立时一次显示完。
+        #   ⚠️ 拿不到签名（变量/常量/关键字，或假 completer 没这个接口）时
+        #     退回老行为，绝不显示一个拼出来的空 `()`。
         active = None
         if count:
             if self._hover is not None and 0 <= self._hover < count:
@@ -581,7 +587,18 @@ class Popup:
         detail_text = None
         if active is not None:
             name = self._rows[active][0]
-            if self._measure(name) > text_w:
+            sig = ""
+            # `getattr(..., None)` 而不是直接调：UI 的单测里用的是**假 completer**，
+            # 它没有这个方法（见 _sync_from_completer 的说明），不能因此报错。
+            _sig_of = getattr(self.completer, "signature_of", None)
+            if callable(_sig_of):
+                try:
+                    sig = str(_sig_of(name) or "")
+                except Exception:
+                    sig = ""
+            if sig:
+                detail_text = name + "  " + sig
+            elif self._measure(name) > text_w:
                 detail_text = name
         detail_h = row_h if detail_text else 0
         detail_w = (PAD_X + self._measure(detail_text) + PAD_X) if detail_text else 0

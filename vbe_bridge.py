@@ -16,7 +16,10 @@ from log import log as _log
 
 import parser as vba_parser
 import vba_builtins
-from engine import replace_word
+# ★v103：`_in_rem_comment` 是 `Rem` 判据的【唯一实现】（在 engine 里）。
+# 本文件的 `_classify` 原先漏认 Rem（只认 `'`），导致注释里照弹候选、
+# 自动配对也不让路 —— 复用同一份，不许在这里再写第二份 Rem 判据。
+from engine import replace_word, _in_rem_comment
 
 _CACHE_TTL = 2.0  # 标识符缓存刷新间隔（秒）
 
@@ -482,7 +485,13 @@ def _eol_caret_col(line_text, sem_info=None):
             return len(t) + 1
         except Exception:
             pass
-    return _disp_width(t, 4, False) + 1
+    # ★v103：兜底口径必须与 `_eol_disp_col` 一致（全角占 2 格）。
+    # 原来这里写的是 `_disp_width(t, 4, False)` —— 那是从 `_indent_end_col`
+    # 抄来的口径，而 `_indent_end_col` 的输入**只有空白**（缩进），全角参数
+    # 对它根本无意义；抄到一个"输入是任意代码行"的函数里，就变成"含中文的行
+    # 少算格数"（`    说 = 1` -> 10，而真值是 11）⇒ 删空行后光标落在上一行中文
+    # 中间偏左。同一语义（"行尾显示列"）在本文件里只能有一份实现，所以直接调它。
+    return _eol_disp_col(t, 4)
 
 
 # ---- 回车后的自动缩进（v79） ----
@@ -1233,11 +1242,14 @@ def pair_delete_span(line_text, char_col=None):
     删了。**判据一旦"两种都试"，就从精确判据退化成两个模糊判据的并集** ——
     漏判只是功能不生效，误判是改坏用户的代码，方向完全不可逆（MEMORY 第 19
     条、第 10 条）。⇒ 换算的责任交给调用方，各用自己最准的那份：
-      * 主线程 `delete_pair_here` 用 `_caret_char_col`（它认得列语义）；
-      * 钩子线程 `pair_delete_wanted` 用 `_col_to_char_index` 按 (tabw=4,
-        wide2=True) 换算 —— 与 `blank_line_delete_wanted` 里 `_eol_disp_col`
-        用的是同一组默认假设。万一这台编辑器的列语义与假设不符，最坏是这一次
-        误判/漏判，而主线程还会用精确值复核一遍 ⇒ 顶多退化成原生退格。
+      * 主线程 `delete_pair_here` 用 `_bs_caret_char_col`（★v103 更正：这里原先
+        写的是 `_caret_char_col`，是 v99 初稿的说法；**本功能的两个调用方**
+        （钩子侧 `pair_delete_wanted` 与主线程 `delete_pair_here`）后来统一成
+        了 `_bs_caret_char_col`，因为 `_caret_char_col` 的第三档是拿"行尾列"
+        反推 tabw 的，而删括号这个功能的典型形态是**光标停在行中间**，反推必错
+        （见第 27 条）。文档与代码不一致比没有文档更危险，故更正）；
+      * 钩子线程 `pair_delete_wanted` 同样用 `_bs_caret_char_col` —— 两侧
+        **同一份**（项目铁律：钩子判据与后端复核必须同口径）。
 
     判据本身极简，只问一件事：**光标左边那个字符和右边那个字符，是不是一对
     配对符**（`(` + `)` 或 `"` + `"`）。这一条就把"中间没内容"钉死了 ——
@@ -1427,6 +1439,11 @@ def _find_completion_end(text, completion, near0, fallback0):
     找不到则回退 fallback0（裁剪到行尾）。
     """
     L = len(completion)
+    if not L:
+        # ★v103：`text.find("", i)` 恒等于 i、而 `i += 0` 不动 ⇒ **死循环**
+        # （整个补全线程卡死）。当前所有调用方传的都是非空候选，所以这是个
+        # 潜伏缺陷；但只要将来有人拿"候选为空"调一次就会挂住，先挡住。
+        return min(fallback0, len(text))
     best = None
     i = 0
     while True:
@@ -2389,12 +2406,29 @@ def _classify(line_text, caret_col):
     行内含全角字符时它会大于 len(line_text)，下面的 line_text[i] 就会
     IndexError——所以调用方必须先完成显示列->字符列换算。
     这里再做一次钳制兜底，保证本函数本身永不因越界抛异常。
+
+    ★v103 修两个真 bug（都出在"注释"这一路）：
+
+    ① **不认 `Rem`**：原实现只把 `'` 当注释，于是 `Rem 每个元素` 这样的行
+       被判成"代码"（`in_comment=False`）⇒ `engine.trigger` 不再静默、
+       **在注释里照弹候选**；`insert_pair` 的"注释里不自动配对"早退也失效。
+       同一个文件里的 `_is_comment_only`、parser 的扫描都认 Rem，唯独这里
+       不认 —— 又一处"同一语义两/三份实现"。现在复用 engine 的
+       `_in_rem_comment`（它是 Rem 判据的唯一实现，见其 docstring）。
+
+    ② **遇到 `'` 后不停下**：原实现只记 `comment_pos`、继续往后扫，于是注释
+       里的引号会把 `in_str` 翻成 True —— `x = 1 ' say "hi` 会返回
+       `(True, False)`（"在字符串里"），而正确答案是 `(False, True)`（注释）。
+       现在一进注释立刻定案返回（注释【到行尾】，后面不可能再有代码）。
+
+    ⚠️ 顺序很关键：先按字符串状态机走一遍（含 `''` 转义），**走出字符串之后**
+       才问 Rem —— 否则 `x = "a Rem b"` 这种"字符串里长得像 Rem"的会被误判成
+       注释（实测：字符串状态机会给出 in_str=True，直接跳过 Rem 那一问）。
     """
     n = caret_col - 1 if caret_col > 1 else 0
     if n > len(line_text):
         n = len(line_text)
     in_str = False
-    comment_pos = -1
     i = 0
     while i < n:
         c = line_text[i]
@@ -2407,9 +2441,12 @@ def _classify(line_text, caret_col):
             else:
                 in_str = True
         elif c == "'" and not in_str:
-            comment_pos = i
+            # ★v103：注释到行尾 —— 后面不可能再有代码/字符串，直接定案。
+            return False, True
         i += 1
-    return in_str, (not in_str and comment_pos != -1)
+    if not in_str and _in_rem_comment(line_text, caret_col):
+        return False, True
+    return in_str, False
 
 
 def _proc_owns_line(cm, name, line_no):
@@ -2953,6 +2990,8 @@ class VbeBackend:
         # （`Dim n As Long` 补成 `Long()` 直接编译不过）。收集时由
         # parser.extract_records 一并给出，不额外读代码、不额外打 COM。
         self._proc_names = set()
+        # ★v103：过程 -> 形参表（`judge` -> `(s1, s2)`），供候选窗详情行显示。
+        self._proc_sigs = {}
         # ★v98：{类型名(小写): (收集时间戳, 成员名小写集合)}。
         # 与 _cache_time 同一个 TTL（get_members_of 里比对）。
         self._members_of_cache = {}
@@ -3094,6 +3133,24 @@ class VbeBackend:
             except Exception:
                 return frozenset()
         return frozenset(getattr(self, "_proc_names", None) or ())
+
+    def get_proc_signatures(self):
+        """返回 {小写过程名: "(s1, s2)"} —— ★v103，供候选窗详情行显示形参表。
+
+        与 `get_proc_names` 同源（同一次 `_collect_identifiers`、同一个 TTL、
+        同一个刷新点），所以"有候选"与"有签名"永远一致，不会出现一边新一边旧。
+
+        ⚠️ 交回内部 dict 本身（**只读，调用方不得修改**），理由同
+        get_structural_names / get_proc_names：这一路是按一次补全查的。
+        没签名（跨行形参表）的过程名直接不在 dict 里 —— 调用方按"查不到就没有"
+        处理，绝不要拿名字拼一个空的 `()` 出来。
+        """
+        if not getattr(self, "_proc_sigs", None):
+            try:
+                self.get_identifiers()
+            except Exception:
+                return {}
+        return getattr(self, "_proc_sigs", None) or {}
 
     def get_declared_names(self):
         """返回工程里真实声明过的名字（小写集合），供引擎剔除"提示自己"的幻影。
@@ -3285,6 +3342,9 @@ class VbeBackend:
         # ★v98：过程名（Sub / Function / Property / Declare），随 extract_records
         # 一并返回 —— 与 declared_names 的差别见 __init__ 里的说明。
         proc_names = set()
+        # ★v103：过程 -> 形参表文本（`judge` -> `"(s1, s2)"`），供候选窗详情行。
+        # 与 proc_names 同源同刷新（同一个 TTL、同一次收集）。
+        proc_sigs = {}
         # 结构性名字：组件名 + 窗体控件名（v60）+ 语言自带名字（v61/v62）。
         # 详见 __init__ 里的说明。
         structural_names = set()
@@ -3357,6 +3417,14 @@ class VbeBackend:
                         code, module=mod_name, is_std_module=is_std,
                         caret=apply_caret)
                     proc_names |= _proc_of
+                    # ★v103：顺手把过程的【形参表】也收下来（同一遍代码、
+                    # 同一批正则，不额外打 COM），给候选窗的详情行显示
+                    # `judge(s1, s2)` 用 —— 仿 IDEA 在补全列表里就给出参数。
+                    try:
+                        proc_sigs.update(
+                            vba_parser.extract_proc_signatures(code))
+                    except Exception:
+                        pass
                     records.extend(recs)
                     # 记下【这一刻光标处的词】：它多半是用户正在输入 / 正在
                     # 回退删除的词。回退删字时，缓存的池子里还留着它更长的
@@ -3560,6 +3628,7 @@ class VbeBackend:
         self._type_names = type_names
         self._declared_names = declared_names
         self._proc_names = proc_names
+        self._proc_sigs = proc_sigs          # ★v103：过程 -> 形参表
         self._declared_by_module = _decl_by_mod
         self._structural_names = structural_names
         self._builtin_names = builtin_names
@@ -4505,9 +4574,12 @@ class VbeBackend:
         在 finally 里补写）。落光标单独 try —— 写已经成了却因为落光标失败而
         返回 False，会让调用方再补一次退格、把 `)` 也删掉。
 
-        ★列的处理走【显示列 -> 字符列】换算（`_caret_char_col`），再把**字符
+        ★列的处理走【显示列 -> 字符列】换算（★v103 更正：实际用的是
+        `_bs_caret_char_col`，**不是** `_caret_char_col` —— 后者第三档是拿行尾
+        列反推 tabw，而这里光标一定停在行中间，反推必错。钩子侧
+        `pair_delete_wanted` 用的是**同一份**，两侧同口径），再把**字符
         列**喂给判据 —— 判据本身不猜列语义（见 `pair_delete_span` 里 v99 的
-        教训）。摆回去时再按同一份语义换回显示列，与 `insert_pair` 完全一致。
+        教训）。摆回去时再按同一份语义换回显示列，与 `insert_pair` 的落点口径一致。
         之所以不像 v94b 那样交给 VBE 自己钳：那次是"落到行尾"（给一个超大的
         列让 VBE 夹），这次是"落到某个字符中间"，给不出那么干净的表达。
         """

@@ -3710,11 +3710,19 @@ def main():
           expect_absent=[("WithEvents", None, True)])
 
     # 36.5 带访问修饰符的 Declare —— 收真名，不收 Declare
-    check("36.5 Private Declare 收录 gApi（不收 Declare）",
+    #
+    # ★v103 更正期望值：Declare 的形参原先被记成【模块级、priv=False】
+    #   （`("x", None, False)`）—— 那是一处泄漏：Declare 一定在模块级，
+    #   那时 `cur_proc` 是 None，于是形参挂到了模块级上，本模块**每个过程**
+    #   里都能裸名引用到它。正确口径与 Sub/Function 一致：形参挂在**这个
+    #   Declare 自己的名字**名下（`("x", "gApi", False)`），而 Declare 没有
+    #   过程体 ⇒ 它天然不可见。上面那条 `expect_contain` 是本用例**当年写下
+    #   的期望**，它把 bug 当成了规格，所以这里按 v103 修正（用例本身保留）。
+    check("36.5 Private Declare 收录 gApi（不收 Declare）；★v103 形参归属 Declare 自己不再泄漏",
           recs36('Private Declare PtrSafe Function gApi Lib "k" '
                  '(ByVal x As Long) As Long'),
-          expect_contain=[("gApi", None, True), ("x", None, False)],
-          expect_absent=[("Declare", None, True)])
+          expect_contain=[("gApi", None, True), ("x", "gApi", False)],
+          expect_absent=[("Declare", None, True), ("x", None, False)])
     check("36.6 无修饰 Declare 仍收录",
           recs36('Declare PtrSafe Function gApi2 Lib "k" () As Long'),
           expect_contain=[("gApi2", None, False)])
@@ -12815,14 +12823,25 @@ def main():
         # 反面对照：把 builtin_names 清空（= 两批开关都关掉），
         # 排序应退回 v96 之前的行为 —— Declare 因名字短而排到前面。
         # 这条钉住"改动确实是 v96 那条规则造成的"，不是恰好排成这样。
+        #
+        # ★v103 更正：光关 builtin 标志已经不够了 —— 池子里的 declaredVar 属于
+        # `模块1`（当前模块，档位 3），Declare 属于语言自带模块（档位 2），
+        # v103 新增的【作用域就近】排序会**独立地**把 declaredVar 排前面。
+        # 反面对照的意义是"把这两条相关度规则都关掉，看它退回旧行为"，
+        # 所以这里必须同时把 RANK_BY_SCOPE 也关掉（否则这条对照验的不是
+        # "规则在起作用"，而是"两条规则恰好都指同一个方向"）。
         _B76_save = _B76.get_builtin_names
+        _RANK76_save = E76.RANK_BY_SCOPE
         _B76.get_builtin_names = lambda: frozenset()
+        E76.RANK_BY_SCOPE = False
         try:
             _d76_off = _m76("decl")
         finally:
             _B76.get_builtin_names = _B76_save
-        check("76.4b ★反面对照：builtin_names 为空（开关关）时排序退回旧行为 "
-              "-> Declare 排第 1（证明 76.4 是 v96 那条规则在起作用）",
+            E76.RANK_BY_SCOPE = _RANK76_save
+        check("76.4b ★反面对照：builtin_names 为空（开关关）【且】作用域就近排序"
+              "也关掉时，排序退回旧行为 -> Declare 排第 1"
+              "（证明 76.4 是新加的那两条相关度规则在起作用）",
               [_d76_off[:1]], expect_contain=[["Declare"]])
 
         # 精确命中不受影响：打了完整的 declare 就该选 Declare，不能因为它是
@@ -14611,6 +14630,390 @@ def main():
         import traceback as _tp81
         _tp81.print_exc()
         check("第 81 节异常: %s" % _e81, [True], expect_contain=[False])
+
+    # ==================================================================
+    # 第 82 节：v103 —— 与 IDEA 逐项对照后补的东西 + 顺手挖出的 8 个真 bug
+    #
+    # 用户口径："我其实就是为了解决 VBE 里不能自动提醒变量名、过程名这个问题，
+    #   现代编辑器比如 IDEA 都有很成熟的这种解决方案，我的项目就是想复刻 IDEA。
+    #   你帮我从头到尾重新对比一下 IDEA，我是否有考虑不周全的地方，你帮我加上，
+    #   或者有 bug 的地方，你帮我修复一下。"
+    #
+    # 本节分三块：
+    #   82.1~82.5  parser 层 4 个真 bug（都是"收录出假名字"或"局部变量泄漏"）
+    #   82.6~82.9  engine / vbe_bridge 的判据 bug（下标、列口径、注释识别）
+    #   82.10~82.12 ★IDEA 式排序：作用域就近 + 最近使用（含开关的 A/B）
+    #   82.13~82.16 ★IDEA 式参数信息：候选详情行显示形参表
+    #
+    # ⚠️ 这些 bug 的共性值得记一句：**没有一条是"逻辑写错了"**，全是
+    #   "判据的隐含前提被后一个用途打破"（owner 只有一格 / 缩进只有空白 /
+    #   小写化不改长度）—— 与 MEMORY 第 11 条同一副面孔。
+    # ==================================================================
+    try:
+        import vbe_bridge as VB82
+        print("\n--- 82. v103：IDEA 对照补齐 + 8 个真 bug ---")
+
+        # ---- 82.1 过程头漏认无括号的 `As 类型` 形式（连带局部变量泄漏）----
+        #      MS 官方语法：`Sub/Function name [(arglist)] [As type]` —— 括号可省。
+        #      旧正则要求名字后面必须是 `(` 或行尾 ⇒ `Function Compute As Long`
+        #      不被当成过程头 ⇒ `cur_proc` 不置位 ⇒ 它体内的 Dim 全记成模块级。
+        _code82 = ("Function Compute As Long\n"
+                   "    Dim secretLocal As Long\n"
+                   "End Function\n"
+                   "Sub Caller()\n"
+                   "    Dim myVar As Long\n"
+                   "End Sub\n")
+        _recs82, _procs82 = P.extract_records(_code82, "M1", True)
+        check("82.1 `Function Compute As Long`（无括号带返回类型）必须认成过程头，"
+              "且它的局部变量归属该过程（旧写法下 `secretLocal` 会被记成模块级、"
+              "泄漏到 Sub Caller 的候选里）",
+              [sorted(_procs82),
+               [r for r in _recs82 if r[0].lower() == "secretlocal"],
+               "secretLocal" in E.filter_identifiers_by_scope(_recs82, "Caller", "M1")],
+              expect_contain=[["caller", "compute"],
+                              [("secretLocal", "M1", "Compute", False)],
+                              False])
+
+        # ---- 82.2 VBA 还允许名字末尾写类型声明符：`Function Foo$()` ----
+        check("82.2 名字末尾带类型声明符（`Function Foo$()` / `Sub Foo$()`）"
+              "也要认成过程头（`_IDENT` 不含 `% & ! # @ $`，旧正则在这里断掉）",
+              [sorted(P.extract_records("Function Foo$()\nEnd Function\n",
+                                        "M1", True)[1]),
+               sorted(P.extract_records("Sub Foo$()\nEnd Sub\n", "M1", True)[1]),
+               sorted(P.extract_records("Function Bar%()\nEnd Function\n",
+                                        "M1", True)[1])],
+              expect_contain=[["foo"], ["foo"], ["bar"]])
+
+        # ---- 82.3 形参修饰词可以连写：`Optional ByVal x` ----
+        check("82.3 `Optional ByVal retries As Long = 3` 的参数名必须是 retries"
+              "（旧正则只吃一个修饰词 ⇒ 把第二个 `ByVal` 当参数名，"
+              "于是池子里多一个伪候选 `ByVal`、真参数反而丢了）",
+              [P._params_inside("Optional ByVal retries As Long = 3"),
+               P._params_inside("ByVal a As Long, ByRef b"),
+               P._params_inside("ParamArray arr() As Variant")],
+              expect_contain=[["retries"], ["a", "b"], ["arr"]])
+
+        # ---- 82.4 `ReDim Preserve arr(...)` 的 `Preserve` 不是声明名 ----
+        #      `_RE_DECL` 只吃掉 `ReDim`，剩下的 `Preserve arr(...)` 交给
+        #      _decl_names 取首标识符 ⇒ 收录出伪候选 `Preserve`（关键字、
+        #      不在 stopword 表里，输入 `pre` 就以 kind 3 弹出来）。
+        _r82b = P.extract_records(
+            "Sub Work()\n    ReDim Preserve arr(1 To 10)\nEnd Sub\n",
+            "M1", True)[0]
+        check("82.4 `ReDim Preserve arr(1 To 10)` 不许收录伪名字 `Preserve`"
+              "（真数组名 arr 照旧收）",
+              _r82b,
+              expect_contain=[("arr", "M1", "Work", False)],
+              expect_absent=[("Preserve", "M1", "Work", False)])
+
+        # ---- 82.5 Declare 的形参不许挂到模块级（跨过程可见 = 泄漏）----
+        _r82c = P.extract_records(
+            'Private Declare Sub Sleep Lib "kernel32"'
+            ' (ByVal dwMilliseconds As Long)\n', "M1", True)[0]
+        _vis82c = E.filter_identifiers_by_scope(_r82c, "Anything", "M1")
+        # ⚠️★v103 写用例时又踩的坑（MEMORY 第 24 条）：`check` 的 expect_contain 是
+        #   【逐元素成员判断】（`x not in got`）。把几个布尔散在一个列表里当 got、
+        #   期望又是 [True, False, ...] 混合 ⇒ **必然假绿**（True 和 False 都在 got 里）。
+        #   多项必须**打包成一个元组**，让"位置/组合"参与比较。
+        check("82.5 Declare 的形参要挂在【Declare 自己】名下："
+              "`dwMilliseconds` 不该出现在任意过程的候选里"
+              "（Declare 一定在模块级，旧写法用 `cur_proc`=None ⇒ 形参成了模块级、"
+              "priv=False ⇒ 本模块每个过程都看得见）",
+              [tuple((("dwMilliseconds", "M1", "Sleep", False) in _r82c,
+                      ("dwMilliseconds", "M1", None, False) in _r82c,
+                      "dwMilliseconds" in _vis82c,
+                      "Sleep" in _vis82c))],
+              expect_contain=[(True, False, False, True)],
+              expect_absent=[(False, True, True, False)])
+
+        # ---- 82.6 `remX.Value` 的 Rem 守卫用错了列 ----
+        #      `_in_rem_comment(line, m+1)` 里的 `m` 是 owner 的**末**字符，
+        #      原注释写"m+1 等于 s+2"只在 owner 恰好 1 格时成立。
+        check("82.6 `remX.Value` 必须认成成员访问（owner 叫 remX，不是 Rem 注释）"
+              "—— `Rem a.b` 这种真注释仍要挡住；"
+              "同一个 owner 还要与 `parser.ident_before_dot` 同口径",
+              [E._member_list_dot_col("remX.Value", 11),
+               E.list_slot_anchor("remX.Value", 11),
+               P.ident_before_dot("remX.Value", 11),
+               E._member_list_dot_col("Rem a.b", 7),
+               E.vbe_member_list_expected("    Range(\"A1\").", 17)],
+              expect_contain=[4, 6, "remX", None, True])
+
+        # ---- 82.7 小写化改变长度时命中下标错位（甚至越界）----
+        #      `'İ'.lower()` 是两个字符 ⇒ `low` 与 `name` 不再逐字符对齐。
+        _f82 = E.fuzzy_match("İstanbul", "s")
+        _f82b = E.fuzzy_match("İstanbul", "stanbul")
+        check("82.7 `fuzzy_match` 的命中下标必须落在**原始名字**上："
+              "`İstanbul` 里 `s` 在第 1 格（旧实现给 2，高亮错位）；"
+              "命中的下标一个都不许 ≥ len(name)（旧实现给到 8 == len）",
+              [None if _f82 is None else _f82[1],
+               None if _f82b is None else _f82b[1],
+               None if _f82b is None else max(_f82b[1]) < len("İstanbul"),
+               E.fuzzy_match("dataArr", "ts"), E.fuzzy_match("", "a")],
+              expect_contain=[[1], [1, 2, 3, 4, 5, 6, 7], True, None, None])
+
+        # ---- 82.8 `_classify` 必须认 `Rem`，且进了注释就不再往后扫 ----
+        #      ① 不认 Rem ⇒ 注释里照弹候选、自动配对也不让路；
+        #      ② 进了 `'` 注释还继续扫 ⇒ 注释里的引号把 in_str 翻成 True。
+        check("82.8 `_classify`：`Rem ...` 是注释（原来只认 `'`，"
+              "`in_comment` 恒 False）；`x = 1 ' say \"hi` 是【注释】不是字符串"
+              "（原来被注释里的引号骗成 in_str=True）"
+              "—— ★四项打包成一个元组比较，否则'第一项凑巧对上'就假绿",
+              [tuple(VB82._classify(_t, _c) for _t, _c in
+                     [("Rem 每个元素", 9),
+                      ("    Rem x", 9),
+                      ("x = 1 ' say \"hi", 15),
+                      ("' it's here", 11)])],
+              expect_contain=[((False, True), (False, True),
+                               (False, True), (False, True))])
+
+        check("82.9 对照：字符串里长得像 Rem 的**不算**注释"
+              "（顺序必须是「先跑完字符串状态机，再问 Rem」）",
+              [tuple(VB82._classify(_t, _c) for _t, _c in
+                     [('x = "a Rem b"', 13), ('    s = "Rem', 13)])],
+              expect_contain=[((True, False), (True, False))])
+
+        # ---- 82.10 行尾显示列只能有一份实现（全角占 2 格）----
+        #      `_eol_caret_col` 的兜底原来抄了 `_indent_end_col` 的
+        #      `_disp_width(t, 4, False)` 口径 —— 那是给"只有空白的缩进"
+        #      用的，全角参数对它无意义；抄到"任意代码行"上就少算格数。
+        #      ⚠️★必须**先把 `_sem_cache["info"]` 清空**：含全角的行走
+        #      `if info:` 那条分支（第 484 行），全量测试同进程跑时缓存早被
+        #      前面的真机用例填上了 ⇒ 不清缓存就永远走不到兜底那行，A/B 不红。
+        _sem_save82 = VB82._sem_cache.get("info")
+        VB82._sem_cache["info"] = None
+        try:
+            _ec82 = (VB82._eol_caret_col("    说 = 1"),
+                     VB82._eol_disp_col("    说 = 1"))
+            _ec82b = (VB82._eol_caret_col("    abc = 1"),
+                      VB82._eol_disp_col("    abc = 1"))
+        finally:
+            VB82._sem_cache["info"] = _sem_save82
+        check("82.10 同一行尾的「显示列」两份实现必须给出同一个数"
+              "（含中文的行上，旧 `_eol_caret_col` 少算全角格数）"
+              "—— 同样打包比较：`11 in [10, 11, ...]` 那种写法验不出东西",
+              [( _ec82[0], _ec82[1], _ec82[0] == _ec82[1],
+                 _ec82b[0], _ec82b[1], _ec82b[0] == _ec82b[1])],
+              expect_contain=[(11, 11, True, 12, 12, True)])
+
+        # ---- 82.11 `_find_completion_end` 空候选不再死循环 ----
+        #      `text.find("", i)` 恒等于 i 且 `i += 0` ⇒ while 转不出去。
+        check("82.11 `_find_completion_end` 传空 completion 不再死循环"
+              "（潜在缺陷：只要有人拿空候选调一次，整个补全线程就卡死）"
+              "—— 直接判等返回（返回后仍按行尾裁剪）",
+              [(VB82._find_completion_end("    abc", "", 0, 7),
+                VB82._find_completion_end("    abc", "", 0, 999),
+                VB82._find_completion_end("    abc", "", 0, 7) == 7)],
+              expect_contain=[(7, 7, True)])
+
+        # ---- 82.12 源码护栏：那两处列口径必须真的同源 ----
+        _bsrc82 = io.open(os.path.join(ROOT, "vbe_bridge.py"),
+                          encoding="utf-8").read()
+        _i82 = _bsrc82.find("def _eol_caret_col")
+        _seg82 = _bsrc82[_i82:_i82 + 2600]
+        check("82.12 源码护栏：`_eol_caret_col` 的兜底必须调 `_eol_disp_col`，"
+              "不许再自己算一份（'同一语义只能一份实现'：这两份曾经在全角上"
+              "给出不同的数）",
+              ["return _eol_disp_col(t, 4)" in _seg82,
+               "_disp_width(t, 4, False) + 1" not in _seg82],
+              expect_contain=[True, True])
+
+        # ---- 82.13 作用域档位（IDEA 局部作用域优先的输入）----
+        _pool83 = [("myVar", "M1", "Cur", False),
+                   ("modVar", "M1", None, False),
+                   ("pubVar", "M2", None, False),
+                   ("privVar", "M2", None, True)]
+        check("82.13 `filter_identifiers_by_scope_ranked` 的档位："
+              "本过程局部 4 > 本模块模块级 3 > 别的模块 Public 2；"
+              "别的模块 Private 根本不可见",
+              E.filter_identifiers_by_scope_ranked(_pool83, "Cur", "M1"),
+              expect_contain=[("myVar", 4), ("modVar", 3), ("pubVar", 2)],
+              expect_absent=[("privVar", 2), ("privVar", 3), ("privVar", 4)])
+
+        check("82.14 老接口 `filter_identifiers_by_scope` 必须是新接口的投影"
+              "（保序、逐字一致 —— 可见性这条语义只有一份实现）",
+              [E.filter_identifiers_by_scope(_pool83, "Cur", "M1"),
+               [n for n, _r in
+                E.filter_identifiers_by_scope_ranked(_pool83, "Cur", "M1")]],
+              expect_contain=[["myVar", "modVar", "pubVar"]])
+
+        # ---- 82.15/82.16 ★排序：作用域就近 + 最近使用 ----
+        #      构造最小引擎（同第 76 节的写法）。池子刻意让"远的那个先插入"
+        #      —— 稳定排序下，插入序就是"没有任何相关度信号时"的结果，
+        #      于是 A/B 能分辨出到底是谁在起作用。
+        class _B82(object):
+            def __init__(self, pool, ctx_extra=None, sigs=None):
+                self._pool = list(pool)
+                self._sigs = dict(sigs or {})
+                self._ctx = {"line_no": 1, "in_string": False,
+                             "in_comment": False, "in_type_position": False,
+                             "in_decl_position": False, "decl_names": []}
+                self._ctx.update(ctx_extra or {})
+
+            def get_context(self):
+                return dict(self._ctx)
+
+            def get_identifiers(self):
+                return list(self._pool)
+
+            def get_declared_names(self):
+                return [str(n).lower() for n, _m, _p, _v in self._pool]
+
+            def declared_elsewhere(self, name, module_name):
+                return str(name).lower() in self.get_declared_names()
+
+            def get_structural_names(self):
+                return []
+
+            def get_builtin_names(self):
+                return set()
+
+            def get_type_names(self):
+                return []
+
+            def get_host_enum_names(self):
+                return {}
+
+            def get_proc_names(self):
+                return frozenset()
+
+            def get_proc_signatures(self):
+                return dict(self._sigs)
+
+            def names_outside_caret(self, caret, scope_only=False):
+                return None          # 现场证据不可用 -> 走真名集合那条路
+
+            def apply_completion(self, *a, **k):
+                return None
+
+            def vbe_yield_visible(self):
+                return False
+
+            def vbe_popup_visible(self):
+                return False
+
+            def vbe_popup_info(self):
+                return []
+
+        class _U82(object):
+            def show(self, *a, **k):
+                pass
+
+            def hide(self):
+                pass
+
+            def update_selection(self, *a, **k):
+                pass
+
+            def contains_point(self, *a, **k):
+                return False
+
+        def _trig82(word, pool, proc=None, module="M1", sigs=None):
+            _ln = "    " + word
+            _c = E.Completer(
+                _B82(pool, {"line_text": _ln, "caret_col": len(_ln) + 1,
+                            "proc_name": proc, "module_name": module}, sigs),
+                _U82())
+            _c.trigger(True)
+            return _c
+
+        _pool84 = [("myValue", "M2", None, False),
+                   ("myLocal", "M1", "Cur", False)]
+        _c82 = _trig82("my", _pool84, proc="Cur")
+        check("82.15 ★IDEA 式相关度（1/2）作用域就近：两条候选匹配质量完全一样、"
+              "插入序还让'别处的 myValue'在前，但 `myLocal` 是本过程的局部变量 "
+              "⇒ 必须排第 1（此前作用域只用来【过滤】，不参与【排序】）",
+              [list(_c82.matches or [])],
+              expect_contain=[["myLocal", "myValue"]])
+
+        _r82 = E.RANK_BY_SCOPE
+        E.RANK_BY_SCOPE = False
+        try:
+            _c82b = _trig82("my", _pool84, proc="Cur")
+        finally:
+            E.RANK_BY_SCOPE = _r82
+        check("82.15b 反面对照：`VBECOMPLETE_NO_SCOPE_RANK=1`（关掉作用域排序）时"
+              "退回插入序 —— 证明 82.15 确实是这条规则在起作用",
+              [list(_c82b.matches or [])],
+              expect_contain=[["myValue", "myLocal"]])
+
+        _pool85 = [("aaaTwo", "M2", None, False),
+                   ("aaaOne", "M2", None, False)]
+        _c82c = _trig82("aaa", _pool85)
+        check("82.16 ★IDEA 式相关度（2/2）最近使用：两条候选连名字长度都一样"
+              "（评分键逐位相同）⇒ 默认是插入序",
+              [list(_c82c.matches or []),
+               E.fuzzy_match("aaaTwo", "aaa")[0] == E.fuzzy_match("aaaOne", "aaa")[0]],
+              expect_contain=[["aaaTwo", "aaaOne"], True])
+
+        # 记一笔"刚用过 aaaOne"（accept/pick 走的就是这个入口）
+        _c82d = _trig82("aaa", _pool85)
+        _c82d._note_recent("aaaOne")
+        _c82d.trigger(True)
+        check("82.16b `_note_recent` 之后 `aaaOne` 排第 1（其余分量完全不变，"
+              "只有'最近用过'这一项不同 —— 这正是 IDEA 的 recently used）",
+              [list(_c82d.matches or [])],
+              expect_contain=[["aaaOne", "aaaTwo"]])
+
+        _r82b = E.RANK_BY_RECENT
+        E.RANK_BY_RECENT = False
+        try:
+            _c82e = _trig82("aaa", _pool85)
+            _c82e._note_recent("aaaOne")
+            _c82e.trigger(True)
+        finally:
+            E.RANK_BY_RECENT = _r82b
+        check("82.16c 反面对照：`VBECOMPLETE_NO_RECENT_RANK=1` 时记了也不生效"
+              "（退回插入序）",
+              [list(_c82e.matches or [])],
+              expect_contain=[["aaaTwo", "aaaOne"]])
+
+        # ---- 82.17 ★IDEA 式参数信息：候选详情行显示形参表 ----
+        _sig82 = P.extract_proc_signatures(
+            "Sub judge(s1, s2)\nEnd Sub\n"
+            "Private Sub NoArgs()\nEnd Sub\n"
+            "Sub Multi(a As Long, _\n          b As String)\nEnd Sub\n"
+            "Function Compute As Long\nEnd Function\n")
+        check("82.17 `parser.extract_proc_signatures`：只取形参【名字】；"
+              "跨行的形参表（行继续符 `_`）宁可不给签名，也不许给一个假的 `()`；"
+              "无括号的过程头同理",
+              sorted(_sig82.items()),
+              expect_contain=[("judge", "(s1, s2)"), ("noargs", "()")],
+              expect_absent=[("compute", "()"), ("multi", "()")])
+
+        _c82f = _trig82("jud", [("judge", "M1", None, False)],
+                        sigs={"judge": "(s1, s2)"})
+        check("82.18 `Completer.signature_of`：有签名给签名（大小写不敏感），"
+              "没有给空串（「没有信息」和「没有参数」是两件事 —— "
+              "绝不拿名字拼一个 `()`）",
+              [list(_c82f.matches or []),
+               _c82f.signature_of("judge"), _c82f.signature_of("Judge"),
+               _c82f.signature_of("temp")],
+              expect_contain=[["judge"], "(s1, s2)", ""])
+
+        _usrc82 = io.open(os.path.join(ROOT, "ui.py"), encoding="utf-8").read()
+        check("82.19 源码护栏：UI 的详情行必须接上 `signature_of`，"
+              "且**拿不到签名时退回只显示完整名字**的老行为"
+              "（假 completer 没这个方法也不许报错）",
+              ["signature_of" in _usrc82,
+               "elif self._measure(name) > text_w:" in _usrc82,
+               'getattr(self.completer, "signature_of", None)' in _usrc82],
+              expect_contain=[True, True, True])
+
+        _esrc82 = io.open(os.path.join(ROOT, "engine.py"),
+                          encoding="utf-8").read()
+        check("82.20 源码护栏：`accept()` 里必须真的记一笔「最近用过」"
+              "（用例只钉得住 `_note_recent` 本身，钉不住「钩子/主线程有没有"
+              "记账」—— 同 v90/v91 那条教训）",
+              ["self._note_recent(chosen)" in _esrc82,
+               "_sr.get(t[1].lower(), 2)" in _esrc82,
+               "_rc.get(t[1].lower(), 0)" in _esrc82],
+              expect_contain=[True, True, True])
+
+    except Exception as _e82:
+        import traceback as _tp82
+        _tp82.print_exc()
+        check("第 82 节异常: %s" % _e82, [True], expect_contain=[False])
 
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))

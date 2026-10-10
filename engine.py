@@ -505,11 +505,21 @@ def _member_list_dot_col(line_text, caret_col):
     # 访问。这里必须显式查一遍：光靠 _in_comment_or_string 不够，因为它只认
     # `'` 开头的注释（`Rem` 是另一种写法）。不拦的后果是算出假槽位（anchor），
     # 污染 yield_given_up 的键 —— 症状是"偶尔某处不再让位"的时序竞态。
-    # ⚠️ 判据要问 owner 那一格（m+1，此处等于 s+2），不能问点号那一格（k+1）：
-    #    `Rem a.b` 里 `.` 所在的列在 scan_code_states 里是 False（scan_code_states
-    #    刻意不认 Rem），拿它去查 _in_comment_or_string 永远得 False —— 第一版
-    #    就是这么写的，Rem 守卫完全没生效。
-    if _in_rem_comment(line_text, m + 1):
+    #
+    # ⚠️ 要问 `_in_rem_comment`（它专门认 Rem），**不能**拿点号那一格去问
+    #    `_in_comment_or_string`：`Rem a.b` 里 `.` 所在的列在 scan_code_states
+    #    里是 False（scan_code_states 刻意不认 Rem），那样写 Rem 守卫完全没生效。
+    #
+    # ⚠️⚠️★v103 修的第二个坑：问的列必须是 **owner 的【首】字符**（`s + 2`），
+    #    不是 `m + 1`（owner 的**末**字符）。原注释写"m+1，此处等于 s+2" ——
+    #    那个等式**只在 owner 恰好 1 个字符时成立**（作者当时想的是 `Rem a.b`
+    #    里的 `a`），owner 一长就错：`remX.Value` 里 owner 是 `remX`、m=3，
+    #    问 `m+1=4` 时 `_in_rem_comment` 拿到 head = `rem`、恰好整词命中
+    #    ⇒ 把一个正常的成员访问当成 Rem 注释 ⇒ 不让位、`list_slot_anchor`
+    #    也返回 None（假槽位键）——我们的候选窗反过来压住 VBE 的成员列表。
+    #    问 owner 首字符（head 里根本不含 owner 自己）就没有这个自匹配。
+    #    ⇒ 老教训：**判据的隐含前提（"owner 只有一格"）会被后一个用途打破**。
+    if _in_rem_comment(line_text, s + 2):
         return None
     # 5) 注释 / 字符串里 VBE 不弹，我们照旧弹
     if _in_comment_or_string(line_text, k + 1):
@@ -704,6 +714,27 @@ def filter_identifiers_by_scope(scoped_ids, current_proc, current_module=None):
         - 定义模块 != 当前模块：仅 priv=False（Public）的可见；
           priv=True（Private）的隐藏 —— 这就是"不提示其他模块的私有变量"；
       同名遮蔽优先级：本过程局部(4) > 本模块模块级(3) > 其他模块 Public/旧式全局(2)。
+
+    ★v103：本条现在是**薄封装** —— 真正的实现在
+    `filter_identifiers_by_scope_ranked`（它额外把那个 4/3/2 的档位交出来给
+    排序用）。可见性这条语义只能有一份实现（MEMORY 第 14 条），所以这里
+    只做投影，不再自己写一遍循环。
+    """
+    return [n for n, _rank in filter_identifiers_by_scope_ranked(
+        scoped_ids, current_proc, current_module)]
+
+
+def filter_identifiers_by_scope_ranked(scoped_ids, current_proc,
+                                       current_module=None):
+    """`filter_identifiers_by_scope` 的【带作用域档位】版：返回 [(名字, 档位)]。
+
+    档位（越大越"近"，供候选排序用，★v103）：
+        4 = 本过程/函数的局部变量与参数
+        3 = 本模块的模块级名字
+        2 = 别的模块的 Public（以及 module 未知的旧式记录）
+
+    ⚠️ 档位只在**同名遮蔽**时参与"留哪个显示名"的判断（旧行为），v103 起
+    另外交给 `Completer.trigger` 做**候选排序**（IDEA 的局部作用域优先）。
     """
     scoped = _normalize_scoped(scoped_ids)
     cur = (current_proc or "").lower() or None
@@ -733,7 +764,7 @@ def filter_identifiers_by_scope(scoped_ids, current_proc, current_module=None):
             consider(name, 2)               # 其他模块的 Public
         # 其他模块的 Private -> 直接跳过，不提示
 
-    return [ranked[k][1] for k in ranked]
+    return [(ranked[k][1], ranked[k][0]) for k in ranked]
 
 
 def _word_boundaries(name):
@@ -814,6 +845,27 @@ def _greedy_positions(low, query, bounds):
     return pos
 
 
+def _lower_keep_len(s):
+    """小写化，但**保证长度不变**（`str.lower()` 不保证）。
+
+    ★v103：`fuzzy_match` 返回的命中下标要拿去索引**原始名字**（UI 拿去高亮、
+    `kind`/`span` 也按它算），所以 `low` 必须与 `name` 逐字符对齐。可
+    `str.lower()` 对少数字符会**改变长度**：最典型的是 `'İ'`(U+0130) →
+    `'i̇'`（两个字符，i + 组合点）。一旦变长，`low.find(q)` 得到的是 `low` 的
+    下标却被当成 `name` 的用 —— 实测：
+
+        fuzzy_match('İstanbul', 's')        -> positions [2]（该是 1，高亮成 't'）
+        fuzzy_match('İstanbul', 'stanbul')  -> positions [2..8]，而 8 == len('İstanbul')，已越界
+
+    ⇒ 逐字符小写、只取首字符。对 ASCII / 中文 / 常见拉丁字符与 `.lower()`
+    逐字一致（走上面的快路径，零额外开销），只有"小写化会变长"的字符才走慢路。
+    """
+    lo = s.lower()
+    if len(lo) == len(s):
+        return lo
+    return "".join(c.lower()[:1] for c in s)
+
+
 def fuzzy_match(name, query):
     """模糊匹配：query 的字符按顺序出现在 name 里即算命中（不要求开头）。
 
@@ -833,7 +885,7 @@ def fuzzy_match(name, query):
     """
     if not name or not query:
         return None
-    low = name.lower()
+    low = _lower_keep_len(name)
     q = query.lower()
     if len(q) > len(low):
         return None
@@ -921,6 +973,28 @@ def _env_int(name, default):
 BUILTIN_SCATTER_MIN = _env_int("VBECOMPLETE_BUILTIN_SCATTER_MIN", 2)
 
 
+# ★v103：候选排序补上 IDEA 的两条相关度信号（对齐 IDEA 的 "relevance" 排序）。
+#
+# (1) **作用域就近**（`set VBECOMPLETE_NO_SCOPE_RANK=1` 关掉）
+#     命中质量相同的一批候选里：**本过程/函数的局部变量与参数排最前**，
+#     其次本模块的模块级名字，最后才是别的模块的 Public。
+#     IDEA 一直是这个顺序。本项目此前只用作用域做**过滤**（看不见的不收），
+#     没让它参与排序 —— 于是"本过程刚 Dim 的那个变量"和"别的模块里的同名
+#     Public"谁排前面，全看谁先被解析出来（`filter_identifiers_by_scope`
+#     返回的是 dict 插入序），在真实工程里就是"随手一敲，头几个候选不是我要的"。
+#
+# (2) **最近使用**（`set VBECOMPLETE_NO_RECENT_RANK=1` 关掉）
+#     "刚被你用 Tab 确认过的那个名字"排前面（IDEA 的 recently used）。
+#     只在**命中质量完全相同**时才起作用，绝不去顶掉"匹配得更好"的候选。
+#
+# ⚠️ 两条都只插在排序键的【中段】：命中质量（kind / 首个命中位置 / 跨度）
+#    永远优先 —— 这是 v96 定下的铁律（标志塞末尾 = 死规则）。
+RANK_BY_SCOPE = (os.environ.get("VBECOMPLETE_NO_SCOPE_RANK", "0").strip() != "1")
+RANK_BY_RECENT = (os.environ.get("VBECOMPLETE_NO_RECENT_RANK", "0").strip() != "1")
+# 最近使用表最多记多少个名字（超了丢最旧的一批）。只存名字、不存内容。
+RECENT_MAX = _env_int("VBECOMPLETE_RECENT_MAX", 64)
+
+
 # ★v93：这里原来还有一个 `_name_exists_outside_caret(backend, word, line_no,
 # caret_col)` —— 早先"逐词问一次后端"的接口。它已经被 Completer.
 # _live_names_outside_caret（批量版，一次读模块文本给多个候选复用）完全取代，
@@ -967,6 +1041,22 @@ class Completer:
         # 为什么要分两段：见 trigger() 里那段 ★v92 的长注 —— 一次 Tab 会引来
         # 【不止一次】trigger，只活一段就会漏。
         self._accept_pinned = False
+        # ---- ★v103：IDEA 式相关度排序用的两份运行时状态 ----
+        # _recent: 名字小写 -> 递增序号（越大 = 越近被用过）。你在候选窗里按
+        #   Tab（或鼠标点选）确认过的名字记一笔，下次同一批候选里它就靠前
+        #   （IDEA 的 "recently used" 相关度信号）。只存名字，不存内容；
+        #   上限 RECENT_MAX 条，超了丢最旧的一批。
+        #   只在【命中质量完全相同】时才起作用，绝不顶掉匹配得更好的候选。
+        self._recent = {}
+        self._recent_seq = 0
+        # _scope_rank: 本次触发里各候选的【作用域档位】（4 本过程局部/参数 >
+        #   3 本模块模块级 > 2 其它模块 Public）。由 trigger 每次重建 ——
+        #   绝不像 v94b 的 `_sem_cache` 那样跨触发沿用（那是把"某一次的结论"
+        #   当成"现在的结论"）。UI 侧只读，用来显示"来自哪个模块"。
+        self._scope_rank = {}
+        # _proc_sigs_now: 本次触发里"过程 -> 形参表"的快照（★v103），
+        #   UI 的详情行用它显示 `judge(s1, s2)`。同样每次触发重建，不跨触发沿用。
+        self._proc_sigs_now = {}
         self.shown_at = 0.0       # 最近一次真正弹出的时刻（供"刚弹出保护期"使用）
         # 当前候选各自的命中下标：{名字: [下标, ...]}，供 UI 把命中的字符标红。
         # 由 trigger() 填写、hide() 清空。UI 通过 completer 读取，不占用 show() 签名。
@@ -2015,11 +2105,19 @@ class Completer:
             # 词 / 行 / 模块对不上 -> 用户已经动过手，这条记忆作废
             self._accepted = None
         # 只保留当前作用域可见的标识符（屏蔽其他过程局部变量 + 其他模块 Private）
-        visible_ids = filter_identifiers_by_scope(
+        #
+        # ★v103：改用**带档位**的版本 —— 顺手把 4/3/2 那档收下来，给下面的
+        # 排序用（IDEA 的"局部作用域优先"）。可见性判定仍然只有那一份实现。
+        _scoped_ranked = filter_identifiers_by_scope_ranked(
             self.backend.get_identifiers(),
             ctx.get("proc_name"),
             ctx.get("module_name"),
         )
+        visible_ids = [n for n, _r in _scoped_ranked]
+        # 名字小写 -> 作用域档位。没记到的（例如收窄后的对象成员）按 2 处理：
+        # 那是"别处的/信息不足"的档位，不会被误当成"本过程的局部变量"。
+        self._scope_rank = ({n.lower(): r for n, r in _scoped_ranked}
+                            if RANK_BY_SCOPE else {})
         # ★v98：成员访问位置（`c.`）把候选**收进这个对象的类型**。
         #
         # 用户口径（原话）："我定义了一个类 cls，在模块里我写
@@ -2226,19 +2324,33 @@ class Completer:
             _bl_sort = self._builtin_names()
         except Exception:
             _bl_sort = frozenset()
-        if _bl_sort:
-            # ⚠️ `reverse=True` 是降序，而 `True > False` ⇒ 想要"非 builtin 在前"
-            #    就必须把这个标志**取反**（`not in` -> True 表示工程内名字）。
-            #    别写成 `in _bl_sort` —— 那等于"关键字优先"，正好与本条相反。
-            #    键的顺序 = 命中质量(k3) > 你的名字 > 名字长度(降序：短在前)。
-            #    _bl_sort 为空时退化成原来的单键排序（行为逐字不变）。
-            scored.sort(key=lambda t: (t[0][0], t[0][1], t[0][2],
-                                       t[1].lower() not in _bl_sort,
-                                       t[0][3]),
-                        reverse=True)
-        else:
-            # sorted 稳定：同分时保持后端原来的顺序
-            scored.sort(key=lambda t: t[0], reverse=True)
+        # ⚠️ `reverse=True` 是降序，而 `True > False` ⇒ 想要"非 builtin 在前"
+        #    就必须把这个标志**取反**（`not in` -> True 表示工程内名字）。
+        #    别写成 `in _bl_sort` —— 那等于"关键字优先"，正好与本条相反。
+        #
+        # ★v103 起的完整键顺序（全部是"越大越靠前"，配 reverse=True）：
+        #    命中质量(kind) > 首个命中位置 > 命中跨度
+        #      > 【作用域就近】 > 【最近使用】 > 你的名字(非 builtin) > 名字长度(短在前)
+        #
+        #   为什么作用域/最近使用插在这里（而不是最前、也不是最后）：
+        #     * 最前 = 会顶掉"匹配得更好"的候选（打了 `msgbox` 却因为
+        #       `msgboxLocal` 是局部变量而排在 MsgBox 前面）—— 明确不要；
+        #     * 最后 = 只在完全同分时才轮到，而那之前名字长度已经分完了胜负
+        #       ⇒ **死规则**（v96 就是这么踩的）。
+        #     放在"命中质量之后、名字长度之前"才是它该起作用的那一档：
+        #     两条候选匹配得一样好时，**离你近的、你刚用过的**排前面。
+        #
+        #   _bl_sort 为空（四批语言自带词汇全关）时：
+        #     这一整个 key 里那个分量恒为 True ⇒ 对排序没有任何影响，
+        #     与旧行为逐字等价。
+        _sr = self._scope_rank if RANK_BY_SCOPE else {}
+        _rc = self._recent if RANK_BY_RECENT else {}
+        scored.sort(key=lambda t: (t[0][0], t[0][1], t[0][2],
+                                   _sr.get(t[1].lower(), 2),
+                                   _rc.get(t[1].lower(), 0),
+                                   t[1].lower() not in _bl_sort,
+                                   t[0][3]),
+                    reverse=True)
         matches = [name for _, name, _ in scored]
         # 每个候选的命中下标，交给 UI 高亮（键是名字，值是下标列表）
         self.match_hits = {name: pos for _, name, pos in scored}
@@ -2398,6 +2510,14 @@ class Completer:
             self.hide()
             return
         self.matches = matches
+        # ★v103：本次候选的【形参表】快照 —— UI 的详情行拿它显示 `judge(s1, s2)`
+        # （仿 IDEA 在补全列表里就给出参数信息）。与 `_scope_rank` 一样：
+        # **每次触发重建、绝不跨触发沿用**，且取不到就退回空表（详情行退回
+        # 只显示完整名字的老行为，不会因为后端没实现这个接口就报错）。
+        try:
+            self._proc_sigs_now = dict(self.backend.get_proc_signatures() or {})
+        except Exception:
+            self._proc_sigs_now = {}
         # 按 Tab 即可直接确认当前已输入的完整名字；否则选中列表首项。
         exact = word.lower()
         sel = 0
@@ -2483,11 +2603,42 @@ class Completer:
             self._accept_key = None
             self._accept_pinned = False
 
+    def _note_recent(self, name):
+        """记一笔"这个字刚被用过" —— ★v103，IDEA 的 recently used 相关度信号。
+
+        只记名字（小写）+ 一个单调递增的序号，不存任何内容，开销可忽略。
+        `accept()` 与 `pick()` 都走 `accept()`，所以两处（Tab 与鼠标点选）
+        自动都记上。
+
+        ⚠️ 关掉：`set VBECOMPLETE_NO_RECENT_RANK=1`（此时本函数第一行就返回，
+        排序里那个分量恒为常量 ⇒ 与没加这一条完全等价）。
+        """
+        if not RANK_BY_RECENT:
+            return
+        try:
+            k = str(name or "").lower()
+            if not k:
+                return
+            self._recent_seq += 1
+            self._recent[k] = self._recent_seq
+            if len(self._recent) > RECENT_MAX:
+                # 一次砍掉最旧的 1/4，别每记一笔就整表排序
+                _drop = sorted(self._recent.items(),
+                               key=lambda kv: kv[1])[:max(1, RECENT_MAX // 4)]
+                for _k, _v in _drop:
+                    self._recent.pop(_k, None)
+        except Exception:
+            pass
+
     def accept(self):
         if not self.visible or not self.matches:
             return
         chosen = self.matches[self.selected % len(self.matches)]
         ctx = self.ctx
+        # ★v103：记一笔"最近用过"（IDEA 的 recently used）。放在最前面 ——
+        # 它只是一个相关度信号，后面无论补括号成不成、有没有异常，都不该
+        # 影响"这个名字确实被你用过"这个事实。
+        self._note_recent(chosen)
         # ★v90：记住"这个词是我们替你写进去的、写在哪一行"。
         #
         # 用户口径（原话）："当我按下 tab 键之后，提示词打印到编辑器里，那么本次
@@ -2569,6 +2720,21 @@ class Completer:
     def is_visible(self):
         return self.visible
 
+    def signature_of(self, name):
+        """这个候选的形参表（如 `"(s1, s2)"`）；没有就返回空串。★v103。
+
+        给 UI 的"详情行"用 —— 仿 IDEA：选中/悬停到一个过程或函数时，
+        列表下方把它的形参一并显示出来，用户不必先确认再回头回忆参数。
+
+        ⚠️ 只在【过程/函数】上有值（来源是 parser 的过程头正则），
+        变量 / 常量 / 关键字一律空串 —— 那一档不显示任何东西，
+        绝不拿名字拼一个假的 `()` 出来（"没有信息"和"没有参数"是两件事）。
+        """
+        try:
+            return str((self._proc_sigs_now or {}).get(str(name).lower()) or "")
+        except Exception:
+            return ""
+
     def current_matches(self):
         return list(self.matches)
 
@@ -2580,6 +2746,9 @@ class Completer:
         self.ctx = None
         self.word_is_complete = False
         self.match_hits = {}
+        # ★v103：形参表快照与候选同生共死，绝不留下上一批的签名
+        # （否则下一次弹出时详情行可能显示上一个过程的参数）。
+        self._proc_sigs_now = {}
         self.ui.hide()
 
     def maybe_hide_on_outside_click(self, px, py):
