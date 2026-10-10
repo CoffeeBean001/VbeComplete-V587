@@ -193,6 +193,17 @@ def main():
     except Exception:
         pass
 
+    # ⚠️★v103c：本回归网里凡是【成员位置】（`标识符.` / With 块里的 `.成员`）的
+    #   用例 —— §34 / §49 / §50 / §53 / §71 / §72 / §77.3 —— 测的都是"点号后面
+    #   出候选 + 按声明类型收窄 + 待定让位/补位 + 回声防护"这一整套机制，而它
+    #   自 v103c 起是**开关打开才生效**的能力：用户口径是"输入 student. ，点号
+    #   后面不要出提示框了"（我们出的是裸名池，本来就该让给 VBE 自己的成员列表），
+    #   所以默认 `MEMBER_POPUP=False`。
+    #   这里统一打开，让那些老用例继续验证机制本身（它们验的是能力，不是默认值）；
+    #   "默认必须是关"这个事实由 §84 用源码护栏 + 行为用例钉住。
+    _MEMBER_POPUP_SAVE = E.MEMBER_POPUP
+    E.MEMBER_POPUP = True
+
     mods = load_modules()
     print("载入 %d 个模块: %s\n" % (len(mods), ", ".join(sorted(mods))))
 
@@ -15082,15 +15093,22 @@ def main():
               expect_contain=[(10, None, 10, 4)])
 
         # ---- 83.5 源码护栏：三方接线必须都在 ----
+        #      ★v103c：接入点从"两个独立判据"合并成一条 `_completion_followup`
+        #      （它内部再按 Sub / Function / Property / 内建函数 / 关键字分档），
+        #      所以护栏跟着改钉新的接入点 —— 钉的东西没变：引擎判"是什么"、
+        #      `main` 把注入函数交给后端。
         _msrc83 = io.open(os.path.join(ROOT, "main.py"), encoding="utf-8").read()
-        check("83.5 源码护栏：`accept()` 必须判「是不是关键字」并把结果传给 "
-              "`apply_completion`（引擎判是什么、后端判位置）；"
+        check("83.5 源码护栏：`accept()` 必须经由 `_completion_followup` 得出"
+              "「补括号 / 补空格」两个标志并一起传给 `apply_completion`"
+              "（引擎判是什么、后端判位置），关键字那一档在它内部；"
               "`main` 必须把注入函数交给后端",
-              [("_keyword_wants_space(chosen)" in _esrc82,
-                "_want_parens, _want_space)" in _esrc82,
+              [("_want_parens, _want_space = self._completion_followup(chosen)"
+                in _esrc82,
+                "self._completion_followup(chosen)" in _esrc82,
+                "return False, _keyword_wants_space(low)" in _esrc82,
                 "def _keyword_wants_space(" in _esrc82,
                 "VbeBackend(send_char=send_char)" in _msrc83)],
-              expect_contain=[(True, True, True, True)])
+              expect_contain=[(True, True, True, True, True)])
 
         _bsrc83 = io.open(os.path.join(ROOT, "vbe_bridge.py"),
                           encoding="utf-8").read()
@@ -15121,6 +15139,278 @@ def main():
         import traceback as _tp83
         _tp83.print_exc()
         check("第 83 节异常: %s" % _e83, [True], expect_contain=[False])
+
+    # ------------------------------------------------------------------
+    # 84. ★v103c：① Sub 补空格 / Function 补括号（用户点名）
+    #     ② 成员位置（`变量.` / With 块的 `.成员`）不再出我们自己的候选
+    #     用户口径（原话）：
+    #       "选中的提示词，如果是 sub 过程，按 tab 键不要补双括号，应该补空格；
+    #        如果是 function 函数，按 tab 键要补双括号。"
+    #       "对某个变量的成员提示，这个就关闭，不要提示了。比如说输入 student.，
+    #        .后面就不要出提示框了，现在会提示函数名，变量名这些，按道理提示的
+    #        应该是类或者对象的成员。"
+    #     本节一律**把多项打包成一个元组**再比（MEMORY 第 37 条：散着放布尔
+    #     + 全 True 期望 ⇒ 必然假绿）。
+    # ------------------------------------------------------------------
+    try:
+        import vba_builtins as _B84
+        import vbe_bridge as VB84            # noqa: F401
+
+        # ---- 84.1 parser.extract_proc_kinds（过程种类）----
+        _code84 = "\n".join([
+            "Option Explicit",
+            "Public Sub DoWork()",
+            "End Sub",
+            "Private Function CalcValue(ByVal n As Long) As Long",
+            "End Function",
+            "Function NoArgs",
+            "End Function",
+            "Property Get Title() As String",
+            "End Property",
+            "Private Declare Sub Sleep Lib \"kernel32\" (ByVal dw As Long)",
+            "Public Declare PtrSafe Function gApi Lib \"k\" (ByVal x As Long)",
+            "Sub Foo$()",
+            "End Sub"])
+        _k84 = P.extract_proc_kinds(_code84)
+        _pn84 = sorted(str(n) for n in P.extract_records(_code84, "M1", True)[1])
+        check("84.1 `parser.extract_proc_kinds`：Sub->sub、Function->function、"
+              "Property->property；`Declare Sub` 按 sub、`Declare Function` 按 "
+              "function（无括号的过程头 / 类型声明符 `Foo$()` 也认得出来）；"
+              "与 `extract_records` 认出来的过程名**完全相同**（同一批正则，"
+              "所以不可能出现「有候选却查不到它是什么」）",
+              [(sorted(_k84.items()), _pn84, sorted(_k84) == _pn84)],
+              expect_contain=[(sorted([
+                  ("dowork", "sub"), ("calcvalue", "function"),
+                  ("noargs", "function"), ("title", "property"),
+                  ("sleep", "sub"), ("gapi", "function"), ("foo", "sub")]),
+                  ["calcvalue", "dowork", "foo", "gapi", "noargs", "sleep",
+                   "title"], True)])
+
+        # ---- 84.2/84.3 判据与端到端（最小后端，不碰 COM）----
+        class _B84_(object):
+            """最小后端：只提供补全判据要的那几个只读接口。"""
+            _KINDS = {"dowork": "sub", "calcvalue": "function",
+                      "title": "property"}
+
+            def __init__(self, pool=()):
+                self._pool = list(pool)
+                self._ctx = {"line_no": 1, "line_text": "    x",
+                             "caret_col": 6, "proc_name": "Cur",
+                             "module_name": "M1", "in_string": False,
+                             "in_comment": False, "in_type_position": False,
+                             "in_decl_position": False, "decl_names": []}
+                self.last = None
+
+            def get_context(self):
+                return dict(self._ctx)
+
+            def get_identifiers(self):
+                return list(self._pool)
+
+            def get_proc_names(self):
+                return frozenset(self._KINDS)
+
+            def get_proc_kinds(self):
+                return dict(self._KINDS)
+
+            def get_builtin_names(self):
+                return {"msgbox", "left", "split"}
+
+            def get_structural_names(self):
+                return []
+
+            def get_type_names(self):
+                return []
+
+            def get_host_enum_names(self):
+                return {}
+
+            def get_declared_names(self):
+                # ⚠️ 必须交回池子里的名字：回声防护问的是"这个名字在工程里
+                #    【出现过】吗"，交回空列表会让每个候选都被当成幻影剔光
+                #    （本节第一版就是这么假绿的 —— 弹窗压根不出、`last` 恒 None）。
+                return [str(n).lower() for n, _m, _p, _v in self._pool]
+
+            def declared_elsewhere(self, name, module_name):
+                return str(name).lower() in self.get_declared_names()
+
+            def names_outside_caret(self, caret, scope_only=False):
+                return None
+
+            def apply_completion(self, *a, **k):
+                self.last = a
+                return None
+
+            def vbe_yield_visible(self):
+                return False
+
+            def vbe_popup_visible(self):
+                return False
+
+            def vbe_popup_info(self):
+                return []
+
+        class _U84(object):
+            def __init__(self):
+                self.shown = False
+
+            def show(self, *a, **k):
+                self.shown = True
+
+            def hide(self, *a, **k):
+                self.shown = False
+
+            def update_selection(self, *a, **k):
+                pass
+
+            def contains_point(self, *a, **k):
+                return False
+
+        class _NoKinds84(object):
+            """模拟"旧式后端"：没有 get_proc_kinds 这个可选接口。"""
+
+            def __init__(self, inner):
+                self._in = inner
+
+            def __getattr__(self, k):
+                if k == "get_proc_kinds":
+                    raise AttributeError(k)
+                return getattr(self._in, k)
+
+        def _trig84(word, pool, wrap=None):
+            _b = _B84_(pool)
+            _b._ctx["line_text"] = "    " + word
+            _b._ctx["caret_col"] = len(_b._ctx["line_text"]) + 1
+            _u = _U84()
+            _c = E.Completer(wrap(_b) if wrap else _b, _u)
+            _c.trigger(True)
+            return _c, _b
+
+        _c84a, _b84a = _trig84("DoWo", [("DoWork", "M1", None, False)])
+        _m84a = list(_c84a.matches or [])
+        _c84a.accept()
+        _c84b, _b84b = _trig84("CalcVa", [("CalcValue", "M1", None, False)])
+        _m84b = list(_c84b.matches or [])
+        _c84b.accept()
+        _c84c, _b84c = _trig84("Tit", [("Title", "M1", None, False)])
+        _m84c = list(_c84c.matches or [])
+        _c84c.accept()
+        check("84.2 ★端到端（用户点名的口径）：选中一个 **Sub**（`DoWo`）按 Tab "
+              "-> `apply_completion(..., want_parens=False, want_space=True)`"
+              "（补空格、不补括号）；选中 **Function**（`CalcVa`）-> "
+              "`(True, False)`（补括号）；选中 **Property**（`Tit`）-> 都不补"
+              "（⚠️ `matches` 必须在 `accept()` 【之前】取 —— accept 末尾会 "
+              "`hide()`，而 hide 会把 matches 清空）",
+              [(tuple((_m84a, _b84a.last[4], _b84a.last[5])),
+                tuple((_m84b, _b84b.last[4], _b84b.last[5])),
+                tuple((_m84c, _b84c.last[4], _b84c.last[5])))],
+              expect_contain=[((["DoWork"], False, True),
+                               (["CalcValue"], True, False),
+                               (["Title"], False, False))])
+
+        # 84.3 ★旧式后端（没有 get_proc_kinds）必须退回 v98 的老口径：
+        #      工程内过程名一律补括号 —— 判据缺失就按老规矩来，绝不猜。
+        _c84d, _b84d = _trig84("DoWo", [("DoWork", "M1", None, False)],
+                               wrap=_NoKinds84)
+        _m84d = list(_c84d.matches or [])
+        _c84d.accept()
+        check("84.3 对照：后端没有 `get_proc_kinds`（旧式 / 测试后端）时退回 "
+              "v98 的老口径 —— 工程内过程名一律补括号（`(True, False)`）",
+              [(tuple((_m84d, _b84d.last[4], _b84d.last[5])))],
+              expect_contain=[((["DoWork"], True, False))])
+
+        # 84.4 判据本身：两条标志**不可能同时为真**（补括号 + 补空格同时发出去
+        #      会写成 `Foo ()`，v98 专门修过这个坑）。
+        _c84e = E.Completer(_B84_(), _U84())
+        check("84.4 `_completion_followup` 不变量：任何名字都不可能同时"
+              "「补括号」又「补空格」（同时真会写成 `Foo ()`）—— "
+              "Sub / Function / Property / 内建函数 / 关键字 / 变量一起过一遍",
+              [tuple((bool(_c84e._completion_followup(n)[0]),
+                      bool(_c84e._completion_followup(n)[1]))
+                     for n in ("DoWork", "CalcValue", "Title", "MsgBox", "Left",
+                               "Public", "Set", "temp", "student", ""))],
+              expect_contain=[((False, True), (True, False), (False, False),
+                               (True, False), (True, False), (False, True),
+                               (False, True), (False, False), (False, False),
+                               (False, False))])
+
+        check("84.5 顺手钉住 v103b 的老能力没被这次重构弄丢：语言关键字仍然是"
+              "「补空格不补括号」，语言自带函数仍然是「补括号不补空格」",
+              [(tuple((E._keyword_wants_space("public"),
+                       _B84.keyword_wants_space("function"),
+                       _c84e._completion_followup("msgbox"),
+                       _c84e._completion_followup("public"))))],
+              expect_contain=[(True, True, (True, False), (False, True))])
+
+        # ---- 84.6 ★用户点名的口径：成员位置不再出我们自己的候选 ----
+        def _m84(line, manual=False, popup=None):
+            """在 `line` 的光标处触发一次，返回 (窗可见, UI 真被 show 过,
+            yield_pending 是否被挂上)。"""
+            _b = _B84_([("student", "M1", None, False),
+                        ("DoWork", "M1", None, False)])
+            _b._ctx["line_text"] = line
+            _b._ctx["caret_col"] = len(line) + 1
+            _u = _U84()
+            _c = E.Completer(_b, _u)
+            _save = E.MEMBER_POPUP
+            if popup is not None:
+                E.MEMBER_POPUP = popup
+            try:
+                _c.trigger(manual=manual)
+                return (bool(_c.is_visible()), bool(_u.shown),
+                        _c.yield_pending is not None)
+            finally:
+                E.MEMBER_POPUP = _save
+
+        _mp84 = E.MEMBER_POPUP
+        try:
+            E.MEMBER_POPUP = False          # = 出厂默认（见 84.7）
+            _r84_auto = _m84("    student.te")
+            _r84_with = _m84("    .Size")
+            _r84_man = _m84("    student.te", manual=True)
+            # 补位路径（main 轮询里 confirm_yield 返回 False 之后那条）
+            _r84_refill = _m84("    student.te")
+        finally:
+            E.MEMBER_POPUP = _mp84
+
+        check("84.6 ★用户点名：成员位置（`student.` / With 块的 `.`）不再出"
+              "我们自己的候选 —— 自动触发一律不弹（也不挂待定让位，因为"
+              "我们永远不弹、没有「宽限到再补回来」这回事）；"
+              "对照：Ctrl+Space 点名要的列表照弹（v72 老口径：点名的列表照弹，"
+              "否则就成了「按了没反应」）",
+              [(_r84_auto, _r84_with, _r84_refill, (_r84_man[0], _r84_man[1]))],
+              expect_contain=[((False, False, False), (False, False, False),
+                               (False, False, False), (True, True))])
+
+        # ---- 84.7 源码护栏：默认关 / 早退位置 / 后端接线 ----
+        _esrc84 = io.open(os.path.join(ROOT, "engine.py"),
+                          encoding="utf-8").read()
+        _bsrc84 = io.open(os.path.join(ROOT, "vbe_bridge.py"),
+                          encoding="utf-8").read()
+        _psrc84 = io.open(os.path.join(ROOT, "parser.py"),
+                          encoding="utf-8").read()
+        _i84 = _esrc84.find("if (not MEMBER_POPUP) and (not manual)")
+        _i84b = _esrc84.find("self.yield_pending = (time.time() + YIELD_GRACE")
+        check("84.7 源码护栏：① 开关 `MEMBER_POPUP` 的出厂默认必须是【关】"
+              "（`VBECOMPLETE_MEMBER_POPUP` 取 \"0\"）；② 成员位置的早退必须"
+              "排在让位逻辑【之前】（否则那条「宽限到、VBE 没弹、把候选补回来」"
+              "的路径还会把窗补出来）；③ 后端必须收集 `_proc_kinds` 并提供 "
+              "`get_proc_kinds`；④ `parser` 必须有 `extract_proc_kinds`；"
+              "⑤ 「补括号」与「补空格」两道闸门都必须过 `_in_call_stmt`"
+              "（同一语义只有一份实现）",
+              [('os.environ.get("VBECOMPLETE_MEMBER_POPUP", "0")' in _esrc84,
+                _i84 >= 0 and 0 <= _i84 < _i84b,
+                "proc_kinds.update(" in _bsrc84,
+                "def get_proc_kinds(" in _bsrc84,
+                "def extract_proc_kinds(" in _psrc84,
+                "def _completion_followup(" in _esrc84,
+                _bsrc84.count("not _in_call_stmt(line_text)") >= 2)],
+              expect_contain=[(True, True, True, True, True, True, True)])
+
+    except Exception as _e84:
+        import traceback as _tp84
+        _tp84.print_exc()
+        check("第 84 节异常: %s" % _e84, [True], expect_contain=[False])
 
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))

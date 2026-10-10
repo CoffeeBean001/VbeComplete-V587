@@ -3039,6 +3039,11 @@ class VbeBackend:
         # （`Dim n As Long` 补成 `Long()` 直接编译不过）。收集时由
         # parser.extract_records 一并给出，不额外读代码、不额外打 COM。
         self._proc_names = set()
+        # ★v103c：{过程名(小写): "sub" / "function" / "property"}。
+        # 与 _proc_names 同源同刷新（同一次 extract_*、同一个 TTL）—— 补全时
+        # 用来决定"按 Tab 确认之后后面跟空格还是跟括号"：Sub 是无返回值的语句、
+        # 标准写法不带括号（补了 VBE 也会删），Function 要括号。
+        self._proc_kinds = {}
         # ★v98：{类型名(小写): (收集时间戳, 成员名小写集合)}。
         # 与 _cache_time 同一个 TTL（get_members_of 里比对）。
         self._members_of_cache = {}
@@ -3180,6 +3185,28 @@ class VbeBackend:
             except Exception:
                 return frozenset()
         return frozenset(getattr(self, "_proc_names", None) or ())
+
+    def get_proc_kinds(self):
+        """返回 {小写过程名: "sub" / "function" / "property"}。★v103c。
+
+        与 `get_proc_names` **同源**（同一次 `extract_records` +
+        `extract_proc_kinds`、同一个 TTL、同一个刷新点）："这个是不是过程"与
+        "它是哪一种过程"永远出自同一份代码文本，不会一边新一边旧。
+
+        用途：补全按 Tab 确认时，Sub 补【空格】、Function 补【括号】——
+        见 engine._completion_followup。
+
+        ⚠️ 交回内部 dict 本身（**只读，调用方不得修改**），理由同
+        get_proc_names：这一路是按一次补全查的。
+        ⚠️ 查不到（工程里没这个过程 / 后端只是没收集到）时调用方按"不知道"
+        处理 —— 退回 v98 以来的老口径，绝不猜。
+        """
+        if not getattr(self, "_proc_kinds", None):
+            try:
+                self.get_identifiers()
+            except Exception:
+                return {}
+        return getattr(self, "_proc_kinds", None) or {}
 
     def get_declared_names(self):
         """返回工程里真实声明过的名字（小写集合），供引擎剔除"提示自己"的幻影。
@@ -3371,6 +3398,9 @@ class VbeBackend:
         # ★v98：过程名（Sub / Function / Property / Declare），随 extract_records
         # 一并返回 —— 与 declared_names 的差别见 __init__ 里的说明。
         proc_names = set()
+        # ★v103c：过程名(小写) -> "sub" / "function" / "property"。
+        # 补全时用它决定"后面跟空格还是跟括号"（见 engine._completion_followup）。
+        proc_kinds = {}
         # 结构性名字：组件名 + 窗体控件名（v60）+ 语言自带名字（v61/v62）。
         # 详见 __init__ 里的说明。
         structural_names = set()
@@ -3443,6 +3473,14 @@ class VbeBackend:
                         code, module=mod_name, is_std_module=is_std,
                         caret=apply_caret)
                     proc_names |= _proc_of
+                    # ★v103c：顺手把"每个过程是 Sub / Function / Property"记下来
+                    # （同一行、同一批正则，不额外打 COM）。补全时需要它来定
+                    # "后面跟空格还是跟括号"，见 engine._completion_followup。
+                    try:
+                        proc_kinds.update(
+                            vba_parser.extract_proc_kinds(code))
+                    except Exception:
+                        pass
                     records.extend(recs)
                     # 记下【这一刻光标处的词】：它多半是用户正在输入 / 正在
                     # 回退删除的词。回退删字时，缓存的池子里还留着它更长的
@@ -3646,6 +3684,7 @@ class VbeBackend:
         self._type_names = type_names
         self._declared_names = declared_names
         self._proc_names = proc_names
+        self._proc_kinds = proc_kinds          # ★v103c：过程 -> sub/function/property
         self._declared_by_module = _decl_by_mod
         self._structural_names = structural_names
         self._builtin_names = builtin_names
@@ -4134,8 +4173,14 @@ class VbeBackend:
             # ⚠️ 这里**不**改写 new_line —— 真机实测 VBE 会把行尾空格立刻 trim 掉，
             # 改写等于白写。只算好"要往哪个下标注入一个空格"（纯函数，
             # 便于离线用例钉住），真正的注入在光标摆好之后做。
+            #
+            # ★v103c：`Call 语句` 里不补 —— `Call judge` 的实参位置语法不同
+            # （带实参要写成 `Call judge(1, 2)`），补一个尾随空格纯属无意义字符，
+            # 而且那个位置的空括号本来就会被 VBE 删掉（v102 实测）。判据与上面
+            # 补括号那道用的是**同一个** `_in_call_stmt`（同一语义只有一份实现）。
             space_at = None
-            if want_space and AUTO_SPACE_AFTER_KEYWORD:
+            if want_space and AUTO_SPACE_AFTER_KEYWORD \
+                    and not _in_call_stmt(line_text):
                 space_at = _space_insert_pos(new_line, word_start_col, completion)
             _log("apply_completion: want_space=%s AUTO_SPACE=%s space_at=%s"
                  % (want_space, AUTO_SPACE_AFTER_KEYWORD, space_at))

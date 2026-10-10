@@ -72,6 +72,27 @@ try:
 except Exception:
     YIELD_TO_VBE_LIST = True
 
+# ★v103c：成员位置（`标识符.` 之后 / With 块里的 `.成员`）要不要出**我们自己的**候选窗。
+#
+# 用户口径（原话）："对某个变量的成员提示，这个就关闭，不要提示了。比如说输入
+# student.，.后面就不要出提示框了，现在会提示函数名，变量名这些，按道理提示的
+# 应该是类或者对象的成员。"
+#
+# 默认 **False**（关）。理由不是"做不到"，而是**这个位置本来就轮不到我们**：
+#   * 点号后面该出现的是"这个对象的成员"，而我们的池子是**裸名**池（变量名 /
+#     过程名 / 关键字）—— 出了就是噪音，正是用户看到的"提示函数名、变量名"；
+#   * v98 试过"按变量的声明类型把候选收窄成那个类的成员"，但它只覆盖得了一小
+#     部分（本工程的类模块 + `Dim x As 类型`），宿主对象（Range / Workbook）、
+#     UDT、`New` 出来的对象、`With` 块统统收不了 —— 收不了就退回裸名池 ⇒ 又回到
+#     上面那句噪音；
+#   * 而 VBE **自己**在同一个位置就会弹「自动列出成员」，它按真实类型解析、
+#     比我们准得多 —— 我们弹反而把它的列表盖住（v55/v73 那一整段冲突史）。
+# ⇒ 这里干脆不弹，把位置整个让给 VBE。VBE 不弹（类型解析不出来）时用户看到的是
+#    "什么都不弹"，也好过"弹一堆不相干的名字"。
+#
+# 想恢复旧行为（出候选、并按声明类型收窄）：`set VBECOMPLETE_MEMBER_POPUP=1`。
+MEMBER_POPUP = (os.environ.get("VBECOMPLETE_MEMBER_POPUP", "0").strip() == "1")
+
 # v73：让位的【宽限期】（秒）—— 见 Completer.trigger 里让位那段。
 #
 # 让位原来的假设是"我们让开，VBE 的成员列表就会顶上"。这个假设在 With 块里
@@ -1457,6 +1478,12 @@ class Completer:
         """★v98：光标在 `标识符.` 之后时，把候选收进那个对象的类型。返回新列表，
         收不了就**原样返回** `visible_ids`。
 
+        ⚠️ ★v103c 起这条路**默认走不到**：成员位置（`标识符.` / With 块的 `.成员`）
+        现在由 `MEMBER_POPUP` 直接早退、不出候选了（用户口径："输入 student.，点号
+        后面就不要出提示框了"）。只有 `set VBECOMPLETE_MEMBER_POPUP=1`（或手动
+        `Ctrl+Space`）才会走到这里 —— 那时这一整套收窄仍然照旧生效。
+        ⇒ 读这段代码时先确认开关状态，别以为它在默认路径上。
+
         判定链（任何一步拿不到证据就原样返回，绝不收窄）：
           1) 光标在不在成员位置（`_member_list_dot_col` 那一份判据，v93 合并过）；
           2) `get_context` 给的点号左边标识符名（`member_root_name`）；
@@ -1576,6 +1603,24 @@ class Completer:
                 _BUILTIN_TYPE_NAMES_LOW = frozenset()
         return _BUILTIN_TYPE_NAMES_LOW
 
+    def _proc_kinds(self):
+        """后端给出的"过程名 -> sub / function / property"（小写键）。可选接口。★v103c。
+
+        供 `_completion_followup` 分辨"补空格还是补括号"用（Sub 补空格、
+        Function 补括号、Property 都不补）。
+
+        后端不提供时返回**空 dict** —— 退到 v98 以来的老口径（工程内过程名
+        一律补括号），旧式 / 测试后端行为完全不变（"判据缺失就不动手"）。
+        """
+        hook = getattr(self.backend, "get_proc_kinds", None)
+        if not callable(hook):
+            return {}
+        try:
+            d = hook() or {}
+            return {str(k).lower(): str(v).lower() for k, v in dict(d).items()}
+        except Exception:
+            return {}
+
     def _is_callable_name(self, name):
         """这个名字能不能被调用（该补括号）。★v98 建，★v99 收紧。
 
@@ -1605,6 +1650,46 @@ class Completer:
             return (low in self._builtin_function_names()
                     and low not in self._builtin_type_names())
         return False
+
+    def _completion_followup(self, name):
+        """按 Tab 确认这个名字之后，后面该跟什么 —— 返回 (want_parens, want_space)。★v103c。
+
+        用户口径（原话）："选中的提示词，如果是 sub 过程，按 tab 键不要补双括号，
+        应该补空格；如果是 function 函数，按 tab 键要补双括号。"
+
+        这条正好与 VBA 语法一致（所以不只是迎合用户，方向是对的）：
+          * `Sub`      —— 无返回值的**语句**，标准写法不带括号：
+            `Sleep 1000`、`Foo 1, 2`。补一对空括号 `Foo()` 不但没必要，
+            **VBE 还会立刻把它删掉**（v102 真机实测：写进 `Call foo()`、
+            读回就是 `Call foo`）⇒ 补了等于白补，用户看到"按了没反应"。
+            所以改成补一个空格，用户接着敲实参即可。
+          * `Function` —— 有返回值，按调用表达式写：`x = GetName()` ⇒ 补括号。
+          * `Property` —— `x = p.Name` / `p.Name = 1` 两种用法都不带括号 ⇒ 都不补。
+        工程内过程之外的名字走 v98/v99/v103b 的老口径：语言自带的函数
+        （`MsgBox` / `Left` / `Split`）补括号，语言关键字补空格，其余（变量 / 常量）
+        什么都不补。
+
+        ⚠️ 后端没提供 `get_proc_kinds`（旧式 / 测试后端）时 `kind` 为空 ⇒ 退到
+        `_is_callable_name`，也就是**与 v98 起完全一样**的行为（过程名补括号）。
+        老用例因此不受影响，新能力只在真后端上生效。
+        """
+        low = str(name or "").lower()
+        try:
+            kind = str((self._proc_kinds() or {}).get(low) or "")
+        except Exception:
+            kind = ""
+        if kind == "sub":
+            return False, True
+        if kind == "function":
+            return True, False
+        if kind == "property":
+            return False, False
+        try:
+            if self._is_callable_name(low):
+                return True, False
+        except Exception:
+            pass
+        return False, _keyword_wants_space(low)
 
     def _host_enum_names(self):
         """后端给出的"宿主类型库枚举常量" -> {小写名: 最短输入长度}。可选接口。
@@ -1747,6 +1832,29 @@ class Completer:
         # 要看"当前模块里哪些模块级名字可见"）在 self.ctx 赋值之前就要用。
         self._ctx_now = ctx
         if ctx.get("in_string") or ctx.get("in_comment"):
+            self.hide()
+            return
+        # ★v103c：成员位置（`标识符.` 之后 / With 块里的 `.成员`）**不再自动弹
+        # 我们自己的候选** —— 把这一处整个让给 VBE 的「自动列出成员」。
+        #
+        # 用户口径（原话）："对某个变量的成员提示，这个就关闭，不要提示了。
+        # 比如说输入 student.，.后面就不要出提示框了，现在会提示函数名，变量名
+        # 这些，按道理提示的应该是类或者对象的成员。" —— 我们的池子是裸名池
+        # （变量名 / 过程名 / 关键字），在点号后面出这些就是噪音；VBE 自己在这个
+        # 位置会弹真实的成员列表，按真实类型解析，比我们准。详见 MEMBER_POPUP。
+        #
+        # ⚠️ 放在最前面（早于下面那段"待定让位"）：既然我们永远不弹，就没有
+        # "宽限期到、VBE 没弹、把候选补回来"这回事 —— 那条补位路径（main 轮询
+        # 里 `confirm_yield` 返回 False 后调 `trigger(False)`）走到这里也会直接
+        # 返回，不会把窗又补出来。
+        # ⚠️ Ctrl+Space（manual=True）例外：那是用户**点名**要我们的列表，照弹
+        # （v72 的老口径：点名的列表照弹，否则就成了"按了没反应"）。
+        # ⚠️ 开关 `VBECOMPLETE_MEMBER_POPUP=1` 可恢复旧行为（出候选 + 按声明类型
+        # 收窄，即 v98 那套）。
+        if (not MEMBER_POPUP) and (not manual) and _member_list_dot_col(
+                ctx.get("line_text"), ctx.get("caret_col")) is not None:
+            _log("trigger: 成员位置（. 之后）-> 不出我们自己的候选，"
+                 "让给 VBE 的成员列表")
             self.hide()
             return
         # 声明里 `As` 类型名位置：正在填数据类型名（如 `Dim x As Inte...`）。
@@ -2034,13 +2142,22 @@ class Completer:
                             _word100 = _now_txt[_ws100 - 1:_we100 - 1]
                         if _word100[:1] == ".":
                             _word100 = _word100[1:]
+                        # ★v103c：这里也走同一个判据 —— 不再一律补括号：
+                        # 若 VBE 插进来的是个 Sub，补的是空格（同 accept）。
+                        _wp100, _wsp100 = self._completion_followup(_word100)
                         if (_word100 and _ln100 > 0 and _ws100 > 0
-                                and self._is_callable_name(_word100)):
-                            self.backend.apply_completion(
-                                _ln100, _ws100, _ws100 + len(_word100),
-                                _word100, True)
+                                and (_wp100 or _wsp100)):
+                            try:
+                                self.backend.apply_completion(
+                                    _ln100, _ws100, _ws100 + len(_word100),
+                                    _word100, _wp100, _wsp100)
+                            except TypeError:
+                                self.backend.apply_completion(
+                                    _ln100, _ws100, _ws100 + len(_word100),
+                                    _word100)
                             _log("trigger: VBE 列表补进的 %r 是过程名 "
-                                 "-> 补上括号" % (_word100,))
+                                 "-> 补上括号/空格 (parens=%s space=%s)"
+                                 % (_word100, _wp100, _wsp100))
                     except Exception:
                         # 补不上就算了，绝不因为补括号把这次静默判定弄坏
                         # （下面的 hide / 钉住逻辑必须照常走）。
@@ -2676,22 +2793,16 @@ class Completer:
             self._accepted = None
         try:
             end_col = ctx.get("word_end_col") or ctx.get("caret_col")
-            # ★v98：这个候选是过程/函数才请求补括号。判据在引擎这边
-            # （`_is_callable_name`：工程内过程名，或语言自带且非数据类型），
-            # 后端只判"位置允不允许"（`_is_call_site`，挡掉 `Dim x As <这里>`）。
-            # 两边职责分开，任何一边拿不到证据都只是"不补"，不会补坏代码。
+            # ★v98/v103b/v103c：这两个标志由**同一个**判据一起定 —— 它按
+            # "这个名字是什么"分档（详见 `_completion_followup`）：
+            #   Sub -> 补空格（语句写法，VBE 还会把空括号删掉）；Function -> 括号；
+            #   Property -> 都不补；语言自带的函数 -> 括号；语言关键字 -> 空格。
+            # 引擎判"是什么"（纯函数、可离线钉死），后端只判"位置允不允许 +
+            # 怎么补"（`_is_call_site` / `_in_call_stmt` / 注入空格）。
             try:
-                _want_parens = self._is_callable_name(chosen)
+                _want_parens, _want_space = self._completion_followup(chosen)
             except Exception:
-                _want_parens = False
-            # ★v103b：这个词要不要在后面补一个空格（VBA 关键字，如 `pub` ->
-            # `public `）。与补括号同构：引擎判"是什么"（纯函数），后端判
-            # "位置允不允许 + 怎么补"（真机实测只能靠注入空格，见 vbe_bridge）。
-            # 关键字与内建函数交集为 ∅，所以"补括号"与"补空格"互斥、不会撞车。
-            try:
-                _want_space = _keyword_wants_space(chosen)
-            except Exception:
-                _want_space = False
+                _want_parens, _want_space = False, False
             # ★v101 诊断：这一下 Tab 到底有没有走到 accept、以及"要不要补括号"
             # 这道判据的**输入是什么**。v100 那次"Call judge 按 Tab 不补括号"
             # 我连修两次都没修好，根因是每一层判据离线看都正常 —— 缺的是
@@ -2699,9 +2810,10 @@ class Completer:
             # 只在 VBECOMPLETE_LOG=1 时拼这串（默认 _log 直接 return）。
             _log("accept: line=%s ws=%s we=%s chosen=%r want_parens=%s"
                  " want_space=%s"
-                 " | in_proc=%s builtin=%s is_func=%s is_type=%s"
+                 " | kind=%s in_proc=%s builtin=%s is_func=%s is_type=%s"
                  % (ctx.get("line_no"), ctx.get("word_start_col"), end_col,
                     chosen, _want_parens, _want_space,
+                    (self._proc_kinds() or {}).get(str(chosen).lower()),
                     str(chosen).lower() in self._proc_names(),
                     str(chosen).lower() in self._builtin_names(),
                     str(chosen).lower() in self._builtin_function_names(),

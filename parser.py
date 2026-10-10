@@ -247,6 +247,47 @@ def _params_inside(paren_text):
     return names
 
 
+# ★v103c：过程头里那个关键字。只在【已经被 _RE_SUB / _RE_PROP / _RE_DECLARE
+# 认下来的那一行】上跑，用来分辨 Sub / Function / Property —— 它不是另一套
+# "识别过程头"的规则，只是一次归类。
+_RE_PROC_KW = re.compile(r"\b(Sub|Function|Property)\b", re.I)
+
+
+def extract_proc_kinds(code):
+    """从模块源码里提取 {小写过程名: "sub" / "function" / "property"}。★v103c。
+
+    用途：决定"按 Tab 确认一个过程名之后，后面该跟什么"——
+      * `Sub` / `Declare Sub`        -> 后面跟【空格】。VBA 里 Sub 是无返回值
+        的语句，标准写法本来就没括号（`Sleep 1000` / `Foo 1, 2`）；就算补了空
+        括号 `Foo()`，**VBE 也会立刻把它删掉**（v102 实测：`Call foo()` 写进去
+        读回就是 `Call foo`）—— 补了等于白补，用户看到的是"按了没反应"。
+      * `Function` / `Declare Function` -> 补一对 `()`（有返回值，按调用表达式写）。
+      * `Property`                   -> 什么都不补（`x = p.Name` / `p.Name = 1`
+        两种用法都不带括号）。
+
+    ⚠️ 与 `extract_records` 用**同一批**过程头正则（_RE_SUB / _RE_PROP /
+    _RE_DECLARE），所以"哪些行算过程头"两边永远一致 —— 不可能出现"有候选、
+    却查不到它是什么"。关键字本身只是从**这一行已确认的头部**里读出来的。
+    """
+    out = {}
+    for line in str(code or "").split("\n"):
+        if not line.strip():
+            continue
+        m = (_RE_SUB.match(line) or _RE_PROP.match(line)
+             or _RE_DECLARE.match(line))
+        if not m:
+            continue
+        try:
+            head = line[:m.start(1)]
+        except Exception:
+            continue
+        kws = _RE_PROC_KW.findall(head)
+        if not kws:
+            continue
+        out[str(m.group(1)).lower()] = kws[-1].lower()
+    return out
+
+
 def extract_records(code, module=None, is_std_module=True, caret=None):
     """
     返回 (records, proc_names)：
