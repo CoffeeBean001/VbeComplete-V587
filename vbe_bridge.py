@@ -3966,6 +3966,14 @@ class VbeBackend:
             # ★v98：补括号。判据全在这三行，且**任何一步不确定就不补**
             # —— 补坏代码的代价远大于少补一对括号。
             added_parens = False
+            # ★v101 诊断：后端这三道输入（want_parens / 开关 / 位置闸门）
+            # 才是"括号到底补没补"的决定者。v100 那次修不好就是因为只验了
+            # 引擎侧（_is_callable_name）与离线 mock，没看后端这三项的真值。
+            _log("apply_completion: want_parens=%s AUTO_PAREN=%s "
+                 "call_site=%s | line=%r ws=%s completion=%r"
+                 % (want_parens, AUTO_PAREN_ON_COMPLETE,
+                    _is_call_site(line_text, word_start_col),
+                    str(line_text).rstrip("\r\n"), word_start_col, completion))
             if want_parens and AUTO_PAREN_ON_COMPLETE \
                     and _is_call_site(line_text, word_start_col):
                 # 补全词的**词尾**（0-based 下标）。括号要贴在这个词的后面。

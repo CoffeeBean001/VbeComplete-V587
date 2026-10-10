@@ -1882,26 +1882,37 @@ class Completer:
                 # `_is_call_site` 放行、`judge` 也真在 `get_proc_names` 里），
                 # 而是**这一下 Tab 根本没走到我们的 accept()**：光标在 `Call `
                 # 之后时 VBE 自己就弹着【自动列出成员】，我们全程让位、弹窗已
-                # 经隐藏 ⇒ `completer.is_visible()` 那条分支轮不到我们 ⇒
-                # VBE 自己把 `judge` 插进去，而**它插名字是不带括号的**。
-                # 与 v90b/v91 记的是同一个坑（让位期间 Tab 打给 VBE 的列表），
-                # 但那次要解决的是"别再提示自己"，这次要解决的是"该补的括号
-                # 没人补"。
-                #
-                # ⇒ 在这儿补：这一段已经判据确证是"VBE 刚插进来的那个词"
-                # （`_hit` 的四条全过），把它交给与 accept() 同一个后端动作
-                # （`apply_completion(..., want_parens=True)`）——判据与动作
-                # 都不另写一份，改完立刻生效。
-                #
-                # ⚠️ 只在【第一段】补：第二段（`_accept_pinned`）锚的是"VBE
-                # 留下的那一行"，那一行一个字都没再动过，补括号会变成改坏代码。
-                #
-                # ★★要补的词**不是 `_ins`**，而是 ctx 里光标处的【整个词】：
-                # VBE 的列表是把你已经打的半截词**补长**（`jud` → `judge`），
-                # 不是插进一个新词 ⇒ 公共前缀/后缀一算，抠出来的 `_ins` 只是差量
-                # （`Call jud` → `Call judge` 得 `_ins == "ge"`）。拿 `_ins` 去
-                # 判"是不是过程名"必然判否（`ge` 当然不是过程）⇒ 必须用光标处
-                # 那个整词。v93 记的"第三种形态"讲的就是同一件事。
+# 经隐藏 ⇒ `completer.is_visible()` 那条分支轮不到我们 ⇒
+            # VBE 自己把 `judge` 插进去，而**它插名字是不带括号的**。
+            # 与 v90b/v91 记的是同一个坑（让位期间 Tab 打给 VBE 的列表），
+            # 但那次要解决的是"别再提示自己"，这次要解决的是"该补的括号
+            # 没人补"。
+            #
+            # ⇒ 在这儿补：这一段已经判据确证是"VBE 刚插进来的那个词"
+            # （`_hit` 的四条全过），把它交给与 accept() 同一个后端动作
+            # （`apply_completion(..., want_parens=True)`）——判据与动作
+            # 都不另写一份，改完立刻生效。
+            #
+            # ⚠️ 只在【第一段】补：第二段（`_accept_pinned`）锚的是"VBE
+            # 留下的那一行"，那一行一个字都没再动过，补括号会变成改坏代码。
+            #
+            # ★★要补的词**不是 `_ins`**，而是 ctx 里光标处的【整个词】：
+            # VBE 的列表是把你已经打的半截词**补长**（`jud` → `judge`），
+            # 不是插进一个新词 ⇒ 公共前缀/后缀一算，抠出来的 `_ins` 只是差量
+            # （`Call jud` → `Call judge` 得 `_ins == "ge"`）。拿 `_ins` 去
+            # 判"是不是过程名"必然判否（`ge` 当然不是过程）⇒ 必须用光标处
+            # 那个整词。v93 记的"第三种形态"讲的就是同一件事。
+            #
+            # ★★v101 更正本段注释里那句因果断言（我原先写错了，害得 v100 白修
+            # 一轮）：**`Call ` 之后我们并不让位** ——
+            # `vbe_list_expected("    Call ", 10)` 实测返回 `False`（它只认
+            # `标识符.` 与 `As `/`New ` 两种位置），所以 `Call jud` 时我们的窗
+            # 是**弹着的**，Tab 走的是上面 `completer.is_visible()` 那条分支的
+            # `accept()`，**根本轮不到 `_hit` 这段**。
+            # ⇒ 用户报的"Call 后按 Tab 不补括号"**与本段无关**，本段只对
+            # 真正会让位的那些位置（点号成员 / 类型位置）有意义。
+            # 那条 `Call` 故障的真实成因尚未定位，`VBECOMPLETE_LOG=1` 下看
+            # `accept:` / `apply_completion:` 两行日志（见 log.py）。
                 if not self._accept_pinned:
                     try:
                         # 光标左边的词（1-based 字符列）。拿不到就退到 `_ins`
@@ -2511,6 +2522,19 @@ class Completer:
                 _want_parens = self._is_callable_name(chosen)
             except Exception:
                 _want_parens = False
+            # ★v101 诊断：这一下 Tab 到底有没有走到 accept、以及"要不要补括号"
+            # 这道判据的**输入是什么**。v100 那次"Call judge 按 Tab 不补括号"
+            # 我连修两次都没修好，根因是每一层判据离线看都正常 —— 缺的是
+            # "真机上 chosen 与 _proc_names 的真值"这一眼。
+            # 只在 VBECOMPLETE_LOG=1 时拼这串（默认 _log 直接 return）。
+            _log("accept: line=%s ws=%s we=%s chosen=%r want_parens=%s"
+                 " | in_proc=%s builtin=%s is_func=%s is_type=%s"
+                 % (ctx.get("line_no"), ctx.get("word_start_col"), end_col,
+                    chosen, _want_parens,
+                    str(chosen).lower() in self._proc_names(),
+                    str(chosen).lower() in self._builtin_names(),
+                    str(chosen).lower() in self._builtin_function_names(),
+                    str(chosen).lower() in self._builtin_type_names()))
             try:
                 self.backend.apply_completion(
                     ctx["line_no"], ctx["word_start_col"], end_col, chosen,

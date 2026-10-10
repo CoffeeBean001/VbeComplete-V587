@@ -14407,6 +14407,88 @@ def main():
         _tp79.print_exc()
         check("第 79 节异常: %s" % _e79, [True], expect_contain=[False])
 
+    # ==================================================================
+    # 第 80 节：v101 —— 把 v100 那次【错误归因】钉成护栏（3 条）
+    #
+    #★背景：v100 我断定"`Call ` 之后 VBE 会弹成员列表、我们让位、于是 Tab
+    #  打给了 VBE 自己的列表"，并把修复挂在 `_hit`（note_accept_key 记账）
+    #  那段上。用户实测反馈"故障依旧存在"—— 根因就是**这个前提本身是错的**：
+    #  `vbe_list_expected("    Call ", 10)` 实测返回 **False**（它只认
+    #  `标识符.` 与 `As `/`New ` 两种位置），所以 `Call jud` 时我们的窗是
+    #  **弹着的**，Tab 走 `completer.is_visible()` → `accept()`，
+    #  **根本轮不到 `_hit` 那段** ⇒ 我挂在死路上的修复从未被触发。
+    #
+    # 教训（第 29 条的升级版）：**"某个功能不生效"的第一嫌疑是"那次按键
+    #  根本没走到我们"，但"第二嫌疑"必须是"我认定的那条路径本身是不是
+    #  真的会发生"** —— 而这两点都**只能靠实测判据返回值确认，不能靠读代码
+    #  推断**。读代码只能告诉我"如果 X 成立会怎样"，告诉不了我"X 成立吗"。
+    # ==================================================================
+    try:
+        print("\n--- 80. 让位判据对 Call 返回 False（v100 归因错误的根源）---")
+
+        # 80.1 ★核心：`Call ` 之后我们【不让位】—— 只有两种位置才让位。
+        _call_exp = [
+            ("    Call ", 10),
+            ("    Call j", 11),
+            ("    Call jud", 14),
+            ("    Call judge", 15),
+            ("Call judge", 11),
+        ]
+        _r80 = [(str(ln), int(cc), E.vbe_list_expected(ln, cc))
+                for (ln, cc) in _call_exp]
+        check("80.1 ★★`Call ` 之后【我们不让位】（实测返回 False）—— v100 "
+              "把修复挂在\"让位期间 Tab 打给 VBE\"那条路上，而那条路对 Call "
+              "**根本不存在**。真实路径是：我们的窗弹着→ Tab 走 "
+              "`completer.is_visible()` → `accept()`。实测=%r"
+              % ([r[2] for r in _r80],),
+              [all(r[2] is False for r in _r80)],
+              expect_contain=[True])
+
+        # 80.1b 对照组：让位判据**确实**认这两种位置（钉住"不是判据坏了"）
+        _yld_exp = [
+            ("    Call SheetUtils.", 21),
+            ("    ws.", 8),
+            ("    Dim x As ", 14),
+            ("    Set c = New ", 17),
+        ]
+        _r80b = [(str(ln), int(cc), E.vbe_list_expected(ln, cc))
+                 for (ln, cc) in _yld_exp]
+        check("80.1b 对照组：让位判据**确实**认`标识符.` 与 `As `/`New ` "
+              "这两种位置（证明 80.1 的 False 不是判据整体失效，而是它本来"
+              "就只管这两种）实测=%r" % ([r[2] for r in _r80b],),
+              [all(r[2] is True for r in _r80b)],
+              expect_contain=[True])
+
+        # 80.2 源码护栏：那段补括号代码的注释里**必须**带上 v101 的实测更正
+        #       （`Call ` 不让位 + 指向日志），否则下一个读代码的人会再次
+        #       相信那个错误断言、再修一轮空气。
+        # ⚠️ 断言方式：**查"更正声明在不在"**，不要查"原句还在不在"——
+        #   原句是作为"我原先写错了"的引述**故意保留**的（删掉它就看不出
+        #   这里曾经错过），查它有没有消失会得到假红。
+        _esrc80 = io.open(os.path.join(_ROOT78, "engine.py"),
+                          encoding="utf-8").read()
+        _i80 = _esrc80.find("if _hit:")
+        _re80 = __import__("re")
+        _m80 = _re80.search(r"\n {16}if self\._accept_pinned:", _esrc80[_i80:]) \
+            if _i80 >= 0 else None
+        _seg80 = (_esrc80[_i80:_i80 + _m80.start()] if _m80 else "")
+        check("80.2 ★那段补括号代码的注释里【必须】带 v101 实测更正："
+              "`Call ` 不让位（真实路径是 accept()）+ 指向日志 —— "
+              "注释里若没有这段，下一个读代码的人会再次相信那个错误断言"
+              "（v100 就是这么白修一轮的）。原句作为\"我原先写错了\"的引述"
+              "故意保留，不检查它的有无",
+              [("v101 更正本段注释里那句因果断言" in _seg80,
+                "VBECOMPLETE_LOG" in _seg80 and "accept:" in _seg80,
+                "与本段无关" in _seg80)],
+              # ⚠️ `check` 是**逐元素相等**（`x not in got`），不是子串匹配
+              #   （MEMORY 第 24 条）—— 三项打包成**一个**元组去比。
+              expect_contain=[(True, True, True)])
+
+    except Exception as _e80:
+        import traceback as _tp80
+        _tp80.print_exc()
+        check("第 80 节异常: %s" % _e80, [True], expect_contain=[False])
+
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))
     if FAILURES:

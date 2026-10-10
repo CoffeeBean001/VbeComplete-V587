@@ -22,12 +22,37 @@
 """
 
 # 恒为 False：主循环里 `if _LOG_ENABLED:` 包着的诊断块整段不执行。
-LOG_ENABLED = False
+#
+# ★v101：**改成真的可开关**（原先恒为 False，等于把排障设施彻底封死）。
+# 设 `VBECOMPLETE_LOG=1` 才落盘，默认仍是零开销的空实现 ——
+# 日常使用行为与开销与从前**完全一致**（log() 第一行就 return）。
+#
+# 为什么必须留这个后门：v100 那次"Call 后按 Tab 不补括号"我连修两次都没修好，
+# 根因是**每一层判据在离线环境里都显示正常**，而真机跑的是另一条路
+# （`get_proc_names` 拿的是 vbe_bridge 内部那份缓存，不是 mock）。
+# 没有运行时数据就只能猜，猜错就要用户再等一轮 —— 有了它，
+# 下一次一行 `set VBECOMPLETE_LOG=1` 就能把"走到哪一步"直接读出来。
+import os as _os
+
+LOG_ENABLED = (_os.environ.get("VBECOMPLETE_LOG", "0").strip() == "1")
+_LOG_PATH = _os.environ.get("VBECOMPLETE_LOG_FILE", "").strip() or \
+    r"D:\codes\VbeComplete-V587\VbeComplete.log"
 
 
-def log(*_args, **_kwargs):
-    """空实现：什么都不做（参数原样吞掉，调用点无需判断）。"""
+def log(*args, **kwargs):
+    """写一行诊断日志到 `_LOG_PATH`（仅 VBECOMPLETE_LOG=1 时真正做事）。"""
+    if not LOG_ENABLED:
+        return                      # 默认路径：立刻返回，零开销
+    try:
+        line = " ".join(str(a) for a in args)
+        if kwargs:
+            line += " " + repr(kwargs)
+        with open(_LOG_PATH, "a", encoding="utf-8", errors="replace") as f:
+            f.write(line[:1200] + "\n")
+    except Exception:
+        pass                        # 日志失败绝不影响主功能
 
 
 def log_boot():
-    """空实现：原先在这里记录启动信息。"""
+    """记录启动信息（同样只在 VBECOMPLETE_LOG=1 时写）。"""
+    log("boot: 日志已开启 ->", _LOG_PATH)

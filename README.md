@@ -55,10 +55,19 @@ python tests\test_real_project.py
 
 ⚠️ **`log.py` 这个空壳不能删**：`engine.py` / `vbe_bridge.py` / `main.py` 都
 `import` 它，删掉会直接 ImportError 起不来。留空实现而不是把那约 60 处
-`_log(...)` 调用逐个挖掉，是因为 `log()` 本身直接返回、`LOG_ENABLED` 恒为
+`_log(...)` 调用逐个挖掉，是因为 `log()` 本身直接返回、`LOG_ENABLED` 默认
 `False` ⇒ 主循环里 `if _LOG_ENABLED:` 包着的诊断块（含额外的只读 COM 调用）
-自动整段跳过，**行为与开销都与删掉一样**；将来要排障，把日志实现加回本文件即可，
-其余文件一行不动。配套的 `run_debug.bat` / `show_log.bat` 已随收尾移除。
+自动整段跳过，**行为与开销都与删掉一样**。
+
+**★v101 起这个后门是真能用的**（原先恒为 `False`，等于把排障设施彻底封死）：
+启动前设 `set VBECOMPLETE_LOG=1`，日志会写到项目目录下的 `VbeComplete.log`
+（可用 `VBECOMPLETE_LOG_FILE` 换路径），关掉时仍是零开销（实测 10 万次调用
+0.024 秒，那都是函数调用本身的开销）。**下次再遇到"某处不生效"先开它**——
+日志里有一行 `accept: ... want_parens=... | in_proc=... is_func=... is_type=...`
+直接告诉你括号决策的每一项输入真值，不用再靠猜。
+
+其余文件一行不动。配套的 `run_debug.bat` / `show_log.bat` 已随收尾移除，
+现在直接手工设环境变量即可。
 
 ## 使用
 
@@ -728,8 +737,10 @@ python tests\test_real_project.py
     （见第 ③ 条），先把提示窗类名加进探测清单；
     ② 手动 `Ctrl+Space` 的标记还挂着（v76 之后它已不再阻止让位，出现即异常）；
     ③ 两者几何明明相交却没被收掉 —— 窗口判据那一侧的问题。
-  这三者的区分最终要靠窗口实测（`EnumWindows` + `GetClassName`），
-  原先的 `run_debug.bat` 日志已随测试/调试代码一起移除，`log.py` 现为空实现。
+  这三者的区分最终要靠窗口实测（`EnumWindows` + `GetClassName`）。
+  ★v101 起 `log.py` 已恢复成**可开关的真实现**：启动前 `set VBECOMPLETE_LOG=1`，
+  窗口探测量与按键接管都会记进 `VbeComplete.log`（心跳每3 秒一行），
+  比手工枚举窗口快得多。
   ③ 这台机器的提示窗类名不在探测清单里（默认认 `NameListWndClass` /
   `PopupTipWndClass`）：枚举一下 Excel 进程的顶层窗口（`EnumWindows` + `GetClassName`）
   确认真实类名后，用 `set VBECOMPLETE_VBE_POPUP_CLASS=类名` 追加（探测与避让都用这份
