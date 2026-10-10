@@ -1444,6 +1444,43 @@ def _find_completion_end(text, completion, near0, fallback0):
     return min(fallback0, len(text))
 
 
+def _in_call_stmt(line_text):
+    """这一行是不是 VBA 的 `Call` 语句（`Call 过程名`）。★v102。纯函数。
+
+    ★★为什么必须加这条（用户报"Call judge 按 Tab 不补括号、手动敲括号也没反应"）：
+
+    **VBE 会把 `Call foo()` 里的【空括号】自动删掉** —— 这是 VBA 的规范：
+    `Call` 语句在无参数时不写括号，`Call foo` 才是标准写法。
+    真机实测（独立 Excel 实例 + 真 CodeModule，v102g 内容矩阵）：
+
+        写 '    Call judge()'     -> 立即 '    Call judge'      ← 括号被 VBE 删掉
+        写 '    Call judge(1, 2)' -> '    Call judge(1, 2)'      ← 有参数则保留
+        写 '    Call foo()'       -> 立即 '    Call foo'        ← 同样被删
+        写 '    judge()'          -> '    judge()'               ← 不在 Call 语句里，保留
+        写 '    x()'              -> '    x()'                   ← 保留
+
+    ⇒ 这个位置上做括号动作**全是白做**，而且是最坏的那种"白做"——
+      用户看到的是"按了没反应"：
+        * 补全补出 `Call judge()` → VBE 立刻删 → 用户以为"Tab 没补括号"；
+        * 自动配对写入 `Call judge()` → VBE 立刻删 → 用户以为"敲括号没反应"。
+      两个现象同一个根因，与我们的判据、让位、时序**全都无关**。
+
+    ⇒ 修法就是【什么都不做】：补全不补括号、自动配对不接管，让 VBE 全权处理
+      （它自己插入 `(`，用户接着输入参数时会得到 `Call judge(1, 2)` 并保留）。
+
+    ⚠️ 判据只看【行首是不是 Call 关键字】：`Call obj.Method` 同样是 Call 语句、
+      同样会被删括号，所以不能用"标识符紧跟在 Call 后面"这种更窄的判据。
+    """
+    try:
+        return bool(_CALL_STMT_RE.match(str(line_text or "")))
+    except Exception:
+        return False
+
+
+# `^\s*Call` 且后面不是标识符字符（挡住 `Callback` / `CallCount` 这类名字）。
+_CALL_STMT_RE = re.compile(r"^[ \t]*call(?![A-Za-z0-9_])", re.I)
+
+
 def _is_call_site(line_text, word_start_col):
     """这一行的这个词位置，是不是一个**可以直接调用过程**的位置。纯函数。
 
@@ -3783,6 +3820,12 @@ class VbeBackend:
             col0 = max(0, min(col - 1, len(line_text)))
             if _classify(line_text, col0 + 1)[1]:
                 return False          # 注释里不自动配对（VBE 也不）
+            if _in_call_stmt(line_text):
+                # ★v102：`Call 过程名` 里的空括号会被 VBE 立刻删掉（VBA 规范），
+                # 我们写入 `()` 等于白写 —— 用户看到的是"敲 `(` 完全没反应"。
+                # 返回 False 让按键【原样交给 VBE】，它自己插入 `(`；
+                # 用户接着输参数时得到 `Call judge(1, 2)`，那对括号会保留。
+                return False
             if open_ch == ")":
                 # 右半边已经在光标右边 -> 只跨过去（补完 `()` 后再按 `)` 不该
                 # 多出一个）；否则【放行】，让用户真的插入一个右括号。
@@ -3975,7 +4018,8 @@ class VbeBackend:
                     _is_call_site(line_text, word_start_col),
                     str(line_text).rstrip("\r\n"), word_start_col, completion))
             if want_parens and AUTO_PAREN_ON_COMPLETE \
-                    and _is_call_site(line_text, word_start_col):
+                    and _is_call_site(line_text, word_start_col) \
+                    and not _in_call_stmt(line_text):
                 # 补全词的**词尾**（0-based 下标）。括号要贴在这个词的后面。
                 k = word_start_col - 1 + len(completion)
                 # 跳过空白**只是为了判断**"右边是不是已经紧跟左括号"
@@ -3997,6 +4041,16 @@ class VbeBackend:
             end0 = start0 + len(completion)
 
             cm.ReplaceLine(line_no, new_line)
+            # ★v102 诊断：ReplaceLine 到底有没有写进 VBE。
+            # 真机实测（独立 Excel 实例）出现过"返回算好的新行、VBE 里却没变"
+            # —— 必须看清是 ReplaceLine 静默失败，还是读回被缓存。
+            try:
+                _log("apply_completion: ReplaceLine 后 line_no=%r n=%r "
+                     "写入=%r 读回=%r"
+                     % (line_no, cm.CountOfLines, new_line,
+                        cm.Lines(line_no, 1)))
+            except Exception as _e102:
+                _log("apply_completion: ReplaceLine 后读回异常 %r" % (_e102,))
             # 读回实际行（VBE 可能做规范化，内容略有变化）
             actual = cm.Lines(line_no, 1)
             if actual != new_line:

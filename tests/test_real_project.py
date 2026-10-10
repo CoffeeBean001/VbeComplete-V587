@@ -14081,14 +14081,19 @@ def main():
         _tp78.print_exc()
         check("第 78 节异常: %s" % _e78, [True], expect_contain=[False])
 
-    # ==================== 第 79 节：v100 ====================
+    # ==================== 第 79 节：v100（★v102 已更正归因）================
     # 用户报：`Sub test()` 里 `Call judge` + Tab 不补括号，手动敲 `(` 也没反应。
     #
-    # ⚠️ 本节的核心是**根因本身**：不是判据错、不是位置错，而是**这一下 Tab
-    # 根本没走到我们的 accept()** —— 光标在 `Call ` 之后时 VBE 自己就弹着
-    # 【自动列出成员】，我们全程让位、弹窗已隐藏 ⇒ 用户按的 Tab 是打给 VBE 的
-    # 列表的，而 **VBE 插名字时不带括号**（与 v90b/v91 记的是同一个坑，那次要解决
-    # 的是"别再提示自己"，这次是"该补的括号没人补"）。
+    # ★★v102 更正（真机取证）：本节原先写的根因"光标在 `Call ` 之后时 VBE 自己
+    # 弹着自动列出成员、我们让位、Tab 打给了它"**是错的** —— 实测
+    # `vbe_list_expected("    Call ", 10)` 返回 **False**（我们根本不让位，
+    # Tab 走的是 `accept()`）。**真正的根因**：**VBE 会立刻删掉 `Call foo()`
+    # 里的空括号**（VBA 规范：Call 语句无参数时不写括号）⇒ 补了白补、
+    # 配对写了也被删 ⇒ 用户看到"按了没反应"。
+    # ⇒ 本节已按 v102 更正：79.1.3 改成"Call 位置不补括号"；79.2 的场景从
+    #   `Call jud` 换成普通调用点 `x = jud`（继续验证 `_hit` 段那条路的
+    #   补括号能力 —— 它对点号成员等**会让位**的位置仍然有效）。
+    #   **真机取证与最终修复见第 81 节。**
     try:
         import re as _re79
         print("\n--- 79.1 根因定位：Call 后的两条判据本来就放行 ---")
@@ -14168,18 +14173,22 @@ def main():
             # 期望值一律从实际产物推，别手写）。
             return cm.lines[0].rstrip("\r\n")
 
-        check("79.1.3 ★前提：同一个位置（`Call jud`）直接调 `apply_completion"
-              "(want_parens=True)` **能**补出 `Call judge()` —— 所以补括号的"
-              "实现本身没坏，坏的是**那一次 accept() 从未被调用**"
-              "（让位期间 Tab 打给了 VBE 自己的列表）",
+        check("79.1.3 ★v102 更正：`Call jud` 位置直接调 `apply_completion"
+              "(want_parens=True)` **不再补括号**（`_in_call_stmt` 挡掉）—— "
+              "本用例原先断言的是\"能补出 `Call judge()`\"，用来证明\"补括号实现"
+              "没坏、坏的只是 accept() 没被调用\"。**那个方向是错的**：v102 在"
+              "真实 VBE 上取证发现 **VBE 会立刻删掉 `Call foo()` 里的空括号**"
+              "（VBA 规范：Call 语句无参数时不写括号），所以这里补了也会消失 ——"
+              "用户看到的\"Tab 没补括号\"根因就在这里，不在让位、不在记账。",
               # ⚠️ `check` 是**逐元素相等**（`for x in expect: if x not in got`），
               #   不是子串匹配（MEMORY 第 24 条已栽过一次）：`got` 里放**裸字符串**
               #   即可，外面那层 `[...]` 就是候选清单 —— 别再往里包一层元组，
               #   包了就去比 `('x',) == 'x'`，永远 False。
               [_comp79("    Call jud", 10, "judge")],
-              expect_contain=["    Call judge()"])
+              expect_contain=["    Call judge"])
 
-        print("\n--- 79.2 修法：让位期间 VBE 补进过程名 -> 我们补括号 ---")
+        print("\n--- 79.2 修法：`_hit` 段给 VBE 补进来的过程名补括号"
+              "（v102 起场景改为普通调用点，Call 位置已不补）---")
 
         class _UI79(object):
             def show(self, *a, **k):
@@ -14241,28 +14250,31 @@ def main():
                 VB._get_vbe_cached = orig
             return cm.lines[1].rstrip(chr(13) + chr(10)), pn.sel[3]
 
-        # ---- 79.2.1 ★用户报的现象：Call jud + Tab 要补出judge() ----
-        _r, _c = _tab79("    Call jud", "    Call judge")
-        check("79.2.1 ★用户报的现象：`Sub test()` 里 `Call jud` 按Tab"
-              "（这一下Tab 打给VBE 自己的成员列表，我们的 accept() 没被调用）"
-              "-> 补出 `%r`，光标落在括号内（第 %d 列）" % (_r, _c),
+        # ---- 79.2.1 ★`_hit` 路径（VBE 自己把半截词补长）----
+        # ⚠️ v102 更正：本条原用 `Call jud` 场景，已被推翻（Call 位置不补括号）。
+        # 场景改成普通调用点，继续验证这条路的能力。
+        _r, _c = _tab79("    x = jud", "    x = judge")
+        check("79.2.1 ★`_hit` 路径：VBE 自己把半截词补长"
+              "（`x = jud` -> `x = judge`）时，我们要给它补上括号、"
+              "并让光标进括号 -> 补出 `%r`，光标落在第 %d 列"
+              % (_r, _c),
               [(_r, _c)],
-              expect_contain=[("    Call judge()",
+              expect_contain=[("    x = judge()",
                                _r.index("(") + 2)])
 
         # ---- 79.2.2 只打了 1 个字母 / 一个字母没打，都要补 ----
-        _r2a, _c2a = _tab79("    Call j", "    Call judge")
-        _r2b, _c2b = _tab79("    Call ", "    Call judge")
+        _r2a, _c2a = _tab79("    x = j", "    x = judge")
+        _r2b, _c2b = _tab79("    x = ", "    x = judge")
         check("79.2.2 打了 1 个字母（`Call j`）与一个字母都没打（`Call `）"
               "两种起点都要补出括号",
               [(_r2a, _r2b)],
-              expect_contain=[("    Call judge()", "    Call judge()")])
+              expect_contain=[("    x = judge()", "    x = judge()")])
 
         # ---- 79.2.3 ★要补的是【光标处的整个词】，不是 `_ins` ----
         # VBE 是把半截词【补长】（`jud` -> `judge`），公共前后缀一算，抠出来的
         # 插入段只是差量 `ge` —— 拿它去判"是不是过程名"必然判否。
         # 这条钉住"别再用 `_ins`"。
-        _lo79, _nl79 = "    call jud".lower(), "    call judge".lower()
+        _lo79, _nl79 = "    x = jud".lower(), "    x = judge".lower()
         _p79 = 0
         while _p79 < len(_lo79) and _p79 < len(_nl79) and _lo79[_p79] == _nl79[_p79]:
             _p79 += 1
@@ -14270,7 +14282,7 @@ def main():
         while (_s79 < len(_lo79) - _p79 and _s79 < len(_nl79) - _p79
                and _lo79[-1 - _s79] == _nl79[-1 - _s79]):
             _s79 += 1
-        _ins79 = "    Call judge"[_p79:len("    Call judge") - _s79]
+        _ins79 = "    x = judge"[_p79:len("    x = judge") - _s79]
         check("79.2.3 ★要补的是【光标处的整个词】而不是 `_ins`："
               "`Call jud` -> `Call judge` 抠出来的插入段是 `%r`（只是差量），"
               "判\"是不是过程名\"必须用整词 `judge` —— 拿 `_ins` 判必然判否，"
@@ -14323,13 +14335,13 @@ def main():
                 VB._get_vbe_cached = orig
             return cm.lines[1].rstrip(chr(13)+chr(10))
 
-        _r4a = _tab_nonproc79("    Call jud", "    Call judgeX", "judgeX")
-        _r4b = _tab_nonproc79("    Call ms", "    Call msgbox", "msgbox")
+        _r4a = _tab_nonproc79("    x = jud", "    x = judgeX", "judgeX")
+        _r4b = _tab_nonproc79("    x = ms", "    x = msgbox", "msgbox")
         check("79.2.4 ★对照组：VBE 补进来的**不是过程名**时一个括号都不许补"
               " —— 工程里没有 `judgeX`（不补）、`msgbox` 不在 `get_proc_names` 里"
               "（本工程没这个过程，不补）",
               [(_r4a, _r4b)],
-              expect_contain=[("    Call judgeX", "    Call msgbox")])
+              expect_contain=[("    x = judgeX", "    x = msgbox")])
 
         # ---- 79.2.5 ★只在【第一段】补：第二段（pinned）绝不补 ----
         # pinned 锚的是"VBE 留下的那一行"，那一行一个字都没再动过，
@@ -14488,6 +14500,117 @@ def main():
         import traceback as _tp80
         _tp80.print_exc()
         check("第 80 节异常: %s" % _e80, [True], expect_contain=[False])
+
+    # ==================================================================
+    # 第 81 节：v102 —— `Call 过程名` 位置不做括号动作（8 条）
+    #
+    # ★★根因是真机取证得来的（v102g 内容矩阵；独立 Excel 实例 + 真 CodeModule）：
+    #   **VBE 会把 `Call foo()` 里的【空括号】自动删掉** —— 这是 VBA 的规范：
+    #   `Call` 语句无参数时不写括号，`Call foo` 才是标准写法。
+    #       写 '    Call judge()'     -> 立即 '    Call judge'     ← 括号被删
+    #       写 '    Call judge(1, 2)' -> '    Call judge(1, 2)'     ← 有参数则保留
+    #       写 '    Call foo()'       -> 立即 '    Call foo'       ← 同样被删
+    #       写 '    judge()'          -> '    judge()'              ← 不在 Call 语句里，保留
+    #       写 '    x()'              -> '    x()'                  ← 保留
+    #   ⇒ 用户报的两个现象是**同一个根因**，与我们的判据 / 让位 / 时序全都无关：
+    #       * "Tab 后没有双括号" = 我们补了，VBE 立刻删；
+    #       * "手动敲 `(` 没反应" = 配对写入 `()`，VBE 也立刻删。
+    #   ⇒ 修法：这两条路在 `Call 过程名` 位置**都不做**，把按键原样交给 VBE。
+    #
+    # ⚠️ 这条教训值得记：前两轮我一直在**引擎判据、让位、记账**里找原因，
+    #   而真正的原因在**我从未测过的那一层** —— 真实 VBE 对写入内容的反规范化。
+    #   "离线 mock 全绿"永远证明不了真机行为。
+    # ==================================================================
+    try:
+        import vbe_bridge as VB81
+        print("\n--- 81. `Call 过程名` 不做括号动作（v102 真机取证）---")
+
+        # 81.1 判据正例
+        _pos81 = ["    Call judge", "Call judge", "\tCall obj.Method",
+                  "  call x", "CALL Foo"]
+        _got81 = [(t, VB81._in_call_stmt(t)) for t in _pos81]
+        check("81.1 `_in_call_stmt` 正例：`Call 过程名`（前导空白 / 制表符 / "
+              "`Call obj.Method` / 大小写）全都要认出 —— 这些位置的空括号会被 "
+              "VBE 删掉，补了等于没补",
+              _got81,
+              expect_contain=[(t, True) for t in _pos81])
+
+        # 81.2 判据反例：不许误伤以 Call 开头的标识符
+        _neg81 = ["Callback x", "CallCount = 1", "    x = Call foo",
+                  "    judge", "", "    ", "myCall 1"]
+        _got81b = [(t, VB81._in_call_stmt(t)) for t in _neg81]
+        check("81.2 `_in_call_stmt` 反例：`Callback` / `CallCount` / "
+              "`x = Call foo`（Call 不是行首关键字）/ 普通标识符 —— 都必须是 "
+              "False，否则会把正常位置的补括号误伤掉",
+              _got81b,
+              expect_contain=[(t, False) for t in _neg81])
+
+        # 81.3 源码护栏：apply_completion 的补括号分支必须多带这一道闸门
+        _bsrc81 = io.open(os.path.join(_ROOT78, "vbe_bridge.py"),
+                          encoding="utf-8").read()
+        _i81 = _bsrc81.find("if want_parens and AUTO_PAREN_ON_COMPLETE")
+        _seg81 = _bsrc81[_i81:_i81 + 400] if _i81 >= 0 else ""
+        check("81.3 ★`apply_completion` 补括号那三个条件里必须多出 "
+              "`not _in_call_stmt(line_text)` —— 否则 `Call judge` 位置仍会补出 "
+              "括号、然后被 VBE 删掉（用户看到的正是\"Tab 没补括号\"）",
+              [("not _in_call_stmt(line_text)" in _seg81,
+                "_is_call_site(line_text, word_start_col)" in _seg81)],
+              expect_contain=[(True, True)])
+
+        # 81.4 源码护栏：insert_pair 里必须有这条早退
+        _i81b = _bsrc81.find("def insert_pair(")
+        _j81b = _bsrc81.find("def ", _i81b + 10)
+        _seg81b = _bsrc81[_i81b:_j81b] if _i81b >= 0 and _j81b > _i81b else ""
+        check("81.4 ★`insert_pair` 里必须有 `_in_call_stmt` 早退（返回 False）"
+              " —— 不接管才能把 `(` 原样交给 VBE；接管会写入 `()` 然后被 VBE "
+              "删掉，用户看到的正是\"敲括号没反应\"",
+              [("_in_call_stmt(line_text)" in _seg81b,
+                "return False" in _seg81b)],
+              expect_contain=[(True, True)])
+
+        # 81.5 顺序护栏：insert_pair 里的早退必须发生在【写入之前】
+        _k81 = _seg81b.find("_in_call_stmt(line_text)")
+        _w81 = _seg81b.find("_write_line")
+        check("81.5 `insert_pair` 里 `_in_call_stmt` 早退必须在【真正写入"
+              "（`_write_line`）之前】（早退在第 %d 位、写入在第 %d 位）—— "
+              "写在后面就等于先写坏再判断" % (_k81, _w81),
+              [(_k81 >= 0, _w81 > _k81 >= 0)],
+              expect_contain=[(True, True)])
+
+        # 81.6 源码注释护栏：必须留下"VBE 会删空括号"的实测记录
+        _in81 = _bsrc81.find("def _in_call_stmt(")
+        # ⚠️ docstring 在 `def` **之后**，所以窗口是 [_in81, _in81+2600)，
+        #   不能写成往前取（我第一版写反了，拿到的是一段无关代码 -> 假红）。
+        _seg81c = _bsrc81[_in81:_in81 + 2600] if _in81 >= 0 else ""
+        check("81.6 ★`_in_call_stmt` 的注释里必须写明\"VBE 会把 `Call foo()` 的"
+              "空括号自动删掉\"这个**真机实测结论**（含 `Call judge()` -> "
+              "`Call judge` 的对照）—— 这是本轮唯一解释得通两个现象的事实，"
+              "注释里丢了它，下一个人还会去引擎判据里找原因",
+              [("Call foo()" in _seg81c and "Call judge()" in _seg81c,
+                "VBE" in _seg81c and "删" in _seg81c,
+                "Call judge(1, 2)" in _seg81c)],
+              expect_contain=[(True, True, True)])
+
+        # 81.7 对照护栏：非 Call 位置必须照旧补括号（`judge()` 不会被 VBE 删）
+        check("81.7 对照：`    judge()` / `    x()` 这类**不在 Call 语句里**的"
+              "位置，`_in_call_stmt` 必须是 False（VBE 实测会保留这些括号）"
+              " ⇒ 补括号功能在那里照旧生效，没被这次修复误伤",
+              [VB81._in_call_stmt("    judge()"),
+               VB81._in_call_stmt("    x = judge()")],
+              expect_contain=[False, False])
+
+        # 81.8 判据必须是可套用的纯函数（钩子线程也能用，不碰 COM）
+        _f81 = VB81._in_call_stmt
+        check("81.8 `_in_call_stmt` 是纯函数（只吃文本、不碰 COM），钩子线程与"
+              "主线程可共用同一份实现（项目铁律第 14 条）",
+              [callable(_f81), _f81("    Call a") is True,
+               _f81(None) is False],
+              expect_contain=[True, True, True])
+
+    except Exception as _e81:
+        import traceback as _tp81
+        _tp81.print_exc()
+        check("第 81 节异常: %s" % _e81, [True], expect_contain=[False])
 
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))
