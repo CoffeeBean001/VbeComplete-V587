@@ -226,7 +226,11 @@ def _params_inside(paren_text):
 
 def extract_records(code, module=None, is_std_module=True, caret=None):
     """
-    返回 [(name, module, proc, priv), ...]。
+    返回 (records, proc_names)：
+      records   : [(name, module, proc, priv), ...]
+      proc_names: {小写过程名} —— ★v98 新增，见下面 `add_proc` 的说明。
+
+    ⚠️ v98 起是**二元组**，调用方一律要 `[0]` / 二元解包。
 
     module 为 None 时仍可调用（用于单元测试/旧逻辑），priv 会按默认规则计算，
     但引擎侧把 module=None 的记录当作"旧式全局可见"处理。
@@ -272,6 +276,26 @@ def extract_records(code, module=None, is_std_module=True, caret=None):
         if key not in seen:
             seen.add(key)
             result.append((name, module, proc, priv))
+
+    # ---- ★v98：过程名（小写），供"补全时该不该补括号"判断 ----
+    #
+    # 为什么需要单独一路：`extract_records` 把 Sub / Function 的名字记成
+    # `(name, module, None, priv)` —— proc 位是 None（它自己是模块级），
+    # 于是**与 Dim 出来的模块级变量在结构上完全一样**，调用方分不出
+    # "这是个函数"还是"这是个变量"。而补全补括号这件事，只有过程/函数
+    # 该补（`Dim n As Long` 补成 `Long()` 直接编译不过）。
+    #
+    # 为什么在收集时就分好、而不是"补全时现场扫一遍"：解析这一层本来就在
+    # 扫每一行的过程头（下面 Sub / Function / Property / Declare 四处调用
+    # `add`），顺手多记一个名字**不多读一行代码、不多打一次 COM**；
+    # 反过来现场扫则要为了确认一个候选重扫整个工程。
+    #
+    # 口径：`Declare` 也算（API 声明同样是可调用的过程）。
+    proc_names = set()
+
+    def add_proc(name):
+        if name:
+            proc_names.add(str(name).lower())
 
     def proc_key(name):
         """刚看到的过程头名字 -> 作用域键（第 2 次同名起带序号）。"""
@@ -324,6 +348,7 @@ def extract_records(code, module=None, is_std_module=True, caret=None):
         if m_decl:
             priv = _is_private(KIND_PROC, has_priv_kw, has_pub_kw, is_std_module)
             add(m_decl.group(1), None, priv)
+            add_proc(m_decl.group(1))
             pm = re.search(r"\((.*)\)", line)
             if pm:
                 for p in _params_inside(pm.group(1)):
@@ -336,6 +361,7 @@ def extract_records(code, module=None, is_std_module=True, caret=None):
             proc = m_sub.group(1)
             priv = _is_private(KIND_PROC, has_priv_kw, has_pub_kw, is_std_module)
             add(proc, None, priv)
+            add_proc(proc)
             cur_proc = proc_key(proc)      # 第 2 次同名起带 `#序号`
             pm = re.search(r"\((.*)\)", line)
             if pm:
@@ -349,6 +375,7 @@ def extract_records(code, module=None, is_std_module=True, caret=None):
             proc = m_prop.group(1)
             priv = _is_private(KIND_PROC, has_priv_kw, has_pub_kw, is_std_module)
             add(proc, None, priv)
+            add_proc(proc)
             cur_proc = proc_key(proc)
             pm = re.search(r"\((.*)\)", line)
             if pm:
@@ -383,7 +410,9 @@ def extract_records(code, module=None, is_std_module=True, caret=None):
                     add(nm, None, priv)
             continue
 
-    return result
+    # ★v98：返回 (记录列表, 过程名集合)。⚠️ 第二项是新加的，调用方要按
+    # 二元组解包 —— 保持"只有这一个 return"是为了不给未来再加一路留坑。
+    return result, proc_names
 
 
 # ---------------------------------------------------------------------------
@@ -1100,7 +1129,7 @@ def extract_implicit_records(code, module=None, is_std_module=True,
             declared_global.add(n)
 
     def _declare_from_records():
-        for n, _m, p, _pr in extract_records(code, module, is_std_module):
+        for n, _m, p, _pr in extract_records(code, module, is_std_module)[0]:
             _note_declared(n, p)
 
     if declared is None:
@@ -1278,7 +1307,7 @@ def extract_scoped(code):
     """
     out = []
     seen = set()
-    for name, _module, proc, _priv in extract_records(code, module=None, is_std_module=True):
+    for name, _module, proc, _priv in extract_records(code, module=None, is_std_module=True)[0]:
         scope = proc  # 模块级 proc=None -> None
         key = (name.lower(), scope.lower() if scope else None)
         if key not in seen:
@@ -1469,6 +1498,209 @@ def proc_owns_line(code, line_no, name):
                 return False
         idx -= 1
     return False
+
+
+def var_types(code):
+    """★v98：返回 {变量名(小写): 类型名(小写,可能带模块限定)}。
+
+    只收**写明类型的**声明（`Dim c As Cls` / `Set c = New Cls` / 形参 `ByVal x As Cls`
+    / `Property Let x As Cls`），**隐式变量一律不收** —— 没法推断它的类型，
+    硬猜只会把候选收错。
+
+    为什么需要它：`c.` 的候选该收进"c 的类型"的成员里，而要拿到类型就得先有
+    "变量 → 类型"这张表。宿主对象（`Range` / `Worksheet` / `Application`）同理：
+    `r.` 该只提示 `Range` 的成员，而不是全工程。
+
+    ⚠️ 同名遮蔽按**先声明者胜**（VBA 里同一作用域不能重 Dim 同名），跨过程同名
+    则取第一个 —— 判不准则查不到类型，查不到时上层走"不收窄"的兜底，
+    绝不会把候选收得过窄。
+    """
+    out = {}
+    masked = _mask_strings_and_comments(code)
+    masked = _RE_CONTINUATION.sub(" ", masked)
+    cur_proc = None
+
+    def note(name, type_name):
+        if not name or not type_name:
+            return
+        k = str(name).lower()
+        if k not in out:
+            out[k] = str(type_name).lower()
+
+    for raw in masked.split("\n"):
+        line = raw.strip()
+        if not line:
+            continue
+        if _RE_PROC_END.match(line):
+            cur_proc = None
+            continue
+        m_sub = _RE_SUB.match(line)
+        if m_sub:
+            cur_proc = m_sub.group(1)
+            note(m_sub.group(1), None)      # 过程名本身不是变量
+            for p, t in _params_with_types(line):
+                note(p, t)
+            continue
+        m_prop = _RE_PROP.match(line)
+        if m_prop:
+            cur_proc = m_prop.group(1)
+            for p, t in _params_with_types(line):
+                note(p, t)
+            continue
+        if _RE_DECLARE.match(line):
+            continue
+        if _RE_CONST.search(line) or _RE_SKIP_LINE.match(line):
+            continue
+        if _RE_TYPE.match(line) or _RE_ENUM.match(line):
+            # Type / Enum 块的成员是字段名，不是变量，跳过整块
+            continue
+        # Dim / Private / Public / Static / 形参里的 `name As Type`
+        if _RE_DECL.search(line) or " As " in line or line.lower().endswith(" as"):
+            for nm, t in _as_pairs(line):
+                note(nm, t)
+        # `Set c = New Cls` / `c = New Cls`：右侧 New 后面就是类型
+        m_new = re.search(r"=\s*New\s+(?:" + _IDENT + r"(?:\s*\.\s*" + _IDENT
+                         + r")?)", line, re.I)
+        if m_new:
+            left = line[:m_new.start()].rstrip()
+            m_lv = re.search(r"(" + _IDENT + r")\s*$", left)
+            if m_lv:
+                t = m_new.group(0).split("New", 1)[1].strip().replace(" ", "")
+                note(m_lv.group(1), t)
+    return out
+
+
+def _as_pairs(line):
+    """从一行里取出所有 `名字 As 类型` 的对子（纯函数）。"""
+    out = []
+    for m in re.finditer(r"(" + _IDENT + r")\s+As\s+(?:New\s+)?(" + _IDENT
+                         + r"(?:\s*\.\s*" + _IDENT + r")?)", line, re.I):
+        out.append((m.group(1), m.group(2)))
+    return out
+
+
+def _params_with_types(line):
+    """从过程头里取出所有 `(形参名 As 类型)` 的对子（纯函数）。"""
+    pm = re.search(r"\((.*)\)", line)
+    if not pm:
+        return []
+    return _as_pairs(pm.group(1))
+
+
+def ident_before_dot(line_text, caret_col):
+    """★v98：光标左边若紧跟着一个点号，返回点号再往左那个**标识符**；否则 None。
+
+    纯取值，**不做"是不是成员位置"的判断** —— 那道判据（含 `1.5` 小数点、
+    字符串收尾引号、`Rem` 注释等全部守卫）是 engine._member_list_dot_col 的
+    唯一实现，本函数只负责"拿到名字"这一步。
+
+    为什么不让本函数也判：同一判据写两份必然悄悄分叉 —— v87 与 v93 各栽过一次
+    （见 MEMORY 第 14 / 17 条）。
+
+    caret_col：1-based 字符列（光标左边 = line_text[:caret_col-1]）。
+    """
+    if not line_text or not caret_col or caret_col < 1:
+        return None
+    i = min(int(caret_col) - 1, len(line_text))
+    # 跳过光标左边正在输入的成员名
+    if i > 0 and line_text[i - 1] == ".":
+        k = i - 1
+    else:
+        j = i - 1
+        while j >= 0 and (line_text[j].isalnum() or line_text[j] == "_"):
+            j -= 1
+        k = j
+        while k >= 0 and line_text[k] in " \t":
+            k -= 1
+        if k < 0 or line_text[k] != ".":
+            return None
+    # 点号左边：往回取一个标识符（`c` / `Cls` / 带模块限定的最后一段）
+    m = k - 1
+    while m >= 0 and line_text[m] in " \t":
+        m -= 1
+    e = m + 1
+    while m >= 0 and (line_text[m].isalnum() or line_text[m] == "_"):
+        m -= 1
+    if m + 1 >= e:
+        return None                       # 点号左边不是标识符（`) .` / `] .` …）
+    seg = line_text[m + 1:e]
+    # `1.5` 的小数点：整段是纯数字，它不是变量名。真正的成员位置判据
+    # （engine._member_list_dot_col）也会拦这一条，这里再挡一道是为了让本函数
+    # **单独用**时也是安全的 —— 纯数字查 var_types 必然查不到，
+    # 上层会走"不收窄"兜底，但让函数语义干净些。
+    if seg.isdigit():
+        return None
+    return seg
+
+
+def public_members(code, is_std_module=False):
+    """★v98：返回这个模块里**从外部（经实例或限定名）访问时可见**的成员名
+    （保留原大小写）。
+
+    用户口径："我定义了一个类 cls，在模块里我写 `set c = new cls`、
+    `c.te` 的时候，应该提示 cls 类的内部成员，而不是提示 temp。" —— 也就是说，
+    光标停在 `c.` 之后时，候选范围必须**收进这个对象的类型里**，而不是全工程。
+
+    口径（按 VBA 实际语义，与 extract_records 的 priv 字段**含义不同**，别混）：
+
+      * 标准模块（is_std_module=True）—— 模块级成员一律可见，**全收**；
+        过程内的局部变量与形参不收（`m1.` 访问不到别的过程的局部变量）。
+      * 类 / 窗体 / 文档模块 —— 只有**显式写了 `Public`** 的成员才能从外部
+        访问（`c.Reset` 行，`c.Hidden` 编译不过）；`Private` 的、以及不带
+        关键字的（类里 `Sub Foo` 默认 Public 但那是指"作为成员可访问"，
+        不带关键字的**变量**则默认私有不收）都不该在 `c.` 后提示。
+        过程内的局部变量 / 形参一律不收。
+
+    ⚠️ 为什么不能沿用 extract_records 的 `priv` 字段：那里的 priv=True 意思是
+    "**不能裸名写**"（类成员都是这样，连 `Public Sub` 也是），而这里要问的是
+    "**能不能经实例访问**" —— 两个是不同的问题，`Public Sub` 属于
+    "不能裸写（priv=True）但能经实例访问（这里要收）"。所以这里自己认
+    `Public` / `Global` / `Friend` 关键字。
+    """
+    out = []
+    seen = set()
+    masked = _mask_strings_and_comments(code)
+    masked = _RE_CONTINUATION.sub(" ", masked)
+    cur_proc = None
+    for raw in masked.split("\n"):
+        line = raw.strip()
+        if not line:
+            continue
+        if _RE_PROC_END.match(line):
+            cur_proc = None
+            continue
+        has_pub = bool(_RE_LEAD_PUBLIC.match(line))
+        has_priv = bool(_RE_LEAD_PRIVATE.match(line))
+        m = _RE_SUB.match(line) or _RE_PROP.match(line)
+        if m:
+            cur_proc = m.group(1)
+            if is_std_module or has_pub:
+                _add_pm(out, seen, m.group(1))
+            continue
+        if _RE_DECLARE.match(line):
+            continue
+        if _RE_TYPE.match(line) or _RE_ENUM.match(line) \
+                or _RE_CONST.search(line) or _RE_SKIP_LINE.match(line):
+            continue
+        # 模块级变量声明：Dim / Private / Public / Static
+        if cur_proc is not None:
+            continue                      # 过程内的局部变量：外部访问不到
+        if _RE_DECL.search(line):
+            if is_std_module or (has_pub and not has_priv):
+                for nm in _decl_names(_RE_DECL.sub("", line, count=1).strip()):
+                    _add_pm(out, seen, nm)
+            continue
+    return out
+
+
+def _add_pm(out, seen, name):
+    """public_members 的去重收集（保序）。纯函数。"""
+    if not name:
+        return
+    k = str(name).lower()
+    if k not in seen:
+        seen.add(k)
+        out.append(name)
 
 
 def extract_identifiers(code):

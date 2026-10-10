@@ -29,6 +29,9 @@ import time
 
 import parser as vba_parser
 
+# ★v98：内建数据类型名（小写）的惰性缓存。首次用时才 import vba_builtins。
+_BUILTIN_TYPE_NAMES_LOW = None
+
 from log import log as _log
 from log import LOG_ENABLED as _LOG_ENABLED
 
@@ -1317,6 +1320,126 @@ class Completer:
         except Exception:
             return set()
 
+    def _proc_names(self):
+        """后端给出的"工程里所有过程名"（小写集合）—— Sub / Function /
+        Property / Declare。★v98 新增。可选接口。
+
+        存在的理由只有一个：`declared_names` 是"Dim / Const / Sub / Function /
+        Type / Enum 加组件名"的合集，**分不出变量与函数**。而"这次补全要不要
+        自动补 `()`"只有对过程才该做 —— `Dim n As <这里>` 补成 `Long()` 编译
+        就过不去。
+
+        后端不提供时返回空集 → 引擎一律**不补括号**（旧式 / 测试后端行为不变，
+        也是"判据缺失就不动手"的兜底）。
+        """
+        hook = getattr(self.backend, "get_proc_names", None)
+        if not callable(hook):
+            return frozenset()
+        try:
+            return frozenset(str(n).lower() for n in (hook() or ()))
+        except Exception:
+            return frozenset()
+
+    def _narrow_to_member_type(self, visible_ids, ctx):
+        """★v98：光标在 `标识符.` 之后时，把候选收进那个对象的类型。返回新列表，
+        收不了就**原样返回** `visible_ids`。
+
+        判定链（任何一步拿不到证据就原样返回，绝不收窄）：
+          1) 光标在不在成员位置（`_member_list_dot_col` 那一份判据，v93 合并过）；
+          2) `get_context` 给的点号左边标识符名（`member_root_name`）；
+          3) 那个变量的**声明类型**（后端 `get_var_type`）；
+          4) 那个类型的**对外可见成员**（后端 `get_members_of`）。
+
+        ⚠️ 为什么"查到了类型、但一个候选都没收进来"时退回全工程而不是收起窗：
+        那说明**可见性口径与成员口径对不上**（多半是这批成员在别的模块、
+        或被 `filter_identifiers_by_scope` 判成不可见）。这种情况下贸然收窄的
+        后果是"该提示的一个都没有"——用户看到的是空窗，那比多给几个候选糟得多
+        （这正是项目第 10 条：宁可少提示，也不要让人以为功能坏了）。
+
+        ⚠️ 收窄后候选**变少但非空**是正常的（`c.` 只剩 `Cls` 的成员），这时就
+        用收窄后的那批 —— 用户要的正是在 `Cls` 的成员里挑。
+        """
+        try:
+            line_text = ctx.get("line_text")
+            caret_col = ctx.get("caret_col")
+            if _member_list_dot_col(line_text, caret_col) is None:
+                return visible_ids                    # 不在成员位置，不动
+            root = str(ctx.get("member_root_name") or "")
+            if not root:
+                return visible_ids
+            get_type = getattr(self.backend, "get_var_type", None)
+            get_members = getattr(self.backend, "get_members_of", None)
+            if not callable(get_type) or not callable(get_members):
+                return visible_ids
+            type_name = get_type(root)
+            if not type_name:
+                return visible_ids                    # 判不出类型 -> 不收窄
+            members = get_members(type_name)
+            if not members:
+                return visible_ids                    # 查不到成员 -> 不收窄
+            # ★★ 收窄的候选**不能只从 visible_ids 里挑**。
+            #
+            # visible_ids 是"当前【裸名】可见"的名字，而 `c.` 要的是"经实例
+            # 可见"的名字 —— 这两个口径本就不同：类模块的成员对别的模块来说
+            # 永远"不可裸名访问"（parser._is_private 把它们记成 priv=True），
+            # 于是它们在 filter_identifiers_by_scope 那一关就被丢掉了。
+            # 拿过滤后的池子去挑，结果永远是"一个都不匹配" ⇒ 收窄永远失效
+            # （实测：收窄被调用、返回原列表，`temp` 照样在候选里）。
+            #
+            # 所以直接用 members 本身当候选来源，再按当前输入做模糊匹配 ——
+            # 这才是 `c.` 后面该出现的东西。
+            _log("member-narrow: %r 的类型=%r 对外成员 %d 条 -> 收窄"
+                 % (root, type_name, len(members)))
+            # ★★ 这批候选是【确证】的，下面的回声防护必须跳过它们。
+            #
+            # 回声防护问的是"这个名字在工程里【出现过】吗"（判用户敲的词是不是
+            # 退格残留下来的幻影）。可这批名字来自**类型的定义** —— `Cls` 模块里
+            # 确实写着 `Public Sub TestMethod`，它不是幻影，甚至可能整个工程里
+            # **一次都没被引用过**（当前模块的文本里当然也扫不到）。
+            # 不跳过的后果实测很明确：候选被回声防护全剔光，弹窗在 `c.te`
+            # 之后一条都不出（比不收窄还糟 —— 用户看到的就是"工具坏了"）。
+            self._member_narrowed = True
+            return sorted(members)
+        except Exception:
+            return visible_ids
+
+    def _builtin_type_names(self):
+        """内建**数据类型**名（小写集合）—— Long / String / Object …。★v98。
+
+        为什么要单独减掉它们：`vba_builtins` 把内建**函数与数据类型**收在同
+        一批清单里（都属于"语言自带词汇"），不区分的话 `_is_callable_name`
+        会认为 `Long` 也能调用 ⇒ `Dim n As Long` 补成 `Dim n As Long()`。
+
+        惰性取：vba_builtins 只被这一处用到，而它是个几百行的常量模块 ——
+        顶层 import 会拖慢每次启动（虽然只有一次，但没必要）。
+        """
+        global _BUILTIN_TYPE_NAMES_LOW
+        if _BUILTIN_TYPE_NAMES_LOW is None:
+            try:
+                import vba_builtins as _vb
+                _BUILTIN_TYPE_NAMES_LOW = frozenset(
+                    str(t).lower() for t in _vb.BUILTIN_TYPE_NAMES)
+            except Exception:
+                _BUILTIN_TYPE_NAMES_LOW = frozenset()
+        return _BUILTIN_TYPE_NAMES_LOW
+
+    def _is_callable_name(self, name):
+        """这个名字能不能被调用（该补括号）。★v98。
+
+        两路证据，任一为真即可：
+          * 工程内过程名（`get_proc_names()`）—— 用户自己写的 Sub/Function/
+            Property/Declare；
+          * VBA 语言自带的名字（`_builtin_names()`）里、且**不是数据类型** ——
+            `MsgBox` / `Left` / `Split` 该补，`Long` / `String` / `Object`
+            不该补（那是 `As` 后面的类型）。
+        """
+        low = str(name).lower()
+        if low in self._proc_names():
+            return True
+        if low in self._builtin_names():
+            return low not in self._builtin_type_names()
+        return False
+
     def _host_enum_names(self):
         """后端给出的"宿主类型库枚举常量" -> {小写名: 最短输入长度}。可选接口。
 
@@ -1446,6 +1569,10 @@ class Completer:
         # 结构性名字的集合按"一次触发"取一份快照（v67）：本次触发里所有回声
         # 判定复用同一份，别再逐个候选重建（那会退化成 O(候选数 × 集合大小)）。
         self._struct_cache = None
+        # ★v98：本次触发是否收窄成了"某对象的成员"。收窄后的候选是【确证】的
+        # （来自类型的定义），要跳过回声防护 —— 见 _narrow_to_member_type。
+        # 每次触发开头重置，绝不跨触发沿用。
+        self._member_narrowed = False
         ctx = self.backend.get_context()
         if ctx is None:
             self.hide()
@@ -1775,6 +1902,25 @@ class Completer:
             ctx.get("proc_name"),
             ctx.get("module_name"),
         )
+        # ★v98：成员访问位置（`c.`）把候选**收进这个对象的类型**。
+        #
+        # 用户口径（原话）："我定义了一个类 cls，在模块里我写
+        # `set c = new cls`、`c.te`，我输入 `.te` 的时候，应该提示 cls 类的
+        # 内部成员，而不是提示 temp。" —— 之前出的是**全工程候选**，
+        # `temp`（本过程的局部变量）就混在里面。
+        #
+        # 为什么会出全工程候选：点号位置我们**全程让位**给 VBE 的成员列表
+        # （见上面那段），可 VBE 要先把 `c` 的类型解析出来才弹列表 ——
+        # `Set c = New Cls` 刚敲完还没编译时它解析不出来，就一个窗都不弹；
+        # 宽限期（YIELD_GRACE）一到，走"照常出候选"那条补位路径，而那条
+        # 路径出的是全工程候选。v73 修的是"让位后没东西给"，没修"补回来的
+        # 那些东西该不该是这个对象的成员"。
+        #
+        # ⚠️ 收窄只在【真的查到了这个类型的成员】时做。查不到（类型没写明 /
+        # 隐式变量 / 宿主对象如 Range / 类型名拼错）就**照旧给全工程候选** ——
+        # 宁可多提示，也绝不把用户要的那个成员挡掉。变量名 `c` 查不到类型时
+        # 这条不生效，`c.` 仍会像以前一样出全工程候选。
+        visible_ids = self._narrow_to_member_type(visible_ids, ctx)
         # 候选 = 输入串按顺序出现在名字里即命中（模糊匹配，不要求从头开始）。
         # 例：dataArr / dataSheet 两个变量——
         #   输入 ts -> dataSheet（datasheet 里没有连续的 "ts"，按词边界命中 t 和 S）
@@ -2076,6 +2222,11 @@ class Completer:
                 return low_word in name.lower()
 
             echoes = [m for m in matches if _is_echo_candidate(m)]
+            # ★v98：收窄成"某对象的成员"之后，这批候选已确证，整体跳过回声
+            # 防护（理由见 _narrow_to_member_type 里那段：回声防护问的是"这个名字
+            # 在工程里出现过吗"，而类型的成员可能整个工程一次都没被引用过）。
+            if echoes and self._member_narrowed:
+                echoes = []
             if echoes:
                 try:
                     declared = self._declared_names()
@@ -2245,9 +2396,22 @@ class Completer:
             self._accepted = None
         try:
             end_col = ctx.get("word_end_col") or ctx.get("caret_col")
-            self.backend.apply_completion(
-                ctx["line_no"], ctx["word_start_col"], end_col, chosen
-            )
+            # ★v98：这个候选是过程/函数才请求补括号。判据在引擎这边
+            # （`_is_callable_name`：工程内过程名，或语言自带且非数据类型），
+            # 后端只判"位置允不允许"（`_is_call_site`，挡掉 `Dim x As <这里>`）。
+            # 两边职责分开，任何一边拿不到证据都只是"不补"，不会补坏代码。
+            try:
+                _want_parens = self._is_callable_name(chosen)
+            except Exception:
+                _want_parens = False
+            try:
+                self.backend.apply_completion(
+                    ctx["line_no"], ctx["word_start_col"], end_col, chosen,
+                    _want_parens)
+            except TypeError:
+                # 旧式 / 测试后端的 apply_completion 只有 4 个位置参数。
+                self.backend.apply_completion(
+                    ctx["line_no"], ctx["word_start_col"], end_col, chosen)
         except Exception:
             # 插入失败也要保证状态复位，否则弹窗会卡住不再触发
             pass

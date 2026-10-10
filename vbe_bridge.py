@@ -163,6 +163,19 @@ _RE_LEADING_WS = re.compile(r"[ \t]*")
 #   True —— 恢复旧行为：收集 VBE 里所有工程的标识符。
 ENABLE_CROSS_PROJECT = False
 
+# ★v98 补全时自动补括号 —— 只在【调用点】补，不在声明处补。
+#
+# 用户口径："选中函数（包括 vba 本身函数）或过程提示词，按 tab 后，应该能在
+# 函数或过程名后面自动补全双括号，并且光标能正确落在括号内。"
+#
+# 为什么必须限定"调用点"：VBE 的**语法**在声明处与调用处不同 —— 声明处
+# `Function f` 后面本来就要跟 `()`（VBE 自己也会补），调用处 `f` 后面**不跟**
+# 括号才是合法的裸引用。真正会编译不过的是那些"两边都不该带括号"的位置：
+#   Dim n As Long   ->  Long()   ✘
+#   If x = Long Then ->  Long()   ✘
+# 所以判据是"【这一行的这个位置】是不是一个可以直接调用过程的位置"。
+AUTO_PAREN_ON_COMPLETE = _env_flag("VBECOMPLETE_AUTO_PAREN", True)
+
 def _co_free():
     """释放 pywin32 缓存的 COM 代理（仅在显式开启时才会真正调用）。
 
@@ -1310,6 +1323,55 @@ def _find_completion_end(text, completion, near0, fallback0):
     if best is not None:
         return best + L
     return min(fallback0, len(text))
+
+
+def _is_call_site(line_text, word_start_col):
+    """这一行的这个词位置，是不是一个**可以直接调用过程**的位置。纯函数。
+
+    ★v98：决定"补全时要不要自动补 `()`"的那道闸门 —— 补错了就是坏代码，
+    而最容易被补坏的就是**类型名位置**（`Dim n As <这里>` / `Dim o As <这里>` /
+    `Property Set o = <这里>` / `Function f() As <这里>`）：VBA 里数据类型后面
+    不能带括号，补成 `Dim n As Long()` 编译就过不去。
+    所以判据的核心一句话：**这个词的前一个字，是【可以接收一个调用表达式】的
+    那个位置**，还是【紧跟在 `As` 后面当类型用】的那个位置。
+
+    line_text     : 该行文本
+    word_start_col: 补全词起始的 1-based **字符**列（与 Python 下标一致 +1）
+    """
+    try:
+        i = int(word_start_col) - 1
+        if i < 0:
+            return True                       # 行首裸词（Call Foo / Foo 1）→ 可以
+        # 词左边紧邻的字符（跳过空白）。没有左边 ⇒ 行首 ⇒ 可以。
+        j = i - 1
+        while j >= 0 and line_text[j] in " \t":
+            j -= 1
+        if j < 0:
+            return True
+        # ---- ⚠️ 这两条判据必须一起用切片看，**不能**拿"跳过空白后的那个字符"
+        #    去比字面：`As Long` 里 `Long` 的前一格是【空格】，不是 `s`。
+        #    （我第一版写成 `prev in "sS"` ⇒ As 分支永远不成立，实测 3 条红；
+        #     New 那条因为用了切片才侥幸对。）所以：向左扫掉空白后，
+        #    取最后 2~3 个字符做小写比较。
+        tail = line_text[:j + 1].lower().rstrip(" \t")
+        # `As` 类型位置：`Dim n As Long` / `Function f() As Long` / `Set p As Cls`
+        # 补成 `Long()` 编译不过 —— 数据类型后面不能带括号。
+        if tail.endswith("as"):
+            return False
+        # `New` 类型位置：`Set fso = New FileSystemObject` —— New 要的是
+        # 类型表达式，不是调用，补成 `FileSystemObject()` 是语法错误。
+        if tail.endswith("new"):
+            return False
+        # 点号左边：这是【成员访问】。`obj.method` 可以补括号，
+        # `obj.prop` 补了就错了 —— 但我们分不清成员是方法还是属性，
+        # 而用户明确要求"选中函数或过程提示词后补括号" ⇒ 这里放行，
+        # 让 VBE 自己裁决（真写成属性时 VBE 会当场报"不能带参数"）。
+        # ⚠️ 这条也覆盖 `Range("A1").method`。
+        # 其余情况（= + 运算符 / , / ( / 空白 / 行首 …）都可以是调用点。
+        return True
+    except Exception:
+        # 判据出错就【不补】—— 宁可少补，也不要把用户的代码写坏。
+        return False
 
 
 def _skip_into_parens(actual, end0, orig_line, orig_caret_col):
@@ -2692,6 +2754,15 @@ class VbeBackend:
         self._cache = None
         self._cache_time = 0
         self._declared_names = set()
+        # ★v98：全工程的过程名（小写）—— Sub / Function / Property / Declare。
+        # 与 _declared_names 的差别：后者是"Dim/Const/Sub/Function/Type/Enum 都算"
+        # 的合集，**分不出变量与函数**；补全补括号只对后者里的过程/函数该做
+        # （`Dim n As Long` 补成 `Long()` 直接编译不过）。收集时由
+        # parser.extract_records 一并给出，不额外读代码、不额外打 COM。
+        self._proc_names = set()
+        # ★v98：{类型名(小写): (收集时间戳, 成员名小写集合)}。
+        # 与 _cache_time 同一个 TTL（get_members_of 里比对）。
+        self._members_of_cache = {}
         # 收集标识符那一刻，光标处那个词的原文（小写）。用来识别【回声】：
         # 用户正在输入 / 正在回退删除的词，不该被当成工程里的真名字。
         self._caret_word = ""
@@ -2801,7 +2872,35 @@ class VbeBackend:
         ids = self._collect_identifiers()
         self._cache = ids
         self._cache_time = now
+        # ★v98：成员表跟着标识符池一起作废（同一个 TTL、同一个刷新点）——
+        # 留着上一轮的结果会在用户新写了一个 Public 成员之后还看不到它。
+        self._members_of_cache = {}
         return ids
+
+    def get_proc_names(self):
+        """返回工程里所有【过程名】（小写集合）—— Sub / Function / Property /
+        Declare。★v98：用来判断"这次补全该不该自动补括号"。
+
+        与 get_declared_names 的分工：后者是"Dim / Const / Sub / Function /
+        Type / Enum 加组件名"的合集，**分不出变量与函数**。补括号只对过程该做 ——
+        `Dim n As Long` 补成 `Long()` 会被 VBE 报编译错误。
+
+        ⚠️ 直接交回内部集合（**只读，调用方不得修改**），理由同
+        get_structural_names：这一路是【按一次补全】查的，不必为它复制一份。
+
+        ⚠️ 集合里是**小写**名（与 get_proc_names / get_builtin_names 同口径）。
+        代价是候选窗在 `c.` 位置可能显示成小写 —— 但那一处 VBE 自己弹得出
+        成员列表（带原大小写），我们的名单只是"VBE 还没弹出来"时的兜底，
+        优先级远低于保真。
+        """
+        if not getattr(self, "_proc_names", None):
+            # 空就现收一次（顺带把标识符池建起来）—— 只判 None/空会把
+            # "还没收集过"当成"工程里一个过程都没有"。
+            try:
+                self.get_identifiers()
+            except Exception:
+                return frozenset()
+        return frozenset(getattr(self, "_proc_names", None) or ())
 
     def get_declared_names(self):
         """返回工程里真实声明过的名字（小写集合），供引擎剔除"提示自己"的幻影。
@@ -2990,6 +3089,9 @@ class VbeBackend:
         # 供引擎层区分"真名字"与"幻影"：回退删字回退出来的未定义词（如 numA）
         # 只可能是隐式残留 / 正在敲的词本身，引擎据此剔除"提示自己"。
         declared_names = set()
+        # ★v98：过程名（Sub / Function / Property / Declare），随 extract_records
+        # 一并返回 —— 与 declared_names 的差别见 __init__ 里的说明。
+        proc_names = set()
         # 结构性名字：组件名 + 窗体控件名（v60）+ 语言自带名字（v61/v62）。
         # 详见 __init__ 里的说明。
         structural_names = set()
@@ -3058,9 +3160,10 @@ class VbeBackend:
                     # 代码里自定义的 Type / Enum 名同样是类型名
                     for tn in vba_parser.extract_type_enum_names(code):
                         type_names.add(tn)
-                    recs = vba_parser.extract_records(
+                    recs, _proc_of = vba_parser.extract_records(
                         code, module=mod_name, is_std_module=is_std,
                         caret=apply_caret)
+                    proc_names |= _proc_of
                     records.extend(recs)
                     # 记下【这一刻光标处的词】：它多半是用户正在输入 / 正在
                     # 回退删除的词。回退删字时，缓存的池子里还留着它更长的
@@ -3263,6 +3366,7 @@ class VbeBackend:
 
         self._type_names = type_names
         self._declared_names = declared_names
+        self._proc_names = proc_names
         self._declared_by_module = _decl_by_mod
         self._structural_names = structural_names
         self._builtin_names = builtin_names
@@ -3271,6 +3375,86 @@ class VbeBackend:
         if len(records) != getattr(self, "_last_id_count", -1):
             self._last_id_count = len(records)
         return records
+
+    def get_var_type(self, var_name):
+        """★v98：查一个变量的**声明类型名**（小写）；查不到返回 None。
+
+        只读【当前模块】的代码，用 `parser.var_types` 建表 —— 变量可能声明在
+        当前模块的任何一个过程里，所以要读整个模块（`Lines(1, CountOfLines)`
+        一次，与 `names_outside_caret` 同量级的一次读）。
+
+        返回 None 的情形都交给上层走"不收窄"的兜底：类型没写明、隐式变量、
+        宿主对象类型（`Range` 这类不在本工程里，自然也查不到成员）。
+        """
+        if not var_name:
+            return None
+        try:
+            vbe = _get_vbe_cached()
+            if vbe is None:
+                return None
+            cp = vbe.ActiveCodePane
+            if cp is None:
+                return None
+            cm = cp.CodeModule
+            cnt = int(cm.CountOfLines)
+            if cnt <= 0:
+                return None
+            vt = vba_parser.var_types(cm.Lines(1, cnt))
+            return vt.get(str(var_name).lower())
+        except Exception:
+            return None
+
+    def get_members_of(self, type_name):
+        """★v98：返回某个类型（类模块 / 窗体 / 标准模块）**对外可见**的成员名。
+
+        供引擎在 `对象.` 之后收窄候选：用户口径是"c.te 应该提示 cls 类的内部
+        成员，而不是提示 temp"。可见性口径见 `parser.public_members`。
+
+        type_name : 类型名（可带模块限定，如 `Sheet1.Parent`）。大小写不敏感。
+
+        返回小写集合；**查不到就返回空集合** —— 调用方把"空"理解成
+        "不知道这个类型的成员"，于是走"不收窄"的兜底（宁可多提示，也绝不
+        把该提示的成员挡掉）。
+
+        ⚠️ 只走**当前活动工程**，且逐个组件现读现算、结果缓存到收集周期结束 ——
+        与 get_identifiers 同一个 TTL，不额外打 COM。
+        """
+        if not type_name:
+            return frozenset()
+        key = str(type_name).split(".")[-1].strip().lower()
+        if not key:
+            return frozenset()
+        cache = getattr(self, "_members_of_cache", None)
+        if cache is None:
+            cache = self._members_of_cache = {}
+        stamp = getattr(self, "_cache_time", 0)
+        hit = cache.get(key)
+        if hit is not None and hit[0] == stamp:
+            return hit[1]
+        out = frozenset()
+        try:
+            vbe = _get_vbe_cached()
+            if vbe is not None:
+                caret_mod, _caret = _caret_position(vbe)
+                for comp in _collect_components(vbe, caret_mod):
+                    try:
+                        if str(comp.Name).lower() != key:
+                            continue
+                        cm = comp.CodeModule
+                        cnt = int(cm.CountOfLines)
+                        if cnt <= 0:
+                            break
+                        code = cm.Lines(1, cnt)
+                        out = frozenset(
+                            str(n).lower() for n in vba_parser.public_members(
+                                code, is_std_module=_is_std_module(comp.Type)))
+                        break
+                    except Exception:
+                        continue
+        except Exception:
+            out = frozenset()
+        cache[key] = (stamp, out)
+        return out
 
     def get_type_names(self):
         """返回可作为「数据类型名」使用的名字（窗体/类模块/标准模块名、Type/Enum 名）。
@@ -3555,6 +3739,24 @@ class VbeBackend:
                 module_name = str(cm.Name)
             except Exception:
                 module_name = None
+
+            # ★v98：`标识符.` 左边那个标识符的名字（如 `c.` 里的 `c`）。
+            #
+            # ⚠️ 这里**只取名字、不取类型**，而且"是不是成员位置"那道判据
+            # 也**不在这里判** —— 它归 engine 的 `_member_list_dot_col`
+            # 一家（v93 把它合并成唯一实现，理由见那里的注释：同一判据写两份
+            # 必然悄悄分叉）。engine 判完"是成员位置"之后，自己拿这个名字来
+            # 问类型、问成员。
+            #
+            # 所以本函数只做纯取值：光标左边正在输入的成员名不算，往回找到
+            # 点号，再取点号左边紧邻的标识符；取不到就返回 None。
+            member_root_name = None
+            try:
+                member_root_name = vba_parser.ident_before_dot(
+                    line_text, ec_char)
+            except Exception:
+                member_root_name = None
+
             return {
                 "line_no": sl,
                 "caret_col": ec_char,          # 字符列（1-based）
@@ -3566,12 +3768,16 @@ class VbeBackend:
                 "decl_names": decl_names,
                 "proc_name": _proc_of_line(cm, sl),
                 "module_name": module_name,
+                # ★v98：点号左边那个标识符的名字；None = 那里没有标识符。
+                # "是不是成员位置"由 engine 判（见上面那段说明）。
+                "member_root_name": member_root_name,
             }
         except Exception:
             return None
 
     # ---- 应用补全 ----
-    def apply_completion(self, line_no, word_start_col, end_col, completion):
+    def apply_completion(self, line_no, word_start_col, end_col, completion,
+                         want_parens=False):
         """把 [word_start_col, end_col) 区间的单词替换为 completion 并写回 VBE。
 
         word_start_col / end_col 均为 1-based 字符列（与 Python 行文本一致）。
@@ -3579,6 +3785,11 @@ class VbeBackend:
         （按 Delete 从名字开头删字符，v44）或【中间】（从名字中间删字符，v46）时
         它才大于光标列——此时要把光标右边那段残留名字一起换掉，否则会在残留词
         前面插入候选、拼出双份名字。
+
+        want_parens（★v98）：True 时，若该位置是【调用点】（`_is_call_site`）
+        且词右边本来没有左括号，就在补全词后面补一对 `()` 并把光标送进去。
+        **调用方必须先确认 completion 确实是过程/函数**（引擎用
+        `get_proc_names()` 判）—— 这里只管"位置允不允许"，不管"是什么"。
 
         写回后把光标放到补全词尾部：
           - 若该行(含 Tab/全角)在 VBE 里按"显示列"计，就把字符列换算成显示列，
@@ -3596,6 +3807,20 @@ class VbeBackend:
             line_text = cm.Lines(line_no, 1)
             new_line = replace_word(line_text, word_start_col, end_col, completion)
 
+            # ★v98：补括号。判据全在这三行，且**任何一步不确定就不补**
+            # —— 补坏代码的代价远大于少补一对括号。
+            added_parens = False
+            if want_parens and AUTO_PAREN_ON_COMPLETE \
+                    and _is_call_site(line_text, word_start_col):
+                # 补全词右边的第一个非空白字符；已经紧跟 `(` 就不补
+                # （`x = getVa|(1)` 这种括号本来就有的调用点）。
+                k = word_start_col - 1 + len(completion)
+                while k < len(new_line) and new_line[k] in " \t":
+                    k += 1
+                if not (k < len(new_line) and new_line[k] == "("):
+                    new_line = new_line[:k] + "()" + new_line[k:]
+                    added_parens = True
+
             # 词尾字符下标（0-based）
             start0 = max(0, word_start_col - 1)
             end0 = start0 + len(completion)
@@ -3609,6 +3834,10 @@ class VbeBackend:
             end0 = min(end0, len(actual))
             # VBE 自动补的括号（`Function gCalc` -> `Function gCalc()`）：
             # 光标要落进括号里，否则停在左括号左侧还得手动右移一格。
+            #
+            # ★v98：这一条同时负责**我们自己在 v98 补的那对括号** —— 上面的
+            # 插入位置恰好是词尾，所以 `actual[end0]` 就是那个新 `(`，这里
+            # 自然把光标送进括号里，逻辑完全复用、不必另写一段。
             end0 = _skip_into_parens(actual, end0, line_text, end_col)
             end0 = min(end0, len(actual))
 
