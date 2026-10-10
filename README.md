@@ -9,8 +9,8 @@
 ## 技术栈
 
 - **Python** + `pywin32`（驱动 VBA 编辑器 COM）+ `pynput`（全局键盘监听）+ `tkinter`（弹窗）
-- 核心解析与补全逻辑是纯 Python，不写任何日志文件。仓库只含核心功能源码，
-  不含测试代码与调试工具（项目已收尾，见下方「文件构成」）。
+- 核心解析与补全逻辑是纯 Python，不写任何日志文件。回归测试用真实工程样本
+  离线跑（`run_tests.bat`，**不需要 Excel**）。
 
 ## 安装与运行
 
@@ -24,8 +24,6 @@
 
 ## 文件构成
 
-项目已收尾，仓库**只保留核心功能**：
-
 | 文件 | 作用 |
 | --- | --- |
 | `main.py` | 进程入口：全局键盘钩子、事件轮询、把各路判断接起来 |
@@ -38,16 +36,29 @@
 | `requirements.txt` | 依赖（`pywin32` / `pynput`） |
 | `run.bat` / `stop.bat` / `stop.ps1` | 启停 |
 | `install_autostart.ps1` / `uninstall_autostart.ps1`（及对应 `.bat`） | 开机自启的安装与卸载 |
+| `tests/` + `run_tests.bat` | **回归测试**（874 条），见下 |
 
-**已随收尾一并移除**：`tests/`（含 838 条回归用例与 `testdata/` 样本工程）、
-`run_tests.bat`、`log.py` 原实现与其配套的 `run_debug.bat` / `show_log.bat`。
+### 跑回归测试
+
+双击 `run_tests.bat`，或：
+
+```
+python tests\test_real_project.py
+```
+
+- **不需要 Excel / COM**，用 `tests/testdata/` 里那份真实工程导出的 14 个模块
+  作样本，纯解析层验证。
+- 但有 3 条用例会真读 Excel 的类型库（宿主枚举那批）；机器上没装 / 没开
+  Excel 时它们会红，其余 871 条照常。装了 Excel（含 Office 共享类型库）就全绿。
+- **改了代码请跑一遍。** 这个项目绝大多数坑（列语义、作用域口径、候选排序）
+  都是"看起来对、真机或离线用例一跑就红"才发现的。
 
 ⚠️ **`log.py` 这个空壳不能删**：`engine.py` / `vbe_bridge.py` / `main.py` 都
 `import` 它，删掉会直接 ImportError 起不来。留空实现而不是把那约 60 处
 `_log(...)` 调用逐个挖掉，是因为 `log()` 本身直接返回、`LOG_ENABLED` 恒为
 `False` ⇒ 主循环里 `if _LOG_ENABLED:` 包着的诊断块（含额外的只读 COM 调用）
 自动整段跳过，**行为与开销都与删掉一样**；将来要排障，把日志实现加回本文件即可，
-其余文件一行不动。
+其余文件一行不动。配套的 `run_debug.bat` / `show_log.bat` 已随收尾移除。
 
 ## 使用
 

@@ -3812,12 +3812,19 @@ class VbeBackend:
             added_parens = False
             if want_parens and AUTO_PAREN_ON_COMPLETE \
                     and _is_call_site(line_text, word_start_col):
-                # 补全词右边的第一个非空白字符；已经紧跟 `(` 就不补
-                # （`x = getVa|(1)` 这种括号本来就有的调用点）。
+                # 补全词的**词尾**（0-based 下标）。括号要贴在这个词的后面。
                 k = word_start_col - 1 + len(completion)
-                while k < len(new_line) and new_line[k] in " \t":
-                    k += 1
-                if not (k < len(new_line) and new_line[k] == "("):
+                # 跳过空白**只是为了判断**"右边是不是已经紧跟左括号"
+                # （`x = getVa|(1)` 这种括号本来就有的调用点）。
+                #
+                # ⚠️ ★v98 修：插入点必须是【词尾 k】，不能是被跳过空白后的 j。
+                # 用 j 插入会把括号甩到空白后面 —— `x = DoWo + 1` 曾补成
+                # `x = DoWork ()+ 1`（括号与函数名之间多一个空格，而且
+                # `+` 前的空格被吃掉，读起来像 `DoWork ()+ 1`）。
+                j = k
+                while j < len(new_line) and new_line[j] in " \t":
+                    j += 1
+                if not (j < len(new_line) and new_line[j] == "("):
                     new_line = new_line[:k] + "()" + new_line[k:]
                     added_parens = True
 
