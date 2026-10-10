@@ -1,8 +1,10 @@
 ﻿# VbeComplete
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: MIT](assets/license-mit.svg)](LICENSE)
 
 **IntelliJ IDEA–style autocomplete for the VBA editor.**
+
+![VbeComplete in action: typing "cus" filters the live list, the arrow keys move the selection, and Tab accepts it](assets/demo.gif)
 
 VbeComplete brings modern, IDE-grade code completion to the VBA editor (VBE) shipped with
 Microsoft Office. Start typing a name and a live-filtered list of the variables, constants,
