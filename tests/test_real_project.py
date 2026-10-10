@@ -13645,6 +13645,441 @@ def main():
         import traceback as _tp77
         _tp77.print_exc()
         check("第 77 节异常: %s" % _e77, [True], expect_contain=[False])
+
+    # ==================================================================
+    # 78. v99：① 关键字不该补括号  ② 退格成对删除（空括号 / 空引号）
+    #
+    # 用户口径：
+    #   「如果选中的提示词是关键字，不应该自动补全双括号。现在 public，
+    #     private 会自动补全双括号。」
+    #   「按回退键删除字符时，如果删除的是左右括号，或双引号，如果括号中
+    #     或双引号中没内容，就能自动删除左右两端。」
+    #
+    # ⚠️ 本节自己踩到的三个坑（都写进注释了，别删）：
+    #   ① `String` / `Date` 在 VBA 里**既是类型名也是函数**（实测交集就
+    #      这两个），所以纯白名单会把它们放行 —— 白名单与类型排除两道
+    #      判据问的是不同问题，合成一条就退回 v98 那个 public()；
+    #   ② 判据**不许自己猜列语义**（"两种都试"会把精确判据退化成两个
+    #      模糊判据的并集，误判会改坏用户的代码）；
+    #   ③ 本功能**不能**调 `_caret_char_col`：它拿【行尾列】反推 tabw，
+    #      而这里的光标停在行中间，拟合出来的 tabw 是错的。
+    # ==================================================================
+    try:
+        _ROOT78 = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+        class _UI78(object):
+            """最小 UI 桩 —— 只被 Completer 的构造需要。"""
+
+            def hide(self):
+                pass
+
+            def is_visible(self):
+                return False
+
+            def show(self, *a, **k):
+                pass
+
+        # ---------------- 78.1 关键字不该补括号 ----------------
+        print("\n--- 78.1 engine._is_callable_name：关键字不该补括号 ---")
+
+        class _BK78(object):
+            """后端把【内建函数 + 数据类型 + 关键字 + 常量】一整批都收进
+            get_builtin_names —— 这正是真后端 v62 之后的样子。"""
+
+            def get_proc_names(self):
+                return frozenset(["dowork", "calcvalue"])
+
+            def get_builtin_names(self):
+                _s = set()
+                for _lst in (VBB.BUILTIN_FUNCTIONS, VBB.BUILTIN_TYPE_NAMES,
+                             VBB.BUILTIN_KEYWORDS, VBB.BUILTIN_CONSTANTS):
+                    _s |= set(str(n).lower() for n in _lst)
+                return _s
+
+        _cp78 = E.Completer(_BK78(), _UI78())
+
+        # ---- 78.1.1 ★用户报的现象：Public / Private 被补成 public() ----
+        check("78.1.1 ★用户报的现象：`public` / `private` 是语言关键字，"
+              "选它们补全时**不许**补出 `public()` —— 关键字后面带括号编译不过",
+              [(_cp78._is_callable_name("Public"),
+                _cp78._is_callable_name("Private"))],
+              expect_contain=[(False, False)])
+
+        # ---- 78.1.2 全量扫：79 个关键字一个都不许放行 ----
+        # ⚠️ 这一条比逐个列举强得多：vba_builtins 以后再加关键字，自动被覆盖。
+        _kw78 = sorted(set(str(n).lower() for n in VBB.BUILTIN_KEYWORDS))
+        _leak78 = [k for k in _kw78 if _cp78._is_callable_name(k)]
+        check("78.1.2 ★全量扫 %d 个语言关键字，一个都不许被判成"
+              "「可调用」—— 比逐个列举强：清单以后再加关键字也自动被覆盖"
+              % len(_kw78),
+              [_leak78 or "全部挡住"],
+              expect_contain=["全部挡住"])
+
+        # ---- 78.1.3 内建常量同理（vbCrLf() 是坏代码）----
+        _cs78 = sorted(set(str(n).lower() for n in VBB.BUILTIN_CONSTANTS))
+        _leakc78 = [c for c in _cs78 if _cp78._is_callable_name(c)]
+        check("78.1.3 ★内建常量同样一个都不许放行（`vbCrLf()` 之类"
+              "都不是可调用对象）",
+              [_leakc78 or "全部挡住"],
+              expect_contain=["全部挡住"])
+
+        # ---- 78.1.4 ★v99 的病根：黑名单换成白名单 ----
+        # v98 用的是"在内建池里、且不是数据类型就算可调用"，那只挡了 13 个类型名，
+        # 关键字与常量全漏。改成"是内建函数、且不是类型名"。
+        _fnl78 = set(str(n).lower() for n in VBB.BUILTIN_FUNCTIONS)
+        _tpl78 = set(str(n).lower() for n in VBB.BUILTIN_TYPE_NAMES)
+        _kwl78 = set(str(n).lower() for n in VBB.BUILTIN_KEYWORDS)
+        _csl78 = set(str(n).lower() for n in VBB.BUILTIN_CONSTANTS)
+        check("78.1.4 ★黑名单不够用：内建池里的关键字 %d 个、常量 %d 个，"
+              "v98 那句\"不是数据类型就算可调用\"一个都挡不住（真正被挡住的"
+              "只有 %d 个类型名）—— 这是 v99 改白名单的直接原因"
+              % (len(_kwl78), len(_csl78), len(_tpl78)),
+              [(len(_kwl78 & _fnl78) == 0,
+                len(_csl78 & _fnl78) == 0,
+                len(_tpl78) > 0)],
+              expect_contain=[(True, True, True)])
+
+        # ---- 78.1.5 ★真正的函数一个都不许误伤 ----
+        check("78.1.5 ★白名单不许过严：内建函数该补的还得补"
+              "（MsgBox / Left / Split / UBound 全都 True）",
+              [tuple(_cp78._is_callable_name(n)
+                     for n in ("MsgBox", "Left", "Split", "UBound"))],
+              expect_contain=[(True, True, True, True)])
+        check("78.1.5b 工程内自己写的过程照旧补括号（第一路 proc_names 不受"
+              "v99 收紧影响）",
+              [(_cp78._is_callable_name("DoWork"),
+                _cp78._is_callable_name("CalcValue"))],
+              expect_contain=[(True, True)])
+
+        # ---- 78.1.6 ★String / Date 是双身份名字 ----
+        # VBA 里 `String(5, "ab")` 是合法的重复字符函数，但 `Dim n As String`
+        # 是类型位置。两边都是 yes ⇒ 只能靠后端 `_is_call_site` 按位置挡。
+        _dual78 = sorted(_fnl78 & _tpl78)
+        check("78.1.6 ★前提：`String` / `Date` 同时是函数与类型（交集 = %s）—— "
+              "所以光有白名单不够，还得叠一道类型排除；而它们在**调用点**"
+              "仍要能补括号" % (_dual78,),
+              [(_dual78, _cp78._is_callable_name("String"),
+                _cp78._is_callable_name("Date"))],
+              expect_contain=[(["date", "string"], False, False)])
+        check("78.1.6b ★反面对照：类型排除只管\"名字像不像类型\"，"
+              "真正的调用点仍放行 —— `x = String(5, \"ab\")` 是合法代码，"
+              "后端 `_is_call_site` 在等号右边判 True、在 As 后面判 False",
+              [(VB._is_call_site("    x = String", 9),
+                VB._is_call_site("Dim n As Str", 10))],
+              expect_contain=[(True, False)])
+
+        # ---- 78.1.7 用户定义优先：工程里声明过同名的，以用户为准 ----
+        class _BKShadow78(object):
+            """用户在工程里 `Dim Split As String` —— 后端会把 split 从内建池剔除。"""
+
+            def get_proc_names(self):
+                return frozenset()
+
+            def get_builtin_names(self):
+                return (set(str(n).lower() for n in VBB.BUILTIN_FUNCTIONS)
+                        - {"split"})
+
+        _csh78 = E.Completer(_BKShadow78(), _UI78())
+        check("78.1.7 ★用户定义优先：工程里声明过 `Split`（变量）时它就不再是"
+              "内建函数，不补括号 —— 用户自己的定义永远压过语言自带",
+              [_csh78._is_callable_name("Split")],
+              expect_contain=[False])
+
+        # ---- 78.1.8 后端缺接口时不补（旧式后端行为不变）----
+        class _BKOld78(object):
+            def get_builtin_names(self):
+                return set()
+
+        _co78 = E.Completer(_BKOld78(), _UI78())
+        check("78.1.8 后端没提供 `get_proc_names` 时一律不补（判据缺失 = 不动手，"
+              "旧式 / 测试后端行为完全不变）",
+              [(_co78._is_callable_name("DoWork"),
+                _co78._is_callable_name("MsgBox"))],
+              expect_contain=[(False, False)])
+
+        # ---- 78.1.9 源码护栏：两道判据不许合成一条 ----
+        _src78 = io.open(os.path.join(_ROOT78, "engine.py"),
+                         encoding="utf-8").read()
+        _ic78 = _src78.split("def _is_callable_name(")[1].split("\n    def ")[0]
+        check("78.1.9 ★源码护栏：`_is_callable_name` 里白名单与类型排除必须"
+              "**同时**出现（合成一条就会退回 v98 那个 `public()`；只留白名单则 "
+              "`String` 漏成 True）",
+              [("in self._builtin_function_names()" in _ic78,
+                "not in self._builtin_type_names()" in _ic78)],
+              expect_contain=[(True, True)])
+
+        # ---------------- 78.2 退格成对删除 ----------------
+        print("\n--- 78.2 vbe_bridge：退格删掉一对空括号 / 空引号 ---")
+
+        def _at78(marked):
+            """`"    x = f(@)"` -> (行, 字符列)。@ 是光标标记（1-based 字符列）。
+
+            ⚠️ 空行也必须写 `@`（哪怕它落在第 1 列）—— 没有标记就没法推出列号，
+            而**列一律从字符串推**（MEMORY 第 24 条：手写数字必错）。
+            """
+            _i = marked.index("@")
+            return marked.replace("@", "", 1), _i + 1
+
+        # ---- 78.2.1 判据：光标夹在一对空括号 / 空引号正中间 ----
+        _l1, _c1 = _at78("    x = f(@)")
+        _l1q, _c1q = _at78('    s = "@"')
+        check("78.2.1 ★用户报的场景：`    x = f(@)`（光标在 `(` 与 `)` 中间，"
+              "字符列 %d）-> 接管；空引号 `%s`（第 %d 列）同理"
+              % (_c1, _l1q, _c1q),
+              [(VB.pair_delete_wanted(_l1, _c1),
+                VB.pair_delete_wanted(_l1q, _c1q))],
+              expect_contain=[(True, True)])
+
+        # ---- 78.2.2 ★"中间没内容"这条由判据本身钉死 ----
+        # 左邻是 `(`、右邻**紧挨着**是 `)` —— 两格之间本来就没有任何东西。
+        _bad_pairs = []
+        for _spec, _want in [
+            ("    x = f(a@1)", False),      # 括号里有内容
+            ('    s = a"x@"y"b', False),    # 引号里有内容
+            ("    x = f@()", False),        # 光标在 `(` 左边（退格该删 f）
+            ("    x = f()@", False),        # 光标在 `)` 右边（退格该删 `)`）
+            ("    x = f())@", False),       # 右括号挨右括号，不是"一对"
+            ("    x = f(订@单)", False),    # 里面是中文，有内容
+            ("    x = 1@", False),          # 普通代码
+            ("@x = 1", False),             # 行首普通词
+            ("@", False),                  # 空行（列 = 1）
+            ('    s = @""', False),         # 左邻是 `=` 不是引号
+        ]:
+            _l, _c = _at78(_spec)
+            _got = VB.pair_delete_wanted(_l, _c)
+            if _got != _want:
+                _bad_pairs.append("%r -> %s，期望 %s" % (_spec, _got, _want))
+        check("78.2.2 ★10 条『不接管』逐条对：括号里有内容 / 光标在符号外侧 / "
+              "右括号挨右括号 / 空白行 —— 一个都不许接管（有内容时右括号得留着）",
+              [_bad_pairs or "全部一致"],
+              expect_contain=["全部一致"])
+
+        # ---- 78.2.3 ★钩子侧与主侧必须同一份实现（项目铁律第 18 条）----
+        check("78.2.3 ★钩子判据 `pair_delete_wanted` 与主侧复核 "
+              "`pair_delete_span` 必须是同一份语义 —— 前者只是后者的一个"
+              "bool 包装（少写一份，两边早晚会有一边漏掉某个分支）",
+              [VB.pair_delete_wanted.__doc__.find("pair_delete_span") >= 0],
+              expect_contain=[True])
+        check("78.2.3b ★两处光标列换算走的是**同一份** `_bs_caret_char_col`"
+              "（含全角 / Tab 的行上，两边用不同口径换算 = 钩子说接管、主侧"
+              "说接管不了，按键被吞掉却什么都没发生）",
+              [(VB.pair_delete_wanted.__code__.co_names.count("_bs_caret_char_col"),
+                hasattr(VB, "_bs_caret_char_col"),
+                VB.VbeBackend.delete_pair_here.__code__.co_names.count(
+                    "_bs_caret_char_col"))],
+              expect_contain=[(1, True, 1)])
+
+        # ---- 78.2.4 ★判据不许自己猜列语义（v99 第一版的 bug）----
+        # 我第一版让 pair_delete_span 同时接受"显示列"和"字符列"两种解释。
+        # 这一行是关键：`    说()话` 光标真在 `(` 与 `)` 之间（字符列 7、显示列 8）。
+        # 换算过 -> 字符列 7 -> 命中 (5,6)【对】；不换算、把显示列 8 当字符列
+        # -> 读到 t[7]/t[8] = ')'/'话' -> 判不出【这次侥幸没事】。
+        # ⚠️ 结论：两种口径在这一行上给出的是**不同下标**，"两种都试"会把它们
+        # 合成一个并集 —— 判据一旦变成并集，漏判只是功能不生效，误判是改坏代码。
+        # ⇒ 判据只吃字符列，换算责任交给调用方（各用自己最准的那份）。
+        _l4 = "    说()话"
+        _disp4 = 8                      # 光标在 `(` 与 `)` 之间：字符列 7、显示列 8
+        _col4 = VB._bs_caret_char_col(_l4, _disp4)[0]
+        check("78.2.4 ★判据只吃【字符列】：`%s` 光标在括号中间（显示列 %d -> "
+              "字符列 %d）—— 换算后判据得 %s【对】；不换算、把显示列当字符列"
+              "会得 %s。两种口径在这一行上给出的是**不同下标**，\"两种都试\""
+              "会把它们并成一个并集（v99 第一版正是那样写的；误判会改坏代码，"
+              "漏判只是功能不生效，代价不对称）"
+              % (_l4, _disp4, _col4, VB.pair_delete_span(_l4, _col4),
+                 VB.pair_delete_span(_l4, _disp4)),
+              [(_col4, VB.pair_delete_span(_l4, _col4),
+                VB.pair_delete_span(_l4, _disp4))],
+              expect_contain=[(7, (5, 6), None)])
+
+        # ---- 78.2.5 ★不许用 `_caret_char_col`：它的拟合是拿【行尾列】反推 tabw ----
+        _l5, _c5 = _at78("\tx = f(@)")
+        _disp5 = VB._disp_width(_l5, 4, True, upto=_c5 - 1) + 1
+        _col5 = VB._bs_caret_char_col(_l5, _disp5)[0]
+        _col5_bad = VB._caret_char_col(None, None, 1, _l5, _disp5)[0]
+        check("78.2.5 ★Tab 缩进的行：`%s` 光标在括号中间（显示列 %d）—— "
+              "本功能用 `_bs_caret_char_col` 得字符列 %d -> %s【对】；"
+              "而 `_caret_char_col` 得 %d -> %s【错】：它拿**行尾列**反推 tabw，"
+              "光标停在行中间时拟合成 tabw=3 ⇒ 本功能绝不能调它"
+              % (_l5, _disp5, _col5, VB.pair_delete_span(_l5, _col5),
+                 _col5_bad, VB.pair_delete_span(_l5, _col5_bad)),
+              [(VB.pair_delete_span(_l5, _col5),
+                VB.pair_delete_span(_l5, _col5_bad))],
+              expect_contain=[((6, 7), None)])
+
+        # ---- 78.2.6 集成：真删 + 光标落点（mock 模拟显示列 + 钳列）----
+        class _CM78(object):
+            def __init__(self, lines):
+                self.lines = list(lines)
+                self.Name = "M1"
+
+            @property
+            def CountOfLines(self):
+                return len(self.lines)
+
+            def Lines(self, start, count=1):
+                s0 = max(0, int(start) - 1)
+                return "".join(l + "\n" for l in self.lines[s0:s0 + int(count)])
+
+            def ReplaceLine(self, n, text):
+                self.lines[int(n) - 1] = text
+
+            def DeleteLines(self, n, c=1):
+                del self.lines[int(n) - 1:int(n) - 1 + int(c)]
+
+            def InsertLines(self, n, text):
+                self.lines.insert(int(n) - 1, text)
+
+        class _Pane78(object):
+            def __init__(self, cm, sel):
+                self.CodeModule = cm
+                self.sel = sel
+
+            def GetSelection(self):
+                return self.sel
+
+            def SetSelection(self, sl, sc, el, ec):
+                # ★忠实模拟真 VBE：列是【显示列】，超出行尾会被**钳到行尾**。
+                # 缺了这两条，v95 那类"中文行光标落中间"的 bug 在测试里看不见。
+                ln = max(1, min(int(sl), len(self.CodeModule.lines)))
+                try:
+                    _t = self.CodeModule.lines[ln - 1]
+                except Exception:
+                    _t = ""
+                _eol = VB._disp_width(_t, 4, True) + 1
+                self.sel = (ln, max(1, min(int(sc), _eol)),
+                            ln, max(1, min(int(ec), _eol)))
+
+        class _VBE78(object):
+            def __init__(self, pane):
+                self.ActiveCodePane = pane
+
+        def _run78(marked, sel=None):
+            """按 mock 的代码窗跑一次 delete_pair_here，返回 (ok, 行, 光标列)。
+
+            ⚠️ `marked` 里的 @ 是光标位置，本函数按【字符列】给，再由 mock 换算成
+            显示列喂进去 —— 与真机 GetSelection 一样。**列一律从字符串推。**
+            """
+            _line, _col = _at78(marked)
+            _cm = _CM78([_line])
+            _disp = VB._disp_width(_line, 4, True, upto=_col - 1) + 1
+            _pn = _Pane78(_cm, sel if sel is not None else (1, _disp, 1, _disp))
+            _orig = VB._get_vbe_cached
+            VB._get_vbe_cached = lambda: _VBE78(_pn)
+            try:
+                _ok = VB.VbeBackend().delete_pair_here()
+            finally:
+                VB._get_vbe_cached = _orig
+            return (_ok, _cm.lines[0], _pn.sel[3])
+
+        _exp78 = "    x = f"
+        check("78.2.6 ★集成：`    x = f(@)` 一次退格 -> `    x = f`，"
+              "光标落在第 %d 列（= 左符号原来的位置，也正是原生\"删掉 `(`\""
+              "之后的落点）" % (len(_exp78) + 1),
+              [_run78("    x = f(@)")],
+              expect_contain=[(True, _exp78, len(_exp78) + 1)])
+        check("78.2.6b 空引号对：`    s = \"@\"` -> `    s = `",
+              [_run78('    s = "@"')],
+              expect_contain=[(True, "    s = ", 9)])
+        check("78.2.6c ★中文行（名字里全是全角）：`    订单金额 = 计算(@)` -> "
+              "`    订单金额 = 计算`，光标按【显示列】落在第 %d 列"
+              "（按字符列只有 %d，差的就是那几个汉字的格数）"
+              % (VB._disp_width("    订单金额 = 计算", 4, True) + 1,
+                 len("    订单金额 = 计算") + 1),
+              [_run78("    订单金额 = 计算(@)")],
+              expect_contain=[(True, "    订单金额 = 计算",
+                               VB._disp_width("    订单金额 = 计算", 4, True) + 1)])
+        _exp5 = "\tx = f"
+        check("78.2.6d ★Tab 缩进的工程照旧生效：`\\tx = f(@)` -> `%s`"
+              "，光标落【显示列】第 %d 列（Tab 展开到 4 格，纯字符列只有 %d —— "
+              "这条专钉 78.2.5 那个 tabw 拟合陷阱）"
+              % (_exp5, VB._disp_width(_exp5, 4, True) + 1, len(_exp5) + 1),
+              [_run78("\tx = f(@)")],
+              expect_contain=[(True, _exp5, VB._disp_width(_exp5, 4, True) + 1)])
+        check("78.2.6e 嵌套：`    x = f(g(@))` -> `    x = f(g)`（只删最里那一对）",
+              [_run78("    x = f(g(@))")],
+              expect_contain=[(True, "    x = f(g)", 12)])
+
+        # ---- 78.2.7 ★不接管时必须一个字都不改（交给 VBE 原生退格）----
+        _bad78 = []
+        for _m, _expect_line in [("    x = f(a@1)", "    x = f(a1)"),
+                                 ("    x = f@()", "    x = f()"),
+                                 ("    x = f()@", "    x = f()"),
+                                 ("    x = 1@", "    x = 1")]:
+            _r = _run78(_m)
+            if _r[0] is not False or _r[1] != _expect_line:
+                _bad78.append((_m, _r))
+        check("78.2.7 ★不接管时行表一个字都不许变（返回 False，调用方会把这一下"
+              "退格原样还给系统 —— 绝不会\"吞了按键却什么都没发生\"）",
+              [_bad78 or "4 条全部原样退回"],
+              expect_contain=["4 条全部原样退回"])
+
+        # ---- 78.2.8 有选区 -> 那是"删选区"，一个字符都不许动 ----
+        _l8, _c8 = _at78("    x = f(@)")
+        _sel8 = (1, VB._disp_width(_l8[:8], 4, True) + 1, 1,
+                 VB._disp_width(_l8, 4, True) + 1)
+        _r8 = _run78("    x = f(@)", sel=_sel8)
+        check("78.2.8 ★有选区不接管：退格在有选区时是【删掉选区】，语义完全不同 —— "
+              "后端必须原样退回（调用方会把这一下退格还给系统），行表一个字没变",
+              [_r8],
+              expect_contain=[(False, "    x = f()", _sel8[3])])
+
+        # ---- 78.2.9 VBE 重排了整行时，光标按压平前缀重新定位 ----
+        # 真实调用形态：_locate_by_prefix(actual, new_line, left)
+        #   raw = '    x = f()'，删掉 (5, 6) -> new_line = '    x = f'，left = 5
+        # ⚠️ 删除不会像插入那样留下"可搜的一对符号"，唯一能认的指纹就是前缀。
+        _nl9 = "    x = f"
+        check("78.2.9 VBE 把整行重排过（补空格 `x=f` / 缩进被吃掉）时，"
+              "按【压平后的前缀】（`_norm_code`：去空白 + 小写）重新定位光标 —— "
+              "任何位置补空格 / 改大小写都不影响指纹",
+              [(VB._locate_by_prefix(_nl9, _nl9, 5),
+                VB._locate_by_prefix("    x=f", _nl9, 5),
+                VB._locate_by_prefix("x = f", _nl9, 5))],
+              expect_contain=[(5, 5, 2)])
+        check("78.2.9b ★前缀在行里出现多次时取**离原位置最近**的那个 —— "
+              "v99 第一版写的是\"从后往前扫取最长\"，实测 `aa = aa` 会命中行尾"
+              "那个 `aa`（压平后与前缀一样），把光标从行首扔到行中。"
+              "改成\"最近\"后与 `_locate_inserted` 同一口径：VBE 重排只挪几格，"
+              "不会把光标搬到半行之外",
+              [(VB._locate_by_prefix("    aa = aa", "    aa = aa", 4),
+                VB._locate_by_prefix("    aa = aa", "    aa = aa", 9))],
+              expect_contain=[(0, 9)])
+        check("78.2.9c 认不出来时返回 None（由调用方退回 `left`，宁可偏一格，"
+              "也不越界或乱扔 —— MEMORY 第 10 条：兜底绝不给错位置）",
+              [VB._locate_by_prefix("abc", "    x = f", 5)],
+              expect_contain=[None])
+
+        # ---- 78.2.10 ★main.py 接线护栏（离线用例咬不住"钩子有没有接线"）----
+        _msrc78 = io.open(os.path.join(_ROOT78, "main.py"),
+                          encoding="utf-8").read()
+        check("78.2.10 ★接线护栏：`_bs_delete_pair_key_ok` 必须**恰好两处**出现"
+              "（一处在 `win32_filter` 之外的定义、一处在钩子里被调用）—— "
+              "只定义不接线 = 功能完全不存在，而离线用例抓不到这种漏；"
+              "接线了却漏掉吞键 = 按键被吞但什么都没发生。两处都到位才算数",
+              [(_msrc78.count("_bs_delete_pair_key_ok") == 2,
+                "action = (_delete_pair_here, ())" in _msrc78,
+                "def _delete_pair_here():" in _msrc78)],
+              expect_contain=[(True, True, True)])
+        check("78.2.10b 逃生门：`VBECOMPLETE_NO_BS_DELPAIR=1` 能把这条完全关掉"
+              "（退格回到 VBE 原生）",
+              ["VBECOMPLETE_NO_BS_DELPAIR" in _msrc78],
+              expect_contain=[True])
+        check("78.2.10c ★两条退格接管路共用同一批前置门槛（一份实现，"
+              "项目铁律第 14 条）—— `pending_keys > 0` / 快照过期 / "
+              "Ctrl+Shift 这几条一旦只写一份、另一份漏掉，就会出现"
+              "\"输入法组字时抢掉退格\"这类事故",
+              [(_msrc78.count("_bs_ctx_for_takeover") >= 3,
+                "def _bs_ctx_for_takeover(vk)" in _msrc78)],
+              expect_contain=[(True, True)])
+        check("78.2.10d ★删完必须当场作废快照 `state[\"cur_ctx\"] = None` —— "
+              "按住退格时键盘重复约 33ms 一次，不作废会拿【删之前那一行的旧"
+              "快照】再判一次、又删一对",
+              [('_log("bspair: 未接管 -> 退格原样还给系统")' in _msrc78,
+                "def _delete_pair_here():" in _msrc78)],
+              expect_contain=[(True, True)])
+    except Exception as _e78:
+        import traceback as _tp78
+        _tp78.print_exc()
+        check("第 78 节异常: %s" % _e78, [True], expect_contain=[False])
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))
     if FAILURES:

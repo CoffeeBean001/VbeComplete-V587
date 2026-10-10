@@ -341,6 +341,28 @@ try:
 except Exception:
     BS_DELETE_BLANK_LINE = True
 
+# ---- v99：退格成对删除（空括号 / 空引号）----
+#
+# 用户口径：「按退格键删除字符时，如果删除的是左右括号，或双引号，如果括号中
+# 或双引号中没内容，就能自动删除左右两端。」
+#
+# 即光标停在 `()` / `""` 中间时按一次退格，两个字符一起消失；括号里有内容
+# （`(a|b)`）不接管 —— 那是一次普通删字，右括号得留着。
+#
+# 与 v94 退格删整行同一副骨架：判据是纯函数 vbe_bridge.pair_delete_wanted
+# （跑在钩子线程，只读快照不碰 COM），真正的删除在主线程
+# backend.delete_pair_here，删不成就把这一下退格【原样还给系统】。
+#
+# ★两条退格判据的关系：v94 管"整行只有空白"，v99 管"光标夹在一对空符号中间"，
+# 两者的输入互斥（空白行里不会有 `()`），所以先后顺序无所谓；排在 v94 之后
+# 是因为它更常用。
+# 想关掉（这一下退格完全回到 VBE 原生）：set VBECOMPLETE_NO_BS_DELPAIR=1
+try:
+    BS_DELETE_PAIR = (os.environ.get("VBECOMPLETE_NO_BS_DELPAIR",
+                                     "0").strip() != "1")
+except Exception:
+    BS_DELETE_PAIR = True
+
 # 钩子里判"要不要接管回车"时，轮询快照最多允许多旧（秒）。
 # 快照是每轮轮询刷新的（100ms 一次），但空闲时会降频到 2s。超过这个年纪就
 # 一律不接管：宁可这一次不做缩进，也绝不拿旧行文本去赌用户正在敲的那一行。
@@ -841,6 +863,29 @@ def main():
             _log("bsdelline: 未接管 -> 退格原样还给系统")
             send_vk(VK_BACK)
 
+    def _delete_pair_here():
+        """退格成对删除（v99）：删掉光标左右紧邻的那一对空括号 / 空引号。
+
+        与 `_delete_blank_line_here` 同一副骨架，同样**必须**当场作废快照
+        （`state["cur_ctx"] = None`）：按住退格时键盘重复约 33ms 一次，不作废
+        的话第二次重复会拿【删之前那一行的旧快照】再判一次 ⇒ 又删一对。
+        作废之后到下一次轮询为止退格走 VBE 原生（删一个字符）—— 正是用户按住
+        退格时期待的行为。
+        """
+        try:
+            completer.hide()
+        except Exception:
+            pass
+        _ok = False
+        try:
+            _ok = backend.delete_pair_here()
+        except Exception:
+            _ok = False
+        state["cur_ctx"] = None
+        if not _ok:
+            _log("bspair: 未接管 -> 退格原样还给系统")
+            send_vk(VK_BACK)
+
     def _move_caret_here(delta):
         """Shift+↑/↓（候选窗可见时）：收起我们的窗，光标上/下移一行（v78）。
 
@@ -931,6 +976,36 @@ def main():
         except Exception:
             return False
 
+    def _bs_ctx_for_takeover(vk):
+        """两条退格接管路（v94 删整行 / v99 删空括号对）共用的前置门槛，
+        通过就返回快照的 `(行文本, 光标列)`，不通过返回 None。★v99 抽出。
+
+        ⚠️ 这些门槛一条都不能少，尤其 `pending_keys > 0`：那是"按了可能写字
+        的键、文档却还没变"（输入法正在组字 / 刚敲的字还没落进文档）。此时
+        快照必然是旧的，抢这一下退格会连用户刚敲的字一起删掉。
+        ⚠️ 过期快照一律放行：宁可这一次不接管（原生退格删一个字符，无害），
+        也绝不拿 100ms 前的行文本去赌用户正在敲的那一行。
+        """
+        try:
+            if vk != VK_BACK:
+                return None
+            if _shift_down() or _mod_down():
+                # Ctrl+Backspace 在 VBE 里是"删上一个词"，语义完全不同
+                return None
+            if int(state.get("pending_keys") or 0) > 0:
+                return None
+            if com_backoff_remaining() > 0 or not in_vbe_code_area():
+                return None
+            ctx = state.get("cur_ctx")
+            if not ctx:
+                return None
+            ts, _ln, text, ec = ctx
+            if time.time() - float(ts) > ENTER_CTX_MAX_AGE:
+                return None
+            return (text, ec)
+        except Exception:
+            return None
+
     def _bs_delete_line_key_ok(vk):
         """这一下退格要不要由我们接管（v94，跑在键盘钩子线程里，绝不碰 COM）。
 
@@ -939,27 +1014,34 @@ def main():
         行文本去赌用户正在敲的那一行（快照说"空行"、其实刚粘贴进来一整段，
         那会把用户的代码删掉）。
 
-        ⚠️ pending_keys > 0 必须挡在前面：那是"按了可能写字的键、文档却还没变"
-        （输入法正在组字 / 刚敲的字还没落进文档）。此时快照必然是旧的，抢这一
-        下退格会连用户刚敲的字一起删掉。
+        ★v99 前置门槛抽到 `_bs_ctx_for_takeover`（与删空括号对共用一份）。
         """
         try:
-            if not BS_DELETE_BLANK_LINE or vk != VK_BACK:
+            if not BS_DELETE_BLANK_LINE:
                 return False
-            if _shift_down() or _mod_down():
-                # Ctrl+Backspace 在 VBE 里是"删上一个词"，语义完全不同
+            got = _bs_ctx_for_takeover(vk)
+            if not got:
                 return False
-            if int(state.get("pending_keys") or 0) > 0:
-                return False
-            if com_backoff_remaining() > 0 or not in_vbe_code_area():
-                return False
-            ctx = state.get("cur_ctx")
-            if not ctx:
-                return False
-            ts, _ln, text, ec = ctx
-            if time.time() - float(ts) > ENTER_CTX_MAX_AGE:
-                return False
+            text, ec = got
             return bool(vbe_bridge.blank_line_delete_wanted(text, ec))
+        except Exception:
+            return False
+
+    def _bs_delete_pair_key_ok(vk):
+        """这一下退格要不要由我们接管（v99，跑在键盘钩子线程里，绝不碰 COM）。
+
+        与 `_bs_delete_line_key_ok` 共用前置门槛，只在最后一步换判据
+        （`pair_delete_wanted`）。真正的删除在主线程，写不成就把这一下退格
+        原样还给系统。
+        """
+        try:
+            if not BS_DELETE_PAIR:
+                return False
+            got = _bs_ctx_for_takeover(vk)
+            if not got:
+                return False
+            text, ec = got
+            return bool(vbe_bridge.pair_delete_wanted(text, ec))
         except Exception:
             return False
 
@@ -1025,6 +1107,15 @@ def main():
                     # 该有候选，真挂着（刚把字删光的那一瞬间）也会由动作里的
                     # completer.hide() 收掉，与另外几条改写文本的路一致。
                     action = (_delete_blank_line_here, ())
+                    suppress = True
+                elif _bs_delete_pair_key_ok(vk):
+                    # v99 退格成对删除：光标夹在一对空括号 / 空引号**中间**时
+                    # （`f(|)` / `s = "|"`），一次退格把两端一起删掉；括号里
+                    # 有内容不接管（那是普通删字）。骨架与 v94 那条完全一致。
+                    #
+                    # 排在 v94 之后：两者输入互斥（空白行里不会有 `()`），
+                    # 谁先谁后都一样，但这条更常用、判据更窄，放后面更好读。
+                    action = (_delete_pair_here, ())
                     suppress = True
                 elif (_pair_ch
                         and not _mod_down()

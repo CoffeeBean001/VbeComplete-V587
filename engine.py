@@ -30,7 +30,11 @@ import time
 import parser as vba_parser
 
 # ★v98：内建数据类型名（小写）的惰性缓存。首次用时才 import vba_builtins。
+# ★v99 补上内建**函数**名的白名单缓存（见 _builtin_function_names）。
+#     两份都要：白名单挡关键字/常量，这份挡 String / Date 这类"既是类型又是
+#     函数"的双身份名字（MEMORY：两道判据问的是不同问题，不能合成一条）。
 _BUILTIN_TYPE_NAMES_LOW = None
+_BUILTIN_FUNCTION_NAMES_LOW = None
 
 from log import log as _log
 from log import LOG_ENABLED as _LOG_ENABLED
@@ -1403,12 +1407,52 @@ class Completer:
         except Exception:
             return visible_ids
 
+    def _builtin_function_names(self):
+        """内建**函数**名（小写集合）—— MsgBox / Left / Split …。★v98 建，
+        ★v99 改成"白名单"口径。
+
+        ★v99 用户报的现象：「`public` / `private` 会被自动补成 `public()`」。
+        病根是 v98 用了**黑名单**口径 —— "`_builtin_names()` 里、且不是数据类型
+        就算可调用"。而 `get_builtin_names()` 收的是**内建函数 + 常量 + 数据
+        类型 + 语言关键字**一整批（v62 起关键字也进来了），黑名单只挡了 13 个
+        数据类型名 ⇒ 关键字（`Public`/`Private`/`Dim`/`Call`…）与内建常量
+        （`vbCrLf`…）统统被当成"能调用的函数"。
+
+        ⇒ 改成白名单：只有 `BUILTIN_FUNCTIONS` 这 171 个才算候选。
+        函数∩关键字实测为 ∅，所以白名单一次挡住了关键字与常量两类误判，
+        而黑名单要跟着每一类新清单各写一条排除。
+
+        ⚠️ 白名单比黑名单严 ⇒ 万一漏收某个真函数，最坏是"这个函数不补括号"
+        （少做一次，用户按两下 `(` 也行）；黑名单漏一类则是"写坏用户的代码"。
+        这个方向的错误代价不对称，所以宁可白名单。
+
+        惰性取：vba_builtins 只被这一处用到，而它是个几百行的常量模块 ——
+        顶层 import 会拖慢每次启动（虽然只有一次，但没必要）。
+        """
+        global _BUILTIN_FUNCTION_NAMES_LOW
+        if _BUILTIN_FUNCTION_NAMES_LOW is None:
+            try:
+                import vba_builtins as _vb
+                _BUILTIN_FUNCTION_NAMES_LOW = frozenset(
+                    str(t).lower() for t in _vb.BUILTIN_FUNCTIONS)
+            except Exception:
+                _BUILTIN_FUNCTION_NAMES_LOW = frozenset()
+        return _BUILTIN_FUNCTION_NAMES_LOW
+
     def _builtin_type_names(self):
         """内建**数据类型**名（小写集合）—— Long / String / Object …。★v98。
 
-        为什么要单独减掉它们：`vba_builtins` 把内建**函数与数据类型**收在同
-        一批清单里（都属于"语言自带词汇"），不区分的话 `_is_callable_name`
-        会认为 `Long` 也能调用 ⇒ `Dim n As Long` 补成 `Dim n As Long()`。
+        ★v99 它不再是"唯一的排除项"，而是**白名单之上再叠一道排除**：VBA 里
+        `String` / `Date` **既是类型名也是函数**（`String(5, "x")` 是合法的
+        重复字符函数），它们同时出现在 `BUILTIN_FUNCTIONS` 与
+        `BUILTIN_TYPE_NAMES` 里（实测交集正好是这两个）。所以纯白名单会把
+        `String` 放行。
+
+        ⚠️ 这里排除掉**不是**说它们不能调用 —— `x = String(5, "ab")` 是合法
+        代码，引擎照样会补括号。挡住的是 `Dim n As <这里>` 那个**类型位置**；
+        那一道闸门在后端 `_is_call_site`（v98 加的，认 `As` / `New` 字样）。
+        两道闸门分工不同、都必须留着：这条管"名字本身像不像类型"，那条管
+        "这个位置是不是类型位置"。
 
         惰性取：vba_builtins 只被这一处用到，而它是个几百行的常量模块 ——
         顶层 import 会拖慢每次启动（虽然只有一次，但没必要）。
@@ -1424,20 +1468,33 @@ class Completer:
         return _BUILTIN_TYPE_NAMES_LOW
 
     def _is_callable_name(self, name):
-        """这个名字能不能被调用（该补括号）。★v98。
+        """这个名字能不能被调用（该补括号）。★v98 建，★v99 收紧。
 
-        两路证据，任一为真即可：
-          * 工程内过程名（`get_proc_names()`）—— 用户自己写的 Sub/Function/
-            Property/Declare；
-          * VBA 语言自带的名字（`_builtin_names()`）里、且**不是数据类型** ——
-            `MsgBox` / `Left` / `Split` 该补，`Long` / `String` / `Object`
-            不该补（那是 `As` 后面的类型）。
+        三路判据（v99 起从"黑名单"改成"白名单 + 一道类型排除"）：
+          1) 工程内过程名（`get_proc_names()`）—— 用户自己写的 Sub/Function/
+             Property/Declare；
+          2) VBA 语言自带的**函数**名（`_builtin_function_names()` 白名单）
+             且**不是**内建数据类型名（`_builtin_type_names()`）；
+             `MsgBox` / `Left` / `Split` 该补；`Public` / `Dim` / `vbCrLf` /
+             `Long` / `String` 全都不该补。
+
+        ★v99 必须**同时**留在 `_builtin_names()` 里（后端那份，已剔除工程内
+        自己声明过同名的名字）：用户在工程里 `Dim Split As String` 时，
+        `split` 是个变量、不该补括号，靠这一关挡住；他自己写了 `Sub Split`
+        则由第 1 路 proc_names 放行 —— 用户定义永远优先于语言自带。
+
+        ⚠️ 第 2 路的两道判据（白名单 / 类型排除）问的是**两个不同的问题**：
+        "VBA 有没有这个函数" vs "这个名字会不会被当成类型用"。
+        `String` 两边都是 yes ⇒ 只能靠后端那道 `_is_call_site` 按位置挡。
+        别试图在这里把 `String` 一票否决（那 `String(5, "ab")` 就不补了），
+        也不要把两道判据合成一条（合成一条就会出现 v99 那个 `public()`）。
         """
         low = str(name).lower()
         if low in self._proc_names():
             return True
         if low in self._builtin_names():
-            return low not in self._builtin_type_names()
+            return (low in self._builtin_function_names()
+                    and low not in self._builtin_type_names())
         return False
 
     def _host_enum_names(self):

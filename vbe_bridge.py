@@ -1200,6 +1200,125 @@ def blank_line_delete_wanted(line_text, caret_ec=None, tabw=4):
     return ec == len(t) + 1 or ec == _eol_disp_col(t, tabw)
 
 
+# ---- v99：退格成对删除（空括号 / 空引号）----
+#
+# 用户口径：「按退格键删除字符时，如果删除的是左右括号，或双引号，如果括号中
+# 或双引号中没内容，就能自动删除左右两端。」
+#
+# 即光标停在 `()` 或 `""` **中间**时按一次退格，两个字符一起消失
+# （VSCode / IDEA / VBE 之外的现代编辑器都是这个手感）。有内容时
+# （`(a|b)`）不接管 —— 那是一次普通删字，右括号得留着。
+#
+# 与 v94 退格删整行是同一副骨架：判据是纯函数、跑在键盘钩子线程里（只读
+# 轮询快照，绝不碰 COM）；真正的删除在主线程 `delete_pair_here`；删不成就把
+# 这一下退格【原样还给系统】。
+#
+# ⚠️ 本判据与 `_pair_insertion`（自动配对）刻意成对存在：自动配对插出来的
+# `()`，退格就该一次收掉，否则用户敲完 `f(` 想反悔，得按两下退格。
+_BS_PAIR_PAIRS = {"(": ")", '"': '"'}
+
+
+def pair_delete_span(line_text, char_col=None):
+    """光标停在【一对空括号 / 空引号的正中间】时，返回那一对的下标
+    `(left, right)`（0-based）；不该接管时返回 None。★v99。
+
+    这是本功能的**唯一一份判据** —— 钩子线程的 `pair_delete_wanted` 与主线程
+    的 `delete_pair_here` 都调它（项目铁律：钩子判据与后端复核必须同一份实现，
+    否则两边各写一遍，早晚有一边漏掉某个分支）。
+
+    ⚠️★v99 **`char_col` 必须是【字符列】，不是 VBE 报的显示列**。
+    我第一版让本函数自己去猜"VBE 这次报的是显示列还是字符列"（两种都试），
+    结果在 `    说()话` 这种含全角的行上**假阳性**：光标真在 `(` 与 `)` 之间，
+    显示列 7 被当成字符列 ⇒ left=5 ⇒ 命中了右邻的 `()` ⇒ 把不该删的两个字符
+    删了。**判据一旦"两种都试"，就从精确判据退化成两个模糊判据的并集** ——
+    漏判只是功能不生效，误判是改坏用户的代码，方向完全不可逆（MEMORY 第 19
+    条、第 10 条）。⇒ 换算的责任交给调用方，各用自己最准的那份：
+      * 主线程 `delete_pair_here` 用 `_caret_char_col`（它认得列语义）；
+      * 钩子线程 `pair_delete_wanted` 用 `_col_to_char_index` 按 (tabw=4,
+        wide2=True) 换算 —— 与 `blank_line_delete_wanted` 里 `_eol_disp_col`
+        用的是同一组默认假设。万一这台编辑器的列语义与假设不符，最坏是这一次
+        误判/漏判，而主线程还会用精确值复核一遍 ⇒ 顶多退化成原生退格。
+
+    判据本身极简，只问一件事：**光标左边那个字符和右边那个字符，是不是一对
+    配对符**（`(` + `)` 或 `"` + `"`）。这一条就把"中间没内容"钉死了 ——
+    左边是 `(`、右边紧跟着 `)`，本来就意味着两格之间什么都没有。
+
+    刻意**不做**的事：
+      * 不问光标位置（行首 / 行尾都行）。`f(|)` 与 `f()| |` 的差别只在于
+        用户接下来想干什么，不是"该不该删"；
+      * 不问是不是在字符串/注释里。`"(|)"` 是字符串内容，按了也没坏处
+        （用户自己敲出来的，不是我们插的），而"只删左边一个"反而更让人
+        意外 —— 宁可跟编辑器主流行为一致；
+      * **只认左开右闭**（`(` 在左、`)` 在右）。`f()|)` 这种"右括号挨着右
+        括号"不接管 —— 退格删的是左边那个 `)`，右边的 `)` 与它无关。
+    """
+    t = line_text or ""
+    if not t:
+        return None
+    try:
+        cc = int(char_col or 0)
+    except Exception:
+        return None
+    if cc <= 0:
+        return None
+    # 字符列 cc（1-based）⇒ 光标停在第 cc-1 个字符之前 ⇒ 左邻字符下标 cc-2。
+    left = cc - 2
+    right = left + 1
+    if left < 0 or right >= len(t):
+        return None
+    close = _BS_PAIR_PAIRS.get(t[left])
+    if close and t[right] == close:
+        return (left, right)
+    return None
+
+
+def pair_delete_wanted(line_text, caret_ec=None, tabw=4):
+    """钩子线程用的纯判据：这一下退格要不要由我们接管 —— 删掉一对空括号/
+    空引号（★v99）。语义见 `pair_delete_span`。
+
+    `caret_ec` 是**轮询快照里的 VBE 原始列（显示列）**，本函数负责换算成
+    字符列再问判据 —— 钩子线程没有 COM，够不到 `_caret_char_col`，只能用
+    `_bs_caret_char_col` 那套纯函数换算（与主线程 `delete_pair_here` 走的
+    **同一份**，项目铁律第 18 条：两侧必须同口径）。
+
+    ⚠️ 与 `blank_line_delete_wanted` 同处、同为纯函数：跑在键盘钩子线程里，
+    只读轮询留下的快照，绝不碰 COM。
+    """
+    col, _sem, _tabw, _wide2 = _bs_caret_char_col(line_text, caret_ec)
+    return pair_delete_span(line_text, col) is not None
+
+
+def _bs_caret_char_col(line_text, ec):
+    """v99 专用：VBE 的光标列 -> (字符列 1-based, sem, tabw, wide2)。
+
+    ★为什么**不能**直接用 `_caret_char_col`：那条路的第三档
+    `_fit_semantics` 是拿 **行尾列** 反推 (tabw, wide2) 的（`_detect_semantics_
+    passive` 只在 `ec > len+1` 时才走到那里）。而本功能的典型形态是光标停在
+    **行中间**的一对空括号上 —— `\tx = f()` 光标在 `()` 中间时 ec=11，
+    被当行尾列去拟合，**反推出 tabw=3**（真值是 4）⇒ 字符列偏 1 ⇒
+    `pair_delete_span` 读到 `f(` 上，一对都没匹配上，功能静默失效。
+
+    ⇒ 这里只走**两条不需要拟合的路**（宁可判不出、交给 VBE 原生退格）：
+      1) 行内既无 Tab 也无全角 ⇒ 两种列语义数值相同，直接当字符列用；
+      2) 否则用**最常见的** (tabw=4, 全角占 2) 换算 —— 与
+         `_eol_disp_col` / `blank_line_delete_wanted` 用的是同一组默认假设。
+
+    ⚠️ 假设错了顶多让这一次判不出（或判错而删掉一对本该留着的括号）。前者
+    无害，后者由调用方的兜底与下方的"读回复核"挡住：删完立刻比对写回结果，
+    对不上就还按键。
+    """
+    t = line_text or ""
+    try:
+        ec = int(ec or 0)
+    except Exception:
+        return 1, "char", 4, False
+    if ec <= 0:
+        return 1, "char", 4, False
+    if not ("\t" in t or any(_is_wide(c) for c in t)):
+        return min(ec, len(t) + 1), "char", 4, False
+    return _col_to_char_index(t, ec, 4, True) + 1, "disp", 4, True
+
+
 def _unterminated_string(line_text):
     """这一行的【代码部分】是否"引号没闭合"（VBE 原生回车会替用户补上右引号）。
 
@@ -2435,6 +2554,43 @@ def _caret_char_col(cm, cp, line_no, line_text, ec):
         return (_col_to_char_index(line_text, ec, tabw, wide2) + 1,
                 sem, tabw, wide2)
     return min(ec, len(line_text) + 1), sem, tabw, wide2
+
+
+def _locate_by_prefix(after, written, col0):
+    """VBE 把整行重写过一次之后，在 `after` 里找回 `written[:col0]` 这个
+    **前缀**的位置，返回对应的 0-based 字符下标；认不出来返回 None。★v99。
+
+    为什么要有它：VBE 的自动语法检测会重排整行（`x=1` -> `x = 1`、
+    `if a then` -> `If a Then`），行一变长，写入前算好的光标位置就偏了。
+
+    与 `_locate_inserted` 的差别：那一条找的是"我们**插入**的那对符号"，指纹
+    是 `written[:col0]`；这一条找的是"我们**删除**之后前缀结束的位置" ——
+    删除不会留下任何可搜的标记，唯一能认的指纹就是前缀本身。
+
+    按压平后的前缀找（`_norm_code`：去空白 + 小写）：VBE 在任何位置补空格 /
+    改大小写都不影响指纹。
+
+    ⚠️★v99 前缀在行里可能**出现多次**（`aa = aa`、`    x = x`），此时取
+    **离 `col0` 最近**的那一个，而不是"最长"或"第一个"。我第一版写了
+    "从后往前扫取最长" —— 实测 `aa = aa` 会命中行**尾**那个 `aa`（压平后与
+    前缀一样），把光标从行首扔到行中。改成"最近"就与 `_locate_inserted`
+    同一口径：VBE 重排只会挪动几个字符，不会把光标搬到半行之外。
+    """
+    try:
+        pre = _norm_code(written[:col0])
+        if pre == "":
+            # 前缀是空的（要落到行首）：行首就是答案。
+            return 0
+        hits = []
+        for k in range(len(after) + 1):
+            if _norm_code(after[:k]) == pre:
+                hits.append(k)
+        if hits:
+            near = min(col0, len(after))
+            return min(hits, key=lambda x: abs(x - near))
+        return None
+    except Exception:
+        return None
 
 
 def _pair_insertion(line_text, col0, open_ch, close_ch):
@@ -4256,6 +4412,97 @@ class VbeBackend:
                     cp.SetSelection(prev_no, _c, prev_no, _c)
             except Exception:
                 pass
+            return True
+        except Exception:
+            return False
+        finally:
+            _release_vbe_proxy()
+
+    # ---- v99：退格成对删除（空括号 / 空引号） ----
+    def delete_pair_here(self):
+        """删掉光标左右紧邻的那一对**空**括号 / 空引号，光标停在它们原来的
+        位置。★v99。
+
+        用户口径：「按退格键删除字符时，如果删除的是左右括号，或双引号，如果
+        括号中或双引号中没内容，就能自动删除左右两端。」钩子侧的纯判据见
+        `pair_delete_wanted` —— 那里已经按轮询快照筛过一遍，这里是**真正的
+        权威**：再读一次真实行文本确认，因为快照最多是 100ms 前的（用户可能
+        刚用鼠标把光标挪到了别处，也可能刚粘贴进一整段代码）。
+
+        落点选【左符号原来的位置】：`f(|)` 删完是 `f`，光标就该在 `f` 与下
+        一段之间 —— 也就是原生"删掉 `(`"之后的落点，两种做法观感一致，但
+        一次按键就把 `()` 收干净。
+
+        ⚠️ 这些情形一律返回 False（交给 VBE 原生退格，调用方会把这一下按键
+        原样还给系统，绝不会出现"吞了按键却什么都没发生"）：
+          * 有选区：退格是"删选区"，语义完全不同；
+          * 左右不是一对、或对里有内容（`(a|)`）：那是普通删字；
+          * 取不到 COM / 出任何异常。
+
+        单行一次写：只在确认完毕之后调一次 ReplaceLine（绝不边读边写、也绝不
+        在 finally 里补写）。落光标单独 try —— 写已经成了却因为落光标失败而
+        返回 False，会让调用方再补一次退格、把 `)` 也删掉。
+
+        ★列的处理走【显示列 -> 字符列】换算（`_caret_char_col`），再把**字符
+        列**喂给判据 —— 判据本身不猜列语义（见 `pair_delete_span` 里 v99 的
+        教训）。摆回去时再按同一份语义换回显示列，与 `insert_pair` 完全一致。
+        之所以不像 v94b 那样交给 VBE 自己钳：那次是"落到行尾"（给一个超大的
+        列让 VBE 夹），这次是"落到某个字符中间"，给不出那么干净的表达。
+        """
+        try:
+            vbe = _get_vbe_cached()
+            if vbe is None:
+                return False
+            cp = vbe.ActiveCodePane
+            if cp is None:
+                return False
+            cm = cp.CodeModule
+            sl, sc, el, ec = cp.GetSelection()
+            if int(sl) != int(el) or int(sc) != int(ec):
+                return False                    # 有选区：那是"删选区"
+            anchor = int(sl)
+            if anchor <= 0:
+                return False
+            raw = str(cm.Lines(anchor, 1)).rstrip("\r\n")
+            # ★权威复核：判据与钩子侧【同一份实现】（pair_delete_span），喂
+            # 进去的是【此刻真读到的】行与【换算好的字符列】—— 快照最多是
+            # 100ms 前的，中间用户可能已把光标点到别处，也可能刚粘贴进一整段
+            # 代码。这里一票否决，调用方会把这一下退格原样还给系统，绝不误删。
+            col, sem, tabw, wide2 = _bs_caret_char_col(raw, ec)
+            span = pair_delete_span(raw, col)
+            if not span:
+                return False
+            left, right = int(span[0]), int(span[1])
+            new_line = raw[:left] + raw[right + 1:]
+            if not self._write_line(cm, anchor, new_line):
+                return False
+            try:
+                # 光标落在 left（0-based 字符下标）处。写回后读回真实行：
+                # VBE 的自动语法检测可能把整行重排过（见 _locate_inserted 的
+                # 说明），届时按压平前缀重新定位，认不出来才退到 left
+                # （宁可偏一格，也不要越界或乱扔）。
+                actual = cm.Lines(anchor, 1)
+            except Exception:
+                actual = new_line
+            actual = ("" if actual is None else str(actual)).rstrip("\r\n")
+            caret_off = left
+            if actual != new_line:
+
+                try:
+                    off = _locate_by_prefix(actual, new_line, left)
+                    if off is not None:
+                        caret_off = off
+                except Exception:
+                    pass
+            caret_off = max(0, min(int(caret_off), len(actual)))
+            # ★摆回去用【本次换算出来的】tabw / wide2，不用写死的 (4, True)
+            #   —— 与 insert_pair 同一套算法（MEMORY 第 19 条：列语义要在
+            #   当下这一行现场量，不能吃缓存、也不能想当然）。
+            if sem == "disp":
+                out_col = _disp_width(actual, tabw, wide2, upto=caret_off) + 1
+            else:
+                out_col = caret_off + 1
+            cp.SetSelection(anchor, out_col, anchor, out_col)
             return True
         except Exception:
             return False
