@@ -39,6 +39,28 @@ _BUILTIN_FUNCTION_NAMES_LOW = None
 from log import log as _log
 from log import LOG_ENABLED as _LOG_ENABLED
 
+# ★v103b：会被补空格的关键字（小写）的惰性缓存 —— 同 _builtin_function_names
+# 的理由，vba_builtins 是几百行的常量模块，顶层 import 没必要。
+_BUILTIN_KEYWORD_SPACE_LOW = None
+
+
+def _keyword_wants_space(name):
+    """这个补全词是不是"后面要跟一个空格"的 VBA 关键字（纯函数）。★v103b。
+
+    对应 `vba_builtins.keyword_wants_space` 的惰性封装：取不到就返回 False
+    —— 宁可少补一个空格，也绝不补错（补错 = 往用户代码里塞一个多余字符）。
+    只认语言关键字；工程里的过程名 / 变量名一律 False。
+    """
+    global _BUILTIN_KEYWORD_SPACE_LOW
+    if _BUILTIN_KEYWORD_SPACE_LOW is None:
+        try:
+            import vba_builtins as _vb
+            _BUILTIN_KEYWORD_SPACE_LOW = frozenset(
+                _vb.BUILTIN_KEYWORD_NEEDS_SPACE)
+        except Exception:
+            _BUILTIN_KEYWORD_SPACE_LOW = frozenset()
+    return str(name or "").strip().lower() in _BUILTIN_KEYWORD_SPACE_LOW
+
 # VBE 自带提示列表的让位开关（v55）。
 #
 # 光标停在 VBE 自己会弹「自动列出成员」的位置时我们让位（详见
@@ -1054,9 +1076,6 @@ class Completer:
         #   绝不像 v94b 的 `_sem_cache` 那样跨触发沿用（那是把"某一次的结论"
         #   当成"现在的结论"）。UI 侧只读，用来显示"来自哪个模块"。
         self._scope_rank = {}
-        # _proc_sigs_now: 本次触发里"过程 -> 形参表"的快照（★v103），
-        #   UI 的详情行用它显示 `judge(s1, s2)`。同样每次触发重建，不跨触发沿用。
-        self._proc_sigs_now = {}
         self.shown_at = 0.0       # 最近一次真正弹出的时刻（供"刚弹出保护期"使用）
         # 当前候选各自的命中下标：{名字: [下标, ...]}，供 UI 把命中的字符标红。
         # 由 trigger() 填写、hide() 清空。UI 通过 completer 读取，不占用 show() 签名。
@@ -2510,14 +2529,6 @@ class Completer:
             self.hide()
             return
         self.matches = matches
-        # ★v103：本次候选的【形参表】快照 —— UI 的详情行拿它显示 `judge(s1, s2)`
-        # （仿 IDEA 在补全列表里就给出参数信息）。与 `_scope_rank` 一样：
-        # **每次触发重建、绝不跨触发沿用**，且取不到就退回空表（详情行退回
-        # 只显示完整名字的老行为，不会因为后端没实现这个接口就报错）。
-        try:
-            self._proc_sigs_now = dict(self.backend.get_proc_signatures() or {})
-        except Exception:
-            self._proc_sigs_now = {}
         # 按 Tab 即可直接确认当前已输入的完整名字；否则选中列表首项。
         exact = word.lower()
         sel = 0
@@ -2673,15 +2684,24 @@ class Completer:
                 _want_parens = self._is_callable_name(chosen)
             except Exception:
                 _want_parens = False
+            # ★v103b：这个词要不要在后面补一个空格（VBA 关键字，如 `pub` ->
+            # `public `）。与补括号同构：引擎判"是什么"（纯函数），后端判
+            # "位置允不允许 + 怎么补"（真机实测只能靠注入空格，见 vbe_bridge）。
+            # 关键字与内建函数交集为 ∅，所以"补括号"与"补空格"互斥、不会撞车。
+            try:
+                _want_space = _keyword_wants_space(chosen)
+            except Exception:
+                _want_space = False
             # ★v101 诊断：这一下 Tab 到底有没有走到 accept、以及"要不要补括号"
             # 这道判据的**输入是什么**。v100 那次"Call judge 按 Tab 不补括号"
             # 我连修两次都没修好，根因是每一层判据离线看都正常 —— 缺的是
             # "真机上 chosen 与 _proc_names 的真值"这一眼。
             # 只在 VBECOMPLETE_LOG=1 时拼这串（默认 _log 直接 return）。
             _log("accept: line=%s ws=%s we=%s chosen=%r want_parens=%s"
+                 " want_space=%s"
                  " | in_proc=%s builtin=%s is_func=%s is_type=%s"
                  % (ctx.get("line_no"), ctx.get("word_start_col"), end_col,
-                    chosen, _want_parens,
+                    chosen, _want_parens, _want_space,
                     str(chosen).lower() in self._proc_names(),
                     str(chosen).lower() in self._builtin_names(),
                     str(chosen).lower() in self._builtin_function_names(),
@@ -2689,7 +2709,7 @@ class Completer:
             try:
                 self.backend.apply_completion(
                     ctx["line_no"], ctx["word_start_col"], end_col, chosen,
-                    _want_parens)
+                    _want_parens, _want_space)
             except TypeError:
                 # 旧式 / 测试后端的 apply_completion 只有 4 个位置参数。
                 self.backend.apply_completion(
@@ -2720,21 +2740,6 @@ class Completer:
     def is_visible(self):
         return self.visible
 
-    def signature_of(self, name):
-        """这个候选的形参表（如 `"(s1, s2)"`）；没有就返回空串。★v103。
-
-        给 UI 的"详情行"用 —— 仿 IDEA：选中/悬停到一个过程或函数时，
-        列表下方把它的形参一并显示出来，用户不必先确认再回头回忆参数。
-
-        ⚠️ 只在【过程/函数】上有值（来源是 parser 的过程头正则），
-        变量 / 常量 / 关键字一律空串 —— 那一档不显示任何东西，
-        绝不拿名字拼一个假的 `()` 出来（"没有信息"和"没有参数"是两件事）。
-        """
-        try:
-            return str((self._proc_sigs_now or {}).get(str(name).lower()) or "")
-        except Exception:
-            return ""
-
     def current_matches(self):
         return list(self.matches)
 
@@ -2746,9 +2751,6 @@ class Completer:
         self.ctx = None
         self.word_is_complete = False
         self.match_hits = {}
-        # ★v103：形参表快照与候选同生共死，绝不留下上一批的签名
-        # （否则下一次弹出时详情行可能显示上一个过程的参数）。
-        self._proc_sigs_now = {}
         self.ui.hide()
 
     def maybe_hide_on_outside_click(self, px, py):

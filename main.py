@@ -702,7 +702,7 @@ def main():
     try:
         root = tk.Tk()
         root.withdraw()
-        backend = VbeBackend()
+        backend = VbeBackend(send_char=send_char)
         popup = Popup(root)
         # 滚动窗口行数以 UI 为准（两边必须是同一个数，否则窗口会露出半行）
         completer = engine.Completer(backend, popup, view_rows=MAX_VISIBLE_ROWS)

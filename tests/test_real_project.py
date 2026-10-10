@@ -14813,10 +14813,10 @@ def main():
         _seg82 = _bsrc82[_i82:_i82 + 2600]
         check("82.12 源码护栏：`_eol_caret_col` 的兜底必须调 `_eol_disp_col`，"
               "不许再自己算一份（'同一语义只能一份实现'：这两份曾经在全角上"
-              "给出不同的数）",
-              ["return _eol_disp_col(t, 4)" in _seg82,
-               "_disp_width(t, 4, False) + 1" not in _seg82],
-              expect_contain=[True, True])
+              "给出不同的数）—— 打包成元组，退化了才真会红",
+              [("return _eol_disp_col(t, 4)" in _seg82,
+                "_disp_width(t, 4, False) + 1" not in _seg82)],
+              expect_contain=[(True, True)])
 
         # ---- 82.13 作用域档位（IDEA 局部作用域优先的输入）----
         _pool83 = [("myVar", "M1", "Cur", False),
@@ -14842,9 +14842,8 @@ def main():
         #      —— 稳定排序下，插入序就是"没有任何相关度信号时"的结果，
         #      于是 A/B 能分辨出到底是谁在起作用。
         class _B82(object):
-            def __init__(self, pool, ctx_extra=None, sigs=None):
+            def __init__(self, pool, ctx_extra=None):
                 self._pool = list(pool)
-                self._sigs = dict(sigs or {})
                 self._ctx = {"line_no": 1, "in_string": False,
                              "in_comment": False, "in_type_position": False,
                              "in_decl_position": False, "decl_names": []}
@@ -14877,9 +14876,6 @@ def main():
             def get_proc_names(self):
                 return frozenset()
 
-            def get_proc_signatures(self):
-                return dict(self._sigs)
-
             def names_outside_caret(self, caret, scope_only=False):
                 return None          # 现场证据不可用 -> 走真名集合那条路
 
@@ -14908,11 +14904,11 @@ def main():
             def contains_point(self, *a, **k):
                 return False
 
-        def _trig82(word, pool, proc=None, module="M1", sigs=None):
+        def _trig82(word, pool, proc=None, module="M1"):
             _ln = "    " + word
             _c = E.Completer(
                 _B82(pool, {"line_text": _ln, "caret_col": len(_ln) + 1,
-                            "proc_name": proc, "module_name": module}, sigs),
+                            "proc_name": proc, "module_name": module}),
                 _U82())
             _c.trigger(True)
             return _c
@@ -14968,52 +14964,163 @@ def main():
               [list(_c82e.matches or [])],
               expect_contain=[["aaaTwo", "aaaOne"]])
 
-        # ---- 82.17 ★IDEA 式参数信息：候选详情行显示形参表 ----
-        _sig82 = P.extract_proc_signatures(
-            "Sub judge(s1, s2)\nEnd Sub\n"
-            "Private Sub NoArgs()\nEnd Sub\n"
-            "Sub Multi(a As Long, _\n          b As String)\nEnd Sub\n"
-            "Function Compute As Long\nEnd Function\n")
-        check("82.17 `parser.extract_proc_signatures`：只取形参【名字】；"
-              "跨行的形参表（行继续符 `_`）宁可不给签名，也不许给一个假的 `()`；"
-              "无括号的过程头同理",
-              sorted(_sig82.items()),
-              expect_contain=[("judge", "(s1, s2)"), ("noargs", "()")],
-              expect_absent=[("compute", "()"), ("multi", "()")])
+        # ---- 82.17~82.19 ★v103b：候选窗详情行【不】显示形参表 ----
+        #      用户口径（原话）："提示自定义函数的时候，不需要在提示词框最下方
+        #      提示形参列表。" v103 曾仿 IDEA 在详情行接上 `judge  (s1, s2)`，
+        #      现在整套撤掉 —— 这里把"撤干净"钉住（源码护栏 + 接口不存在）。
+        check("82.17 ★v103b `parser` 不再提供 `extract_proc_signatures`"
+              "（形参表这套解析彻底撤掉，不留无人调用的死代码）",
+              [hasattr(P, "extract_proc_signatures")],
+              expect_contain=[False])
 
-        _c82f = _trig82("jud", [("judge", "M1", None, False)],
-                        sigs={"judge": "(s1, s2)"})
-        check("82.18 `Completer.signature_of`：有签名给签名（大小写不敏感），"
-              "没有给空串（「没有信息」和「没有参数」是两件事 —— "
-              "绝不拿名字拼一个 `()`）",
-              [list(_c82f.matches or []),
-               _c82f.signature_of("judge"), _c82f.signature_of("Judge"),
-               _c82f.signature_of("temp")],
-              expect_contain=[["judge"], "(s1, s2)", ""])
+        _c82f = _trig82("jud", [("judge", "M1", None, False)])
+        check("82.18 ★v103b `Completer` 不再有 `signature_of` / `_proc_sigs_now`"
+              "（详情行拿不到形参，自然也不会去显示）",
+              [(hasattr(_c82f, "signature_of"),
+                hasattr(_c82f, "_proc_sigs_now"),
+                list(_c82f.matches or []))],
+              expect_contain=[(False, False, ["judge"])])
 
         _usrc82 = io.open(os.path.join(ROOT, "ui.py"), encoding="utf-8").read()
-        check("82.19 源码护栏：UI 的详情行必须接上 `signature_of`，"
-              "且**拿不到签名时退回只显示完整名字**的老行为"
-              "（假 completer 没这个方法也不许报错）",
-              ["signature_of" in _usrc82,
-               "elif self._measure(name) > text_w:" in _usrc82,
-               'getattr(self.completer, "signature_of", None)' in _usrc82],
-              expect_contain=[True, True, True])
+        # ⚠️ 不能直接 `"if self._measure..." in src`：`elif self._measure...`
+        #    **包含** `if self._measure...` 这段子串（'e','l','i','f',' '），
+        #    于是那种写法根本分不出 `if` 与 `elif`。按行 startswith 才准。
+        _ulines82 = [l.strip() for l in _usrc82.split("\n")]
+        check("82.19 源码护栏：UI 详情行必须**退回老行为** —— "
+              "只在名字被省略（超宽）时显示完整名字；"
+              "源码里不许再出现 `signature_of` 或 `name + \"  \" + sig`",
+              [("signature_of" not in _usrc82,
+                'name + "  " + sig' not in _usrc82,
+                any(l.startswith("if self._measure(name) > text_w:")
+                    for l in _ulines82),
+                any(l.startswith("elif self._measure(name) > text_w:")
+                    for l in _ulines82))],
+              expect_contain=[(True, True, True, False)])
 
+        _bsrc82b = io.open(os.path.join(ROOT, "vbe_bridge.py"),
+                           encoding="utf-8").read()
         _esrc82 = io.open(os.path.join(ROOT, "engine.py"),
                           encoding="utf-8").read()
+        check("82.19b 源码护栏：`vbe_bridge` / `engine` 里也不许再留"
+              " `get_proc_signatures` / `_proc_sigs`（后端那一路收集一并撤掉）",
+              [("get_proc_signatures" not in _bsrc82b,
+                "_proc_sigs" not in _bsrc82b,
+                "extract_proc_signatures" not in _bsrc82b,
+                "_proc_sigs_now" not in _esrc82)],
+              expect_contain=[(True, True, True, True)])
+
         check("82.20 源码护栏：`accept()` 里必须真的记一笔「最近用过」"
               "（用例只钉得住 `_note_recent` 本身，钉不住「钩子/主线程有没有"
               "记账」—— 同 v90/v91 那条教训）",
-              ["self._note_recent(chosen)" in _esrc82,
-               "_sr.get(t[1].lower(), 2)" in _esrc82,
-               "_rc.get(t[1].lower(), 0)" in _esrc82],
-              expect_contain=[True, True, True])
+              [("self._note_recent(chosen)" in _esrc82,
+                "_sr.get(t[1].lower(), 2)" in _esrc82,
+                "_rc.get(t[1].lower(), 0)" in _esrc82)],
+              expect_contain=[(True, True, True)])
 
     except Exception as _e82:
         import traceback as _tp82
         _tp82.print_exc()
         check("第 82 节异常: %s" % _e82, [True], expect_contain=[False])
+
+    # ------------------------------------------------------------------
+    # 83. ★v103b：关键字补全后自动补一个空格
+    #     用户口径："在使用 public，private，sub，function，set，if，for，with，
+    #     select，end，exit 等这类关键词时，后面需要有空格，要在按 tab 键后，
+    #     也能自动补全空格，idea 里就有这个功能。"
+    #     ⚠️ 真机实测（独立 Excel 实例 + 真 CodeModule）：VBE 会把 ReplaceLine
+    #     写进去的**行尾空格立刻 trim 掉**（`"    public "` 读回 `"    public"`）
+    #     ⇒ 不能靠改行文本，只能在光标就位后【注入一个空格按键】（实测保留）。
+    # ------------------------------------------------------------------
+    try:
+        import vba_builtins as _B83
+        import vbe_bridge as VB83
+
+        # ⚠️⚠️ 本节的断言一律**把多项打包成一个元组**再比（MEMORY 第 37 条）：
+        #   `check` 的 expect_contain 是【逐元素成员判断】(`x not in got`)。
+        #   一串布尔 + 全 True 的期望 ⇒ 只要 got 里有【任意一个】 True 就永远绿
+        #   （A/B 实测：把 `_space_insert_pos` 改成行末返回 None，83.4 竟然不红）。
+        #   打包成元组让"位置/组合"参与比较，退化了才真会红。
+
+        check("83.1 `keyword_wants_space`：用户点名的 11 个关键字全部要补空格"
+              "（大小写不敏感）",
+              [tuple(_B83.keyword_wants_space(w) for w in
+                     ("public", "private", "sub", "function", "set", "if",
+                      "for", "with", "select", "end", "exit",
+                      "Public", "PRIVATE", "Function"))],
+              expect_contain=[tuple([True] * 14)])
+
+        check("83.2 `keyword_wants_space` 反面：经常是【整行最后一个词】的"
+              "（Else / Next / Loop / Then …）、后面紧跟【点号】的（Me / Debug）、"
+              "本身就是【完整表达式】的（True / Nothing），以及工程内名字 —— "
+              "一律【不】补空格",
+              [tuple(_B83.keyword_wants_space(w) for w in
+                     ("else", "next", "loop", "wend", "then", "resume", "stop",
+                      "explicit", "do", "me", "debug", "true", "false",
+                      "nothing", "empty", "null", "myVar", "judge", "", None))],
+              expect_contain=[tuple([False] * 20)])
+
+        check("83.3 「补空格」与「补括号」互斥：关键字与内建函数交集为空 "
+              "（`Set` / `Call` 只在关键字表、不在函数表 ⇒ 不会被 "
+              "`_is_callable_name` 判成可调用、不会补成 `Set()`）",
+              [(len(set(_B83.BUILTIN_KEYWORD_LOWER)
+                    & set(n.lower() for n in _B83.BUILTIN_FUNCTIONS)),
+                "set" in set(n.lower() for n in _B83.BUILTIN_FUNCTIONS),
+                _B83.keyword_wants_space("set"),
+                E._keyword_wants_space("set"),
+                E._keyword_wants_space("else"))],
+              expect_contain=[(0, False, True, True, False)])
+
+        # ---- 83.4 插入位置纯函数（不碰 COM，可离线钉死）----
+        _sp = VB83._space_insert_pos
+        check("83.4 `_space_insert_pos`：词尾在行末 -> 就在词尾补；"
+              "词尾右边已经是空格 -> 不补（不重复）；"
+              "右边是别的字符 -> 补（把关键字与后面的东西隔开）",
+              [(_sp("    public", 5, "public"),            # k=10 == len -> 10
+                _sp("    public Sub", 5, "public"),       # k=10 是空格 -> None
+                _sp("    publicx", 5, "public"),          # k=10 是 'x' -> 10
+                _sp("    public", 5, ""))],               # 空 completion -> 4
+              expect_contain=[(10, None, 10, 4)])
+
+        # ---- 83.5 源码护栏：三方接线必须都在 ----
+        _msrc83 = io.open(os.path.join(ROOT, "main.py"), encoding="utf-8").read()
+        check("83.5 源码护栏：`accept()` 必须判「是不是关键字」并把结果传给 "
+              "`apply_completion`（引擎判是什么、后端判位置）；"
+              "`main` 必须把注入函数交给后端",
+              [("_keyword_wants_space(chosen)" in _esrc82,
+                "_want_parens, _want_space)" in _esrc82,
+                "def _keyword_wants_space(" in _esrc82,
+                "VbeBackend(send_char=send_char)" in _msrc83)],
+              expect_contain=[(True, True, True, True)])
+
+        _bsrc83 = io.open(os.path.join(ROOT, "vbe_bridge.py"),
+                          encoding="utf-8").read()
+        check("83.6 源码护栏：后端必须有开关 `AUTO_SPACE_AFTER_KEYWORD`、"
+              "用 `_space_insert_pos` 定位、并在光标就位后经 `_send_char` 注入"
+              "（真机实测：VBE 会 trim 行尾空格，只能注入按键）",
+              [("AUTO_SPACE_AFTER_KEYWORD = _env_flag(" in _bsrc83,
+                "_space_insert_pos(new_line, word_start_col, completion)"
+                in _bsrc83,
+                "getattr(self, \"_send_char\", None)" in _bsrc83,
+                "def _space_insert_pos(" in _bsrc83,
+                "want_space=False" in _bsrc83)],
+              expect_contain=[(True, True, True, True, True)])
+
+        _vsrc83 = io.open(os.path.join(ROOT, "vba_builtins.py"),
+                          encoding="utf-8").read()
+        check("83.7 源码护栏：关键字表必须带排除法（`KEYWORDS_NO_TRAIL_SPACE` "
+              "是【真子集】：既非空、又小于全部关键字 —— 全部要补 / 全部不补"
+              "都说明排除法写坏了）",
+              [(len(_B83.KEYWORDS_NO_TRAIL_SPACE) > 0,
+                len(_B83.BUILTIN_KEYWORD_NEEDS_SPACE) > 0,
+                len(_B83.BUILTIN_KEYWORD_NEEDS_SPACE)
+                < len(_B83.BUILTIN_KEYWORD_LOWER),
+                "def keyword_wants_space(" in _vsrc83)],
+              expect_contain=[(True, True, True, True)])
+
+    except Exception as _e83:
+        import traceback as _tp83
+        _tp83.print_exc()
+        check("第 83 节异常: %s" % _e83, [True], expect_contain=[False])
 
     print("\n" + "=" * 60)
     print("结果: %d PASS, %d FAIL" % (PASS, FAIL))

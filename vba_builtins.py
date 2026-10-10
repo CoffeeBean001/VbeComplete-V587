@@ -232,3 +232,39 @@ BUILTIN_KEYWORDS = tuple(dict.fromkeys(KEYWORDS))
 BUILTIN_LOWER = frozenset(n.lower() for n in BUILTIN_NAMES)
 BUILTIN_TYPE_LOWER = frozenset(n.lower() for n in BUILTIN_TYPE_NAMES)
 BUILTIN_KEYWORD_LOWER = frozenset(n.lower() for n in BUILTIN_KEYWORDS)
+
+# --------------------------------------------------------------------------
+# ★v103b：哪些关键字在补全后要跟一个【空格】
+# --------------------------------------------------------------------------
+# 用户口径（原话）："在使用 public，private，sub，function，set，if，for，
+# with，select，end，exit 等这类关键词时，后面需要有空格，要在按 tab 键后，
+# 也能自动补全空格，idea 里就有这个功能。"
+#
+# 实现用【排除法】：语言关键字里绝大多数后面必然还要跟一个词（过程名 / 变量名 /
+# 条件表达式 / 操作数），补一个空格总是对的；只有少数几种情况不该补，逐个排除：
+#   * 经常是【整行的最后一个词】：Else / Next / Loop / Wend / Then / Resume /
+#     Stop / Return / Explicit / Do —— 补了会在行尾留一个空格（VBE 还不 trim）；
+#   * 后面紧跟的是【点号】而不是空格：Me / Debug（`Me.Value` / `Debug.Print`）；
+#   * 本身就是【完整表达式】：True / False / Nothing / Empty / Null。
+# 排除法（而不是白名单）的好处：关键字表将来加词时，新词自动获得补空格能力，
+# 只有真正不适合的才需要显式排除。
+KEYWORDS_NO_TRAIL_SPACE = frozenset((
+    "explicit", "me", "debug", "then", "else", "next", "do", "loop", "wend",
+    "return", "resume", "stop", "true", "false", "nothing", "empty", "null",
+))
+
+# 会被补空格的关键字（小写），预先算好，查询 O(1)。
+BUILTIN_KEYWORD_NEEDS_SPACE = frozenset(
+    BUILTIN_KEYWORD_LOWER - KEYWORDS_NO_TRAIL_SPACE)
+
+
+def keyword_wants_space(word):
+    """这个补全词是不是"后面要跟一个空格"的 VBA 关键字（纯函数）。★v103b。
+
+    只认【语言关键字】这一组；工程里的过程名 / 变量名 / 组件名一律 False
+    —— 变量后面多一个空格纯属噪音。用户自建的 Sub / Function 也不在这里
+    （它们走"补括号"那条路，由 engine._is_callable_name 判）。
+
+    大小写不敏感（候选窗里给的是关键字原文，如 `Public`）。
+    """
+    return str(word or "").strip().lower() in BUILTIN_KEYWORD_NEEDS_SPACE

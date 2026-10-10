@@ -247,40 +247,6 @@ def _params_inside(paren_text):
     return names
 
 
-def extract_proc_signatures(code):
-    """从模块源码里提取 {小写过程名: "(s1, s2)"}。★v103。纯文本、不碰 COM。
-
-    用途：候选窗的"详情行"显示形参表 —— 仿 IDEA 在补全列表里就把参数列出来
-    （用户不必先确认、再回头回忆这个子过程要几个参数）。
-
-    只取形参【名字】，不取类型：类型那一段要处理 `As` / 数组括号 / 默认值 /
-    Optional，而用户在这一眼里真正要看的是"有几个参数、都叫什么"。
-
-    ⚠️ 与 `extract_records` 用**同一批**过程头正则（_RE_SUB / _RE_PROP /
-    _RE_DECLARE）—— 两边认出来的过程必须完全一致，否则会出现"有候选没签名"
-    或"有签名没候选"。所以这里刻意不另写一套正则。
-    ⚠️ 形参表跨行（VBA 的行继续符 `_`）时这一行里找不到 `(...)`，那就**不产出
-    签名**：宁可不显示，也不显示一个错的 `()`。
-    """
-    out = {}
-    for line in str(code or "").split("\n"):
-        if not line.strip():
-            continue
-        m = (_RE_SUB.match(line) or _RE_PROP.match(line)
-             or _RE_DECLARE.match(line))
-        if not m:
-            continue
-        pm = re.search(r"\(([^)]*)\)", line)
-        if not pm:
-            continue
-        try:
-            names = _params_inside(pm.group(1))
-        except Exception:
-            names = []
-        out[str(m.group(1)).lower()] = "(" + ", ".join(names) + ")"
-    return out
-
-
 def extract_records(code, module=None, is_std_module=True, caret=None):
     """
     返回 (records, proc_names)：

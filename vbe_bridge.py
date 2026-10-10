@@ -179,6 +179,23 @@ ENABLE_CROSS_PROJECT = False
 # 所以判据是"【这一行的这个位置】是不是一个可以直接调用过程的位置"。
 AUTO_PAREN_ON_COMPLETE = _env_flag("VBECOMPLETE_AUTO_PAREN", True)
 
+# ★v103b：补全一个"后面要跟空格"的 VBA 关键字时，顺手补一个空格
+# （用户口径："在使用 public，private，sub，function，set，if，for，with，
+# select，end，exit 等这类关键词时，后面需要有空格，要在按 tab 键后，也能
+# 自动补全空格，idea 里就有这个功能"）。
+# 哪些关键字要补由 `vba_builtins.keyword_wants_space` 判（纯函数）；
+# 这里只管"这个位置允不允许补"以及"怎么补"。
+#
+# ⚠️⚠️ 真机实测（独立 Excel 实例 + 真 CodeModule）：**VBE 会把 ReplaceLine
+# 写进去的行尾空格立刻 trim 掉** ——
+#     写 `"    public "` 读回 `"    public"`（尾字符 'c'，空格没了）；
+#     两次 ReplaceLine、光标移走再读、读别的行之后再读，一律还是 `"    public"`。
+# ⇒ 靠改写行文本（`new_line[:k] + " " + new_line[k:]`）**根本补不上**。
+# 唯一可行的办法：写完这一行、光标到位之后，**注入一个空格按键**。
+# 实测注入的空格会被保留（读回 `"    public "`），后面再注入 'S' 得到
+# `"    public S"` —— 正是用户要的效果。
+AUTO_SPACE_AFTER_KEYWORD = _env_flag("VBECOMPLETE_AUTO_SPACE", True)
+
 def _co_free():
     """释放 pywin32 缓存的 COM 代理（仅在显式开启时才会真正调用）。
 
@@ -1496,6 +1513,33 @@ def _in_call_stmt(line_text):
 
 # `^\s*Call` 且后面不是标识符字符（挡住 `Callback` / `CallCount` 这类名字）。
 _CALL_STMT_RE = re.compile(r"^[ \t]*call(?![A-Za-z0-9_])", re.I)
+
+
+def _space_insert_pos(new_line, word_start_col, completion):
+    """要在 `new_line` 的哪个【字符下标】注入一个空格；不需要补就返回 None。
+
+    ★v103b 纯函数（不碰 COM），供 `apply_completion` 判"关键字后要不要补空格"，
+    也让这条判据能被离线用例直接钉住。
+
+    规则：补全词的**词尾**右边如果不是空白，就在那里补一个空格。
+      * 词尾已在行末            -> 要补（返回词尾下标）；
+      * 词尾右边是空格 / Tab    -> 不补（用户自己打了，或上一轮已经补过）；
+      * 词尾右边是别的字符      -> 要补（把关键字与后面的东西隔开）。
+    注意返回的是**词尾下标**（0-based，插入点），不是"跳过空白之后"的位置 ——
+    同 v98 括号那条铁律：为判断而算的位置不能拿去当插入点。
+    """
+    try:
+        k = int(word_start_col) - 1 + len(str(completion or ""))
+    except Exception:
+        return None
+    if k < 0:
+        return None
+    line = str(new_line or "")
+    if k >= len(line):
+        return k
+    if line[k] in " \t":
+        return None
+    return k
 
 
 def _is_call_site(line_text, word_start_col):
@@ -2980,7 +3024,12 @@ def host_enum_constants():
 
 
 class VbeBackend:
-    def __init__(self):
+    def __init__(self, send_char=None):
+        # ★v103b：把字符"还给系统"的注入函数（main.send_char）。只在
+        # "关键字补空格"这一处用到 —— 真机实测 VBE 会把 ReplaceLine 写进去的
+        # 行尾空格 trim 掉，唯一可行的补法是注入一个空格按键。
+        # 传 None（旧式构造 / 离线测试）时该功能静默不生效，绝不影响其它路径。
+        self._send_char = send_char
         self._cache = None
         self._cache_time = 0
         self._declared_names = set()
@@ -2990,8 +3039,6 @@ class VbeBackend:
         # （`Dim n As Long` 补成 `Long()` 直接编译不过）。收集时由
         # parser.extract_records 一并给出，不额外读代码、不额外打 COM。
         self._proc_names = set()
-        # ★v103：过程 -> 形参表（`judge` -> `(s1, s2)`），供候选窗详情行显示。
-        self._proc_sigs = {}
         # ★v98：{类型名(小写): (收集时间戳, 成员名小写集合)}。
         # 与 _cache_time 同一个 TTL（get_members_of 里比对）。
         self._members_of_cache = {}
@@ -3133,24 +3180,6 @@ class VbeBackend:
             except Exception:
                 return frozenset()
         return frozenset(getattr(self, "_proc_names", None) or ())
-
-    def get_proc_signatures(self):
-        """返回 {小写过程名: "(s1, s2)"} —— ★v103，供候选窗详情行显示形参表。
-
-        与 `get_proc_names` 同源（同一次 `_collect_identifiers`、同一个 TTL、
-        同一个刷新点），所以"有候选"与"有签名"永远一致，不会出现一边新一边旧。
-
-        ⚠️ 交回内部 dict 本身（**只读，调用方不得修改**），理由同
-        get_structural_names / get_proc_names：这一路是按一次补全查的。
-        没签名（跨行形参表）的过程名直接不在 dict 里 —— 调用方按"查不到就没有"
-        处理，绝不要拿名字拼一个空的 `()` 出来。
-        """
-        if not getattr(self, "_proc_sigs", None):
-            try:
-                self.get_identifiers()
-            except Exception:
-                return {}
-        return getattr(self, "_proc_sigs", None) or {}
 
     def get_declared_names(self):
         """返回工程里真实声明过的名字（小写集合），供引擎剔除"提示自己"的幻影。
@@ -3342,9 +3371,6 @@ class VbeBackend:
         # ★v98：过程名（Sub / Function / Property / Declare），随 extract_records
         # 一并返回 —— 与 declared_names 的差别见 __init__ 里的说明。
         proc_names = set()
-        # ★v103：过程 -> 形参表文本（`judge` -> `"(s1, s2)"`），供候选窗详情行。
-        # 与 proc_names 同源同刷新（同一个 TTL、同一次收集）。
-        proc_sigs = {}
         # 结构性名字：组件名 + 窗体控件名（v60）+ 语言自带名字（v61/v62）。
         # 详见 __init__ 里的说明。
         structural_names = set()
@@ -3417,14 +3443,6 @@ class VbeBackend:
                         code, module=mod_name, is_std_module=is_std,
                         caret=apply_caret)
                     proc_names |= _proc_of
-                    # ★v103：顺手把过程的【形参表】也收下来（同一遍代码、
-                    # 同一批正则，不额外打 COM），给候选窗的详情行显示
-                    # `judge(s1, s2)` 用 —— 仿 IDEA 在补全列表里就给出参数。
-                    try:
-                        proc_sigs.update(
-                            vba_parser.extract_proc_signatures(code))
-                    except Exception:
-                        pass
                     records.extend(recs)
                     # 记下【这一刻光标处的词】：它多半是用户正在输入 / 正在
                     # 回退删除的词。回退删字时，缓存的池子里还留着它更长的
@@ -3628,7 +3646,6 @@ class VbeBackend:
         self._type_names = type_names
         self._declared_names = declared_names
         self._proc_names = proc_names
-        self._proc_sigs = proc_sigs          # ★v103：过程 -> 形参表
         self._declared_by_module = _decl_by_mod
         self._structural_names = structural_names
         self._builtin_names = builtin_names
@@ -4045,7 +4062,7 @@ class VbeBackend:
 
     # ---- 应用补全 ----
     def apply_completion(self, line_no, word_start_col, end_col, completion,
-                         want_parens=False):
+                         want_parens=False, want_space=False):
         """把 [word_start_col, end_col) 区间的单词替换为 completion 并写回 VBE。
 
         word_start_col / end_col 均为 1-based 字符列（与 Python 行文本一致）。
@@ -4058,6 +4075,14 @@ class VbeBackend:
         且词右边本来没有左括号，就在补全词后面补一对 `()` 并把光标送进去。
         **调用方必须先确认 completion 确实是过程/函数**（引擎用
         `get_proc_names()` 判）—— 这里只管"位置允不允许"，不管"是什么"。
+
+        want_space（★v103b）：True 时（且 `AUTO_SPACE_AFTER_KEYWORD` 开着），
+        若补全词的词尾右边不是空白，就在词尾补一个【空格】。用于 VBA 关键字
+        （`pub` -> `public `）。**调用方必须先确认 completion 是这种关键字**
+        （引擎用 `vba_builtins.keyword_wants_space` 判）—— 这里只管位置。
+        ⚠️ 空格**不是**改写行文本补的：真机实测 VBE 会把 ReplaceLine 写进去的
+        行尾空格立刻 trim 掉，所以只能在光标就位之后【注入一个空格按键】
+        （`self._send_char`，由 main 注入；没有它就不补，绝不半途改坏代码）。
 
         写回后把光标放到补全词尾部：
           - 若该行(含 Tab/全角)在 VBE 里按"显示列"计，就把字符列换算成显示列，
@@ -4105,6 +4130,16 @@ class VbeBackend:
                     new_line = new_line[:k] + "()" + new_line[k:]
                     added_parens = True
 
+            # ★v103b：关键字后面补一个空格。
+            # ⚠️ 这里**不**改写 new_line —— 真机实测 VBE 会把行尾空格立刻 trim 掉，
+            # 改写等于白写。只算好"要往哪个下标注入一个空格"（纯函数，
+            # 便于离线用例钉住），真正的注入在光标摆好之后做。
+            space_at = None
+            if want_space and AUTO_SPACE_AFTER_KEYWORD:
+                space_at = _space_insert_pos(new_line, word_start_col, completion)
+            _log("apply_completion: want_space=%s AUTO_SPACE=%s space_at=%s"
+                 % (want_space, AUTO_SPACE_AFTER_KEYWORD, space_at))
+
             # 词尾字符下标（0-based）
             start0 = max(0, word_start_col - 1)
             end0 = start0 + len(completion)
@@ -4132,8 +4167,14 @@ class VbeBackend:
             # ★v98：这一条同时负责**我们自己在 v98 补的那对括号** —— 上面的
             # 插入位置恰好是词尾，所以 `actual[end0]` 就是那个新 `(`，这里
             # 自然把光标送进括号里，逻辑完全复用、不必另写一段。
-            end0 = _skip_into_parens(actual, end0, line_text, end_col)
-            end0 = min(end0, len(actual))
+            #
+            # ★v103b：补空格时【不】走这一段 —— 关键字不补括号，光标必须稳稳
+            # 停在词尾（再注入空格），不能被 `_skip_into_parens` 带进某个 `(`。
+            if space_at is None:
+                end0 = _skip_into_parens(actual, end0, line_text, end_col)
+                end0 = min(end0, len(actual))
+            else:
+                end0 = min(space_at, len(actual))
 
             # 关键：列语义必须在【写回之后】的实际行上量，而且**不能拿缓存**。
             #
@@ -4167,6 +4208,22 @@ class VbeBackend:
                 cp.SetSelection(line_no, col, line_no, col)
 
             _set_caret(actual, end0)
+            if space_at is not None:
+                # ★v103b：光标已在关键字**词尾**，注入一个空格。
+                # 这一下是【注入进来的字符】，VBE 不会像行尾空格那样把它 trim
+                # 掉 —— 真机实测：注入空格后读回 `"    public "`，再注入 'S'
+                # 得到 `"    public S"`。
+                # ⚠️ 注入函数由 main 传进来（`VbeBackend(send_char=...)`）；
+                # 没有它（旧式构造 / 离线测试）就什么都不做 —— 宁可"没补空格"，
+                # 也绝不半途改坏代码。
+                try:
+                    _send = getattr(self, "_send_char", None)
+                    if callable(_send):
+                        if not _send(" "):
+                            _log("apply_completion: 注入空格失败（SendInput 未命中）")
+                except Exception as _e103b:
+                    _log("apply_completion: 注入空格异常 %r" % (_e103b,))
+                return new_line
             # 二次确认：个别情况下 VBE 是在我们读完行【之后】才补括号的，
             # 那一对 `()` 会把光标"挤"到左括号左侧。再读一次行，若它又变了、
             # 且光标处正是新出现的 `(`，就右移一格把光标放进括号。
